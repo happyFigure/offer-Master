@@ -1,0 +1,4 @@
+-e ./apps/api
+-e ./apps/worker
+httpx>=0.27,<1.0
+

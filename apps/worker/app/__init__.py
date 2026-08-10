@@ -1,0 +1,2 @@
+"""JobPilot worker application package."""
+

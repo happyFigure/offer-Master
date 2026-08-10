@@ -1,0 +1,2 @@
+"""Knowledge bounded context."""
+

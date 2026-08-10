@@ -1,2 +1,1 @@
-"""Interview persistence models will be implemented in phase 1."""
-
+"""Interview persistence models are deferred until the interview phase."""

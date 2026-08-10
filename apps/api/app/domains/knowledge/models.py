@@ -1,2 +1,1 @@
-"""Knowledge document persistence models will be implemented in phase 1."""
-
+"""Knowledge document persistence models are deferred until the RAG phase."""

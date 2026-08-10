@@ -77,9 +77,9 @@ class JobRead(BaseModel):
 class JobSyncRequest(BaseModel):
     keyword: str | None = None
     city: str | None = None
-    remote_type: str = "remote"
-    job_type: str = "any"
-    sources: list[str] = Field(default_factory=lambda: ["jobicy"])
+    remote_type: str = "onsite"
+    job_type: str = "campus"
+    sources: list[str] = Field(default_factory=lambda: ["tencent_campus"])
     limit: int = Field(default=20, ge=1, le=100)
 
 

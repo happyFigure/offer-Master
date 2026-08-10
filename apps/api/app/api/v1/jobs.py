@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db_session
 from app.domains.jobs.providers.base import JobProvider, JobSearchQuery
 from app.domains.jobs.providers.jobicy import JobicyProvider
+from app.domains.jobs.providers.tencent_campus import TencentCampusProvider
 from app.domains.jobs.repository import CompanyRepository, JobRepository
 from app.domains.jobs.schemas import (
     CompanySummaryRead,
@@ -22,7 +23,10 @@ router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
 
 def get_job_providers() -> Mapping[str, JobProvider]:
-    return {"jobicy": JobicyProvider()}
+    return {
+        "tencent_campus": TencentCampusProvider(),
+        "jobicy": JobicyProvider(),
+    }
 
 
 @router.post("/sync", response_model=JobSyncResponse)

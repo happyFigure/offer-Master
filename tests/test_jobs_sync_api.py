@@ -56,6 +56,43 @@ class FakeJobicyProvider:
         )
 
 
+class FakeTencentCampusProvider(FakeJobicyProvider):
+    name = "tencent_campus"
+    source_type = "official_campus_api"
+
+    def search(self, query):
+        from app.domains.jobs.providers.base import RawJob
+
+        self.queries.append(query)
+        return [
+            RawJob(
+                source="tencent_campus",
+                payload={
+                    "postId": "1200791473415778304",
+                    "title": "后台开发",
+                    "company": "腾讯",
+                },
+            )
+        ]
+
+    def normalize(self, raw_job):
+        from app.domains.jobs.schemas import JobImportDraft
+
+        return JobImportDraft(
+            company_name="腾讯",
+            company_country="中国",
+            title="后台开发",
+            city="深圳总部, 北京, 上海",
+            source="tencent_campus",
+            source_job_id=raw_job.payload["postId"],
+            source_url="https://join.qq.com/post_detail.html?postId=1200791473415778304",
+            job_type="应届实习",
+            jd_text="熟练掌握 C/C++/Java/Go，参与 AI 能力在后端的集成。",
+            skills=["Java", "Go", "AI", "大模型"],
+            raw_payload=raw_job.payload,
+        )
+
+
 class JobsSyncApiTest(unittest.TestCase):
     def setUp(self):
         from app.db.base import Base
@@ -148,6 +185,39 @@ class JobsSyncApiTest(unittest.TestCase):
 
         self.assertEqual(400, response.status_code)
         self.assertIn("Unsupported job providers", response.json()["detail"])
+
+    def test_sync_jobs_defaults_to_tencent_campus_provider(self):
+        from app.api.v1.jobs import get_job_providers
+        from app.db.session import get_db_session
+        from app.domains.jobs.models import Job
+        from app.main import create_app
+
+        provider = FakeTencentCampusProvider()
+        app = create_app()
+
+        def override_session():
+            with self.Session() as session:
+                yield session
+
+        app.dependency_overrides[get_db_session] = override_session
+        app.dependency_overrides[get_job_providers] = lambda: {"tencent_campus": provider}
+
+        async def run_sync():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                return await client.post("/api/v1/jobs/sync", json={"keyword": "后端", "limit": 3})
+
+        response = run(run_sync())
+
+        with self.Session() as session:
+            stored_job = session.scalars(select(Job)).one()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(["tencent_campus"], response.json()["requested_sources"])
+        self.assertEqual(1, response.json()["imported"])
+        self.assertEqual("后台开发", stored_job.title)
+        self.assertEqual("腾讯", stored_job.company.name)
+        self.assertEqual("campus", provider.queries[0].job_type)
 
     def test_job_repository_works_in_fresh_runtime_without_manual_model_imports(self):
         script = """

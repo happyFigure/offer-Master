@@ -192,7 +192,7 @@ class CoreBusinessModelsTest(unittest.TestCase):
                 clear=False,
             ):
                 get_settings.cache_clear()
-                command.upgrade(config, "head")
+                command.upgrade(config, "20260810_0001")
 
             engine = create_engine(f"sqlite+pysqlite:///{db_path.as_posix()}", future=True)
 

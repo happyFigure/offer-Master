@@ -1,2 +1,5 @@
-"""SQLAlchemy base metadata will be defined in phase 1."""
+from sqlalchemy.orm import DeclarativeBase
 
+
+class Base(DeclarativeBase):
+    pass

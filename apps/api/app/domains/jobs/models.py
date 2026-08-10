@@ -87,3 +87,7 @@ class Job(Base):
 
     company: Mapped[Company] = relationship(back_populates="jobs", lazy="joined")
     applications: Mapped[list[Application]] = relationship(back_populates="job")
+
+
+# Register reverse-side ORM models when callers import only jobs.models.
+from app.domains.applications import models as application_models  # noqa: E402,F401

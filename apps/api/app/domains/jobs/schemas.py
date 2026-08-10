@@ -72,3 +72,38 @@ class JobRead(BaseModel):
     status: JobStatus
     created_at: datetime
     updated_at: datetime
+
+
+class JobSyncRequest(BaseModel):
+    keyword: str | None = None
+    city: str | None = None
+    remote_type: str = "remote"
+    job_type: str = "any"
+    sources: list[str] = Field(default_factory=lambda: ["jobicy"])
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class CompanySummaryRead(BaseModel):
+    id: str
+    name: str
+
+
+class JobSummaryRead(BaseModel):
+    id: str
+    title: str
+    company: CompanySummaryRead
+    city: str | None = None
+    source: str
+    source_job_id: str
+    source_url: str | None = None
+    job_type: str | None = None
+    skills: list[str]
+    status: JobStatus
+
+
+class JobSyncResponse(BaseModel):
+    requested_sources: list[str]
+    imported: int
+    duplicates: int
+    failed: int
+    jobs: list[JobSummaryRead]

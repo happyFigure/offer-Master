@@ -33,6 +33,19 @@ class FakeSocialProvider:
         ]
 
 
+class FakeUniversityProvider:
+    def fetch(self, entry_url, limit):
+        from app.domains.jobs.providers.university_career import UniversityCareerEntry
+
+        return [
+            UniversityCareerEntry(
+                title="Li Auto 2027 campus recruiting backend engineer",
+                source_url="https://career.example.edu/job/101",
+                raw_content="Li Auto 2027 campus recruiting backend engineer Beijing Java",
+            )
+        ]
+
+
 class JobDiscoveryWorkflowTest(unittest.TestCase):
     def setUp(self):
         from app.db.base import Base
@@ -95,6 +108,67 @@ class JobDiscoveryWorkflowTest(unittest.TestCase):
         self.assertEqual(1, len(result.leads))
         self.assertEqual("理想汽车", stored_leads[0].company_name)
         self.assertEqual("unverified", stored_leads[0].verification_status)
+
+
+    def test_university_career_sync_workflow_records_sync_run_and_creates_leads(self):
+        from app.agent_runtime.workflows.job_discovery import (
+            UniversityCareerSyncCommand,
+            run_university_career_source_sync,
+        )
+        from app.domains.jobs.models import (
+            JobLead,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+            RawJobLead,
+            SourceSyncRun,
+        )
+        from app.domains.jobs.repository import (
+            JobLeadRepository,
+            JobSourceRepository,
+            RawJobLeadRepository,
+            SourceSyncRunRepository,
+        )
+        from app.domains.jobs.schemas import JobSourceCreate
+        from app.domains.jobs.service import JobLeadService
+
+        with self.Session() as session:
+            service = JobLeadService(
+                sources=JobSourceRepository(session),
+                sync_runs=SourceSyncRunRepository(session),
+                raw_leads=RawJobLeadRepository(session),
+                leads=JobLeadRepository(session),
+            )
+            source = service.create_source(
+                JobSourceCreate(
+                    name="DLMU career site",
+                    source_type=JobSourceType.UNIVERSITY_CAREER_SITE,
+                    entry_url="https://career.example.edu/jobs",
+                    trust_level=JobSourceTrustLevel.HIGH,
+                    fetch_mode=JobSourceFetchMode.PUBLIC_HTML,
+                )
+            )
+            result = run_university_career_source_sync(
+                UniversityCareerSyncCommand(source_id=source.id, limit=10),
+                lead_service=service,
+                content_provider=FakeUniversityProvider(),
+                social_provider=FakeSocialProvider(),
+            )
+            session.commit()
+
+            stored_runs = session.scalars(select(SourceSyncRun)).all()
+            stored_raw = session.scalars(select(RawJobLead)).all()
+            stored_leads = session.scalars(select(JobLead)).all()
+
+        self.assertEqual("succeeded", result.sync_run.status)
+        self.assertEqual(1, result.fetched_count)
+        self.assertEqual(1, result.extracted_count)
+        self.assertEqual(1, len(stored_runs))
+        self.assertEqual("succeeded", stored_runs[0].status)
+        self.assertEqual("extracted", stored_raw[0].status)
+        self.assertEqual(stored_runs[0].id, stored_raw[0].sync_run_id)
+        self.assertEqual(1, len(stored_leads))
+        self.assertEqual("https://career.example.edu/job/101", stored_leads[0].source_url)
 
 
 if __name__ == "__main__":

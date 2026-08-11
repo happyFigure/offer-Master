@@ -16,8 +16,10 @@ from app.domains.jobs.models import (
     JobLead,
     JobLeadStatus,
     JobSource,
-    RawJobLeadStatus,
     RawJobLead,
+    RawJobLeadStatus,
+    SourceSyncRun,
+    SourceSyncRunStatus,
     utc_now,
 )
 from app.domains.jobs.repository import (
@@ -34,6 +36,7 @@ from app.domains.jobs.schemas import (
     JobLeadVerification,
     JobSourceCreate,
     RawJobLeadCreate,
+    SourceSyncRunCreate,
 )
 
 
@@ -174,6 +177,42 @@ class JobLeadService:
 
     def get_source(self, source_id: str) -> JobSource:
         return self._require_source(source_id)
+
+    def get_lead(self, lead_id: str) -> JobLead:
+        return self._require_lead(lead_id)
+
+    def start_sync_run(self, draft: SourceSyncRunCreate) -> SourceSyncRun:
+        self._require_source(draft.source_id)
+        return self._sync_runs.add(
+            SourceSyncRun(
+                source_id=draft.source_id,
+                status=draft.status,
+                fetched_count=draft.fetched_count,
+                extracted_count=draft.extracted_count,
+                failed_count=draft.failed_count,
+                error=draft.error,
+                run_metadata=draft.run_metadata,
+            )
+        )
+
+    def finish_sync_run(
+        self,
+        sync_run: SourceSyncRun,
+        *,
+        status: SourceSyncRunStatus,
+        fetched_count: int,
+        extracted_count: int,
+        failed_count: int,
+        error: str | None = None,
+    ) -> SourceSyncRun:
+        sync_run.status = status
+        sync_run.fetched_count = fetched_count
+        sync_run.extracted_count = extracted_count
+        sync_run.failed_count = failed_count
+        sync_run.error = error
+        sync_run.finished_at = utc_now()
+        sync_run.source.last_synced_at = sync_run.finished_at
+        return sync_run
 
     def capture_raw_lead(self, draft: RawJobLeadCreate) -> RawJobLeadCaptureResult:
         self._require_source(draft.source_id)

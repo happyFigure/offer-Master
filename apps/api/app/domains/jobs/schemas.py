@@ -128,6 +128,20 @@ class JobSourceListResponse(BaseModel):
     items: list[JobSourceRead]
 
 
+class JobSourceSyncRequest(BaseModel):
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class JobSourceSyncResponse(BaseModel):
+    sync_run_id: str
+    status: SourceSyncRunStatus
+    fetched_count: int
+    extracted_count: int
+    failed_count: int
+    raw_leads: list[RawJobLeadRead]
+    leads: list[JobLeadRead]
+
+
 class RawJobLeadRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

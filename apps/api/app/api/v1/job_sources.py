@@ -5,11 +5,14 @@ from sqlalchemy.orm import Session
 
 from app.agent_runtime.workflows.job_discovery import (
     ManualSocialLeadImportCommand,
+    UniversityCareerSyncCommand,
     run_manual_social_lead_import,
+    run_university_career_source_sync,
 )
 from app.db.session import get_db_session
 from app.domains.jobs.models import JobLeadStatus
 from app.domains.jobs.providers.social_lead import SocialLeadImportProvider
+from app.domains.jobs.providers.university_career import UniversityCareerProvider
 from app.domains.jobs.repository import (
     CompanyRepository,
     JobLeadRepository,
@@ -30,12 +33,16 @@ from app.domains.jobs.schemas import (
     JobSourceCreate,
     JobSourceListResponse,
     JobSourceRead,
+    JobSourceSyncRequest,
+    JobSourceSyncResponse,
     JobSummaryRead,
     RawJobLeadCaptureResponse,
     RawJobLeadCreate,
     RawJobLeadRead,
 )
 from app.domains.jobs.service import JobLeadService, JobService
+from app.domains.jobs.verification import LeadVerifier, LeadVerificationService
+from app.infrastructure.jobs.lead_verifier import HTTPLeadVerifier
 from app.infrastructure.llm.job_lead_extractor import LLMJobLeadExtractor
 
 
@@ -45,6 +52,14 @@ lead_router = APIRouter(prefix="/api/v1/job-leads", tags=["job-leads"])
 
 def get_social_lead_provider() -> SocialLeadImportProvider:
     return SocialLeadImportProvider(extractor=LLMJobLeadExtractor())
+
+
+def get_university_career_provider() -> UniversityCareerProvider:
+    return UniversityCareerProvider()
+
+
+def get_lead_verifier() -> LeadVerifier:
+    return HTTPLeadVerifier()
 
 
 @source_router.post("", response_model=JobSourceRead, status_code=status.HTTP_201_CREATED)
@@ -62,6 +77,38 @@ def create_job_source(
 def list_job_sources(session: Session = Depends(get_db_session)) -> JobSourceListResponse:
     sources = JobSourceRepository(session).list_enabled()
     return JobSourceListResponse(items=[JobSourceRead.model_validate(source) for source in sources])
+
+
+@source_router.post("/{source_id}/sync", response_model=JobSourceSyncResponse)
+def sync_job_source(
+    source_id: str,
+    request: JobSourceSyncRequest,
+    session: Session = Depends(get_db_session),
+    university_provider: UniversityCareerProvider = Depends(get_university_career_provider),
+    social_provider: SocialLeadImportProvider = Depends(get_social_lead_provider),
+) -> JobSourceSyncResponse:
+    try:
+        result = run_university_career_source_sync(
+            UniversityCareerSyncCommand(source_id=source_id, limit=request.limit),
+            lead_service=_lead_service(session),
+            content_provider=university_provider,
+            social_provider=social_provider,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Job source sync failed") from exc
+
+    session.commit()
+    return JobSourceSyncResponse(
+        sync_run_id=result.sync_run.id,
+        status=result.sync_run.status,
+        fetched_count=result.fetched_count,
+        extracted_count=result.extracted_count,
+        failed_count=result.failed_count,
+        raw_leads=[RawJobLeadRead.model_validate(item.raw_lead) for item in result.raw_captures],
+        leads=[JobLeadRead.model_validate(lead) for lead in result.leads],
+    )
 
 
 @lead_router.post("/raw", response_model=RawJobLeadCaptureResponse, status_code=status.HTTP_201_CREATED)
@@ -162,6 +209,34 @@ def convert_job_lead(
         result = lead_service.convert_verified_lead_to_job(lead_id, job_service)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return JobLeadConversionResponse(
+        lead=JobLeadRead.model_validate(result.lead),
+        job=_job_summary(result.job),
+        created=result.created,
+    )
+
+
+@lead_router.post("/{lead_id}/verify-and-convert", response_model=JobLeadConversionResponse)
+def verify_and_convert_job_lead(
+    lead_id: str,
+    session: Session = Depends(get_db_session),
+    verifier: LeadVerifier = Depends(get_lead_verifier),
+) -> JobLeadConversionResponse:
+    lead_service = _lead_service(session)
+    job_service = JobService(
+        companies=CompanyRepository(session),
+        jobs=JobRepository(session),
+    )
+    try:
+        result = LeadVerificationService(
+            lead_service=lead_service,
+            job_service=job_service,
+            verifier=verifier,
+        ).verify_and_convert(lead_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     session.commit()
     return JobLeadConversionResponse(
         lead=JobLeadRead.model_validate(result.lead),

@@ -37,6 +37,30 @@ class FakeSocialLeadProvider:
         ]
 
 
+class FakeUniversityCareerProvider:
+    def fetch(self, entry_url, limit):
+        from app.domains.jobs.providers.university_career import UniversityCareerEntry
+
+        return [
+            UniversityCareerEntry(
+                title="Li Auto 2027 campus recruiting backend engineer",
+                source_url="https://career.example.edu/job/101",
+                raw_content="Li Auto 2027 campus recruiting backend engineer Beijing Java",
+            )
+        ]
+
+
+class FakeOpenLeadVerifier:
+    def verify(self, lead):
+        from app.domains.jobs.verification import LeadVerificationCheck
+
+        return LeadVerificationCheck(
+            is_open=True,
+            verified_url=lead.apply_url,
+            notes="official application URL is reachable",
+        )
+
+
 class JobSourcesApiTest(unittest.TestCase):
     def setUp(self):
         from app.db.base import Base
@@ -56,8 +80,12 @@ class JobSourcesApiTest(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _app(self, social_provider=None):
-        from app.api.v1.job_sources import get_social_lead_provider
+    def _app(self, social_provider=None, university_provider=None, lead_verifier=None):
+        from app.api.v1.job_sources import (
+            get_lead_verifier,
+            get_social_lead_provider,
+            get_university_career_provider,
+        )
         from app.db.session import get_db_session
         from app.main import create_app
 
@@ -70,6 +98,10 @@ class JobSourcesApiTest(unittest.TestCase):
         app.dependency_overrides[get_db_session] = override_session
         if social_provider is not None:
             app.dependency_overrides[get_social_lead_provider] = lambda: social_provider
+        if university_provider is not None:
+            app.dependency_overrides[get_university_career_provider] = lambda: university_provider
+        if lead_verifier is not None:
+            app.dependency_overrides[get_lead_verifier] = lambda: lead_verifier
         return app
 
     def test_create_and_list_job_sources(self):
@@ -215,6 +247,96 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertEqual(1, len(raw_leads))
         self.assertEqual("Xiaomi", stored_leads[0].company_name)
         self.assertEqual("unverified", stored_leads[0].verification_status)
+
+    def test_sync_university_career_source_creates_raw_and_job_leads(self):
+        from app.domains.jobs.models import JobLead, RawJobLead, SourceSyncRun
+
+        app = self._app(
+            social_provider=FakeSocialLeadProvider(),
+            university_provider=FakeUniversityCareerProvider(),
+        )
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "DLMU career site",
+                        "source_type": "university_career_site",
+                        "entry_url": "https://career.example.edu/jobs",
+                        "trust_level": "high",
+                        "fetch_mode": "public_html",
+                    },
+                )
+                synced = await client.post(
+                    f"/api/v1/job-sources/{source.json()['id']}/sync",
+                    json={"limit": 5},
+                )
+                return synced
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            runs = session.scalars(select(SourceSyncRun)).all()
+            raw_leads = session.scalars(select(RawJobLead)).all()
+            stored_leads = session.scalars(select(JobLead)).all()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("succeeded", response.json()["status"])
+        self.assertEqual(1, response.json()["fetched_count"])
+        self.assertEqual(1, response.json()["extracted_count"])
+        self.assertEqual(1, len(runs))
+        self.assertEqual("succeeded", runs[0].status)
+        self.assertEqual("extracted", raw_leads[0].status)
+        self.assertEqual("Xiaomi", stored_leads[0].company_name)
+
+    def test_lazy_verify_job_lead_converts_to_formal_job(self):
+        from app.domains.jobs.models import Job
+
+        app = self._app(lead_verifier=FakeOpenLeadVerifier())
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "DLMU verified source",
+                        "source_type": "university_career_site",
+                        "entry_url": "https://career.example.edu/jobs",
+                        "trust_level": "high",
+                        "fetch_mode": "public_html",
+                    },
+                )
+                lead = await client.post(
+                    "/api/v1/job-leads",
+                    json={
+                        "source_id": source.json()["id"],
+                        "company_name": "Li Auto",
+                        "title": "Backend Engineer",
+                        "city": "Beijing",
+                        "source_url": "https://career.example.edu/job/101",
+                        "apply_url": "https://career.lixiang.com/campus/101",
+                        "job_type": "campus",
+                        "skills": ["Java"],
+                    },
+                )
+                converted = await client.post(
+                    f"/api/v1/job-leads/{lead.json()['id']}/verify-and-convert"
+                )
+                return converted
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            stored_job = session.scalars(select(Job)).one()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("converted", response.json()["lead"]["verification_status"])
+        self.assertEqual("https://career.lixiang.com/campus/101", response.json()["lead"]["verified_url"])
+        self.assertEqual("Li Auto", stored_job.company.name)
+        self.assertEqual("job_lead", stored_job.source)
 
 
 if __name__ == "__main__":

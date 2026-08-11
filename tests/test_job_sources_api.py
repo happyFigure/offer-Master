@@ -13,6 +13,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
 
 
+class FakeSocialLeadProvider:
+    def extract(self, source_id, raw_lead_id, raw_content, source_url, trust_level):
+        from app.domains.jobs.schemas import JobLeadCreate
+
+        return [
+            JobLeadCreate(
+                source_id=source_id,
+                raw_lead_id=raw_lead_id,
+                company_name="Xiaomi",
+                title="Java Backend Engineer",
+                city="Beijing",
+                job_direction="backend",
+                graduation_year="2027",
+                source_url=source_url,
+                apply_url="https://hr.xiaomi.com/campus",
+                job_type="campus",
+                jd_text="Build Java backend services.",
+                skills=["Java", "Spring"],
+                confidence_score=89.0,
+                trust_level=trust_level,
+            )
+        ]
+
+
 class JobSourcesApiTest(unittest.TestCase):
     def setUp(self):
         from app.db.base import Base
@@ -32,7 +56,8 @@ class JobSourcesApiTest(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _app(self):
+    def _app(self, social_provider=None):
+        from app.api.v1.job_sources import get_social_lead_provider
         from app.db.session import get_db_session
         from app.main import create_app
 
@@ -43,6 +68,8 @@ class JobSourcesApiTest(unittest.TestCase):
                 yield session
 
         app.dependency_overrides[get_db_session] = override_session
+        if social_provider is not None:
+            app.dependency_overrides[get_social_lead_provider] = lambda: social_provider
         return app
 
     def test_create_and_list_job_sources(self):
@@ -144,6 +171,50 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertEqual("converted", converted_response.json()["lead"]["verification_status"])
         self.assertEqual("招银网络科技", stored_job.company.name)
         self.assertEqual("job_lead", stored_job.source)
+
+    def test_extract_job_leads_from_raw_social_content(self):
+        from app.domains.jobs.models import JobLead, RawJobLead
+
+        app = self._app(social_provider=FakeSocialLeadProvider())
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "xiaohongshu autumn recruiting summary",
+                        "source_type": "xiaohongshu_note",
+                        "entry_url": "https://www.xiaohongshu.com/discovery/item/demo",
+                        "trust_level": "medium",
+                        "fetch_mode": "manual_clip",
+                    },
+                )
+                extracted = await client.post(
+                    "/api/v1/job-leads/extract",
+                    json={
+                        "source_id": source.json()["id"],
+                        "source_url": "https://www.xiaohongshu.com/discovery/item/demo",
+                        "raw_content": "Xiaomi 2027 autumn recruiting Java backend Beijing Spring",
+                        "content_type": "text/plain",
+                    },
+                )
+                return extracted
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            raw_leads = session.scalars(select(RawJobLead)).all()
+            stored_leads = session.scalars(select(JobLead)).all()
+
+        self.assertEqual(201, response.status_code)
+        self.assertTrue(response.json()["raw_created"])
+        self.assertEqual("extracted", response.json()["raw_lead"]["status"])
+        self.assertEqual(1, response.json()["extracted_count"])
+        self.assertEqual("Xiaomi", response.json()["leads"][0]["company_name"])
+        self.assertEqual(1, len(raw_leads))
+        self.assertEqual("Xiaomi", stored_leads[0].company_name)
+        self.assertEqual("unverified", stored_leads[0].verification_status)
 
 
 if __name__ == "__main__":

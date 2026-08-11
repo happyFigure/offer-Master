@@ -3,8 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.agent_runtime.workflows.job_discovery import (
+    ManualSocialLeadImportCommand,
+    run_manual_social_lead_import,
+)
 from app.db.session import get_db_session
 from app.domains.jobs.models import JobLeadStatus
+from app.domains.jobs.providers.social_lead import SocialLeadImportProvider
 from app.domains.jobs.repository import (
     CompanyRepository,
     JobLeadRepository,
@@ -17,6 +22,8 @@ from app.domains.jobs.schemas import (
     CompanySummaryRead,
     JobLeadConversionResponse,
     JobLeadCreate,
+    JobLeadExtractionRequest,
+    JobLeadExtractionResponse,
     JobLeadListResponse,
     JobLeadRead,
     JobLeadVerification,
@@ -26,12 +33,18 @@ from app.domains.jobs.schemas import (
     JobSummaryRead,
     RawJobLeadCaptureResponse,
     RawJobLeadCreate,
+    RawJobLeadRead,
 )
 from app.domains.jobs.service import JobLeadService, JobService
+from app.infrastructure.llm.job_lead_extractor import LLMJobLeadExtractor
 
 
 source_router = APIRouter(prefix="/api/v1/job-sources", tags=["job-sources"])
 lead_router = APIRouter(prefix="/api/v1/job-leads", tags=["job-leads"])
+
+
+def get_social_lead_provider() -> SocialLeadImportProvider:
+    return SocialLeadImportProvider(extractor=LLMJobLeadExtractor())
 
 
 @source_router.post("", response_model=JobSourceRead, status_code=status.HTTP_201_CREATED)
@@ -78,6 +91,38 @@ def create_job_lead(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     session.commit()
     return JobLeadRead.model_validate(lead)
+
+
+@lead_router.post("/extract", response_model=JobLeadExtractionResponse, status_code=status.HTTP_201_CREATED)
+def extract_job_leads(
+    request: JobLeadExtractionRequest,
+    session: Session = Depends(get_db_session),
+    provider: SocialLeadImportProvider = Depends(get_social_lead_provider),
+) -> JobLeadExtractionResponse:
+    try:
+        result = run_manual_social_lead_import(
+            ManualSocialLeadImportCommand(
+                source_id=request.source_id,
+                sync_run_id=request.sync_run_id,
+                source_url=request.source_url,
+                raw_content=request.raw_content,
+                content_type=request.content_type,
+            ),
+            lead_service=_lead_service(session),
+            provider=provider,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Job lead extraction failed") from exc
+
+    session.commit()
+    return JobLeadExtractionResponse(
+        raw_lead=RawJobLeadRead.model_validate(result.raw_capture.raw_lead),
+        raw_created=result.raw_capture.created,
+        extracted_count=len(result.leads),
+        leads=[JobLeadRead.model_validate(lead) for lead in result.leads],
+    )
 
 
 @lead_router.get("", response_model=JobLeadListResponse)

@@ -16,6 +16,7 @@ from app.domains.jobs.models import (
     JobLead,
     JobLeadStatus,
     JobSource,
+    RawJobLeadStatus,
     RawJobLead,
     utc_now,
 )
@@ -171,6 +172,9 @@ class JobLeadService:
             )
         )
 
+    def get_source(self, source_id: str) -> JobSource:
+        return self._require_source(source_id)
+
     def capture_raw_lead(self, draft: RawJobLeadCreate) -> RawJobLeadCaptureResult:
         self._require_source(draft.source_id)
         content_hash = self._content_hash(draft.raw_content)
@@ -249,6 +253,10 @@ class JobLeadService:
         lead.verification_notes = verification.verification_notes
         lead.verified_at = utc_now()
         return lead
+
+    def mark_raw_lead_extracted(self, raw_lead: RawJobLead) -> RawJobLead:
+        raw_lead.status = RawJobLeadStatus.EXTRACTED
+        return raw_lead
 
     def convert_verified_lead_to_job(
         self,

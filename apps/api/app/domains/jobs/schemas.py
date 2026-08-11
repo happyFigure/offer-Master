@@ -183,6 +183,21 @@ class JobLeadListResponse(BaseModel):
     items: list[JobLeadRead]
 
 
+class JobLeadExtractionRequest(BaseModel):
+    source_id: str
+    raw_content: str
+    source_url: str | None = None
+    content_type: str = "text/plain"
+    sync_run_id: str | None = None
+
+
+class JobLeadExtractionResponse(BaseModel):
+    raw_lead: RawJobLeadRead
+    raw_created: bool
+    extracted_count: int
+    leads: list[JobLeadRead]
+
+
 class CompanyRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

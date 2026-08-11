@@ -13,6 +13,7 @@ dist/
 build/
 *.tsbuildinfo
 logs/
+runtime/
 .env
 .env.*
 !.env.example

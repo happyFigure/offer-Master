@@ -16,6 +16,7 @@ import {
   Layers3,
   Loader2,
   LucideIcon,
+  MessageCircle,
   Network,
   Plus,
   RadioTower,
@@ -40,7 +41,7 @@ import type {
   JobSourceType,
 } from "../types/jobs";
 
-type PageId = "dashboard" | "sources" | "leads" | "pipeline" | "guardrails";
+type PageId = "chat" | "dashboard" | "sources" | "leads" | "pipeline" | "guardrails";
 type NoticeKind = "success" | "warning" | "danger" | "info";
 
 interface Notice {
@@ -72,7 +73,15 @@ interface ExtractDraft {
   raw_content: string;
 }
 
+interface ChatMessage {
+  id: string;
+  role: "assistant" | "user";
+  content: string;
+  meta?: string;
+}
+
 const NAV_ITEMS: Array<{ id: PageId; label: string; description: string; icon: LucideIcon }> = [
+  { id: "chat", label: "AI 对话", description: "简历/岗位/面试问答", icon: Bot },
   { id: "dashboard", label: "总览", description: "同步态势与下一步", icon: Gauge },
   { id: "sources", label: "信息源", description: "高校/企业/社媒入口", icon: RadioTower },
   { id: "leads", label: "岗位线索", description: "抽取、筛选、验证", icon: FileSearch },
@@ -132,6 +141,17 @@ const INITIAL_FILTERS: LeadFilterDraft = {
   graduation_year: "2027",
 };
 
+const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
+  {
+    id: "assistant-welcome",
+    role: "assistant",
+    content: "我是 OfferMaster 的 AI 求职助手前端壳子。后续接入 Chat API 后，我可以结合你的简历、岗位线索和面试知识库给出建议。",
+    meta: "前端预览",
+  },
+];
+
+const CHAT_PROMPTS = ["帮我分析这个岗位是否适合我", "帮我优化简历项目描述", "模拟 Java 后端面试", "根据岗位生成投递建议"];
+
 function App() {
   const [activePage, setActivePage] = useState<PageId>(() => getInitialPage());
   const [sources, setSources] = useState<JobSource[]>([]);
@@ -146,6 +166,8 @@ function App() {
     source_url: "",
     raw_content: "",
   });
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
 
   const refreshData = useCallback(async (filters?: JobLeadFilters) => {
     const [nextSources, nextLeads] = await Promise.all([
@@ -280,6 +302,28 @@ function App() {
     });
   };
 
+  const handleSendChat = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const content = chatDraft.trim();
+
+    if (!content) {
+      return;
+    }
+
+    const timestamp = Date.now();
+    setChatMessages((current) => [
+      ...current,
+      { id: `user-${timestamp}`, role: "user", content, meta: "你" },
+      {
+        id: `assistant-placeholder-${timestamp}`,
+        role: "assistant",
+        content: "聊天后端还没有接入。这里先保留完整的对话页面交互，后续做到 Chat API、Conversation/Message 持久化后再返回真实模型回复。",
+        meta: "占位回复",
+      },
+    ]);
+    setChatDraft("");
+  };
+
   return (
     <div className="app-root">
       <a className="skip-link" href="#main-content">
@@ -356,6 +400,16 @@ function App() {
             <LoadingView />
           ) : (
             <div className="page-stack">
+              {activePage === "chat" ? (
+                <ChatPage
+                  draft={chatDraft}
+                  messages={chatMessages}
+                  onDraftChange={setChatDraft}
+                  onPromptSelect={setChatDraft}
+                  onSubmit={handleSendChat}
+                  navigate={navigate}
+                />
+              ) : null}
               {activePage === "dashboard" ? <DashboardPage summary={summary} sources={sources} leads={leads} navigate={navigate} /> : null}
               {activePage === "sources" ? (
                 <SourcesPage
@@ -389,6 +443,113 @@ function App() {
         </main>
       </div>
     </div>
+  );
+}
+
+function ChatPage({
+  draft,
+  messages,
+  navigate,
+  onDraftChange,
+  onPromptSelect,
+  onSubmit,
+}: {
+  draft: string;
+  messages: ChatMessage[];
+  navigate: (page: PageId) => void;
+  onDraftChange: (value: string) => void;
+  onPromptSelect: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <section className="chat-layout">
+      <div className="glass-panel chat-panel">
+        <div className="chat-hero">
+          <div className="chat-hero-icon" aria-hidden="true">
+            <Bot size={22} />
+          </div>
+          <div>
+            <p className="eyebrow">AI Career Copilot</p>
+            <h3>AI 求职助手</h3>
+            <p>先保留对话体验入口，后续再接入 Chat API、简历知识库和岗位上下文。</p>
+          </div>
+        </div>
+
+        <div className="chat-message-list" aria-label="AI 对话消息">
+          {messages.map((message) => (
+            <article className={`chat-message chat-message-${message.role}`} key={message.id}>
+              <div className="chat-avatar" aria-hidden="true">
+                {message.role === "assistant" ? <Bot size={16} /> : <MessageCircle size={16} />}
+              </div>
+              <div className="chat-bubble">
+                <div className="chat-meta">
+                  <strong>{message.role === "assistant" ? "OfferMaster AI" : "你"}</strong>
+                  {message.meta ? <span>{message.meta}</span> : null}
+                </div>
+                <p>{message.content}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+
+        <div className="prompt-row" aria-label="快捷问题">
+          {CHAT_PROMPTS.map((prompt) => (
+            <button className="prompt-chip" key={prompt} type="button" onClick={() => onPromptSelect(prompt)}>
+              {prompt}
+            </button>
+          ))}
+        </div>
+
+        <form className="chat-composer" onSubmit={onSubmit}>
+          <label htmlFor="chat-input">输入你想问 AI 的问题</label>
+          <div className="chat-input-row">
+            <textarea
+              id="chat-input"
+              value={draft}
+              onChange={(event) => onDraftChange(event.target.value)}
+              placeholder="例如：帮我分析 Java 后端秋招岗位和我的项目匹配度"
+              rows={3}
+            />
+            <button className="button button-primary chat-send" type="submit" disabled={!draft.trim()}>
+              <Send size={16} />
+              发送
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <aside className="glass-panel chat-side-panel">
+        <p className="eyebrow">Scope</p>
+        <h3>当前只做前端壳子</h3>
+        <div className="action-list">
+          <div className="action-item">
+            <CheckCircle2 size={18} aria-hidden="true" />
+            <div>
+              <strong>已实现</strong>
+              <p>左侧 AI 对话入口、聊天页布局、输入框、快捷问题和本地占位回复。</p>
+            </div>
+          </div>
+          <div className="action-item">
+            <Clock3 size={18} aria-hidden="true" />
+            <div>
+              <strong>后续接入</strong>
+              <p>Chat API、Conversation/Message 表、RAG 简历知识库和流式模型回复。</p>
+            </div>
+          </div>
+          <div className="action-item">
+            <ShieldCheck size={18} aria-hidden="true" />
+            <div>
+              <strong>边界不变</strong>
+              <p>真实投递、MCP 自动化和高风险操作仍必须等待用户确认。</p>
+            </div>
+          </div>
+        </div>
+        <button className="button button-ghost full-width" type="button" onClick={() => navigate("leads")}>
+          <FileSearch size={16} />
+          查看岗位线索
+        </button>
+      </aside>
+    </section>
   );
 }
 
@@ -1052,6 +1213,7 @@ function toDisplayError(error: unknown): string {
 }
 
 const PAGE_TITLES: Record<PageId, string> = {
+  chat: "AI 求职助手",
   dashboard: "秋招发现总览",
   sources: "岗位信息源管理",
   leads: "岗位线索工作台",
@@ -1060,6 +1222,7 @@ const PAGE_TITLES: Record<PageId, string> = {
 };
 
 const PAGE_DESCRIPTIONS: Record<PageId, string> = {
+  chat: "先放出对话入口和交互壳子，后续接入真实 Chat API 与简历知识库。",
   dashboard: "先广撒网收集来源，再让线索进入验证与用户确认流程。",
   sources: "管理高校就业网、企业官网、公众号、小红书和可见招聘页来源。",
   leads: "从非结构化汇总抽取岗位线索，并在投递前做懒加载验证。",

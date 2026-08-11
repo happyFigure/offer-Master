@@ -1,14 +1,11 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+import App from "./app/App";
 import "./styles/global.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <main className="shell">
-      <h1>JobPilot</h1>
-      <p>Local-first interview and application assistant scaffold.</p>
-    </main>
+    <App />
   </React.StrictMode>,
 );
-

@@ -338,6 +338,102 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertEqual("Li Auto", stored_job.company.name)
         self.assertEqual("job_lead", stored_job.source)
 
+    def test_list_job_leads_filters_by_source_trust_status_company_direction_year_and_keyword(self):
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                university_source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "Filtered university source",
+                        "source_type": "university_career_site",
+                        "entry_url": "https://career.example.edu/jobs",
+                        "trust_level": "high",
+                        "fetch_mode": "public_html",
+                    },
+                )
+                social_source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "Filtered social source",
+                        "source_type": "xiaohongshu_note",
+                        "entry_url": "https://www.xiaohongshu.com/discovery/item/demo",
+                        "trust_level": "medium",
+                        "fetch_mode": "manual_clip",
+                    },
+                )
+                university_source_id = university_source.json()["id"]
+                social_source_id = social_source.json()["id"]
+
+                await client.post(
+                    "/api/v1/job-leads",
+                    json={
+                        "source_id": university_source_id,
+                        "company_name": "Li Auto",
+                        "title": "Java Backend Engineer",
+                        "city": "Beijing",
+                        "job_direction": "backend",
+                        "graduation_year": "2027",
+                        "source_url": "https://career.example.edu/job/101",
+                        "apply_url": "https://career.lixiang.com/campus/101",
+                        "job_type": "campus",
+                        "jd_text": "Build Java services for agent platform.",
+                        "skills": ["Java", "Spring"],
+                        "verification_status": "unverified",
+                    },
+                )
+                await client.post(
+                    "/api/v1/job-leads",
+                    json={
+                        "source_id": university_source_id,
+                        "company_name": "Li Auto",
+                        "title": "Frontend Engineer",
+                        "job_direction": "frontend",
+                        "graduation_year": "2027",
+                        "job_type": "campus",
+                        "jd_text": "Build React pages.",
+                        "skills": ["TypeScript"],
+                    },
+                )
+                await client.post(
+                    "/api/v1/job-leads",
+                    json={
+                        "source_id": social_source_id,
+                        "company_name": "Xiaomi",
+                        "title": "Java Backend Engineer",
+                        "job_direction": "backend",
+                        "graduation_year": "2027",
+                        "job_type": "campus",
+                        "jd_text": "Build Java services.",
+                        "skills": ["Java"],
+                    },
+                )
+
+                return await client.get(
+                    "/api/v1/job-leads",
+                    params={
+                        "source_id": university_source_id,
+                        "source_type": "university_career_site",
+                        "trust_level": "high",
+                        "verification_status": "unverified",
+                        "company": "li",
+                        "job_direction": "backend",
+                        "graduation_year": "2027",
+                        "keyword": "agent",
+                        "limit": 10,
+                    },
+                )
+
+        response = run(call_api())
+
+        self.assertEqual(200, response.status_code)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("Li Auto", items[0]["company_name"])
+        self.assertEqual("Java Backend Engineer", items[0]["title"])
+
 
 if __name__ == "__main__":
     unittest.main()

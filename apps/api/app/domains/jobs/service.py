@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from hashlib import sha256
 
 from app.domains.jobs.events import (
@@ -16,6 +17,8 @@ from app.domains.jobs.models import (
     JobLead,
     JobLeadStatus,
     JobSource,
+    JobSourceTrustLevel,
+    JobSourceType,
     RawJobLead,
     RawJobLeadStatus,
     SourceSyncRun,
@@ -180,6 +183,42 @@ class JobLeadService:
 
     def get_lead(self, lead_id: str) -> JobLead:
         return self._require_lead(lead_id)
+
+    def list_enabled_sources(self) -> list[JobSource]:
+        return self._sources.list_enabled()
+
+    def list_due_sources(self, now: datetime | None = None) -> list[JobSource]:
+        current_time = now or utc_now()
+        return [
+            source
+            for source in self._sources.list_enabled()
+            if self._is_source_due(source, current_time)
+        ]
+
+    def list_leads(
+        self,
+        *,
+        source_id: str | None = None,
+        source_type: JobSourceType | None = None,
+        trust_level: JobSourceTrustLevel | None = None,
+        verification_status: JobLeadStatus | None = None,
+        company: str | None = None,
+        job_direction: str | None = None,
+        graduation_year: str | None = None,
+        keyword: str | None = None,
+        limit: int = 50,
+    ) -> list[JobLead]:
+        return self._leads.list_filtered(
+            source_id=source_id,
+            source_type=source_type,
+            trust_level=trust_level,
+            verification_status=verification_status,
+            company=company,
+            job_direction=job_direction,
+            graduation_year=graduation_year,
+            keyword=keyword,
+            limit=limit,
+        )
 
     def start_sync_run(self, draft: SourceSyncRunCreate) -> SourceSyncRun:
         self._require_source(draft.source_id)
@@ -351,6 +390,13 @@ class JobLeadService:
     def _content_hash(raw_content: str) -> str:
         normalized = " ".join(raw_content.split())
         return sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_source_due(source: JobSource, now: datetime) -> bool:
+        if source.last_synced_at is None:
+            return True
+        next_sync_at = source.last_synced_at + timedelta(hours=source.sync_interval_hours)
+        return next_sync_at <= now
 
     @staticmethod
     def _lead_hash(draft: JobLeadCreate) -> str:

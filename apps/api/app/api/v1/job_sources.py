@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.agent_runtime.workflows.job_discovery import (
@@ -10,7 +10,7 @@ from app.agent_runtime.workflows.job_discovery import (
     run_university_career_source_sync,
 )
 from app.db.session import get_db_session
-from app.domains.jobs.models import JobLeadStatus
+from app.domains.jobs.models import JobLeadStatus, JobSourceTrustLevel, JobSourceType
 from app.domains.jobs.providers.social_lead import SocialLeadImportProvider
 from app.domains.jobs.providers.university_career import UniversityCareerProvider
 from app.domains.jobs.repository import (
@@ -175,9 +175,27 @@ def extract_job_leads(
 @lead_router.get("", response_model=JobLeadListResponse)
 def list_job_leads(
     verification_status: JobLeadStatus | None = None,
+    source_id: str | None = None,
+    source_type: JobSourceType | None = None,
+    trust_level: JobSourceTrustLevel | None = None,
+    company: str | None = None,
+    job_direction: str | None = None,
+    graduation_year: str | None = None,
+    keyword: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
     session: Session = Depends(get_db_session),
 ) -> JobLeadListResponse:
-    leads = JobLeadRepository(session).list_by_status(verification_status)
+    leads = _lead_service(session).list_leads(
+        source_id=source_id,
+        source_type=source_type,
+        trust_level=trust_level,
+        verification_status=verification_status,
+        company=company,
+        job_direction=job_direction,
+        graduation_year=graduation_year,
+        keyword=keyword,
+        limit=limit,
+    )
     return JobLeadListResponse(items=[JobLeadRead.model_validate(lead) for lead in leads])
 
 

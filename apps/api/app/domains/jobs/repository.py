@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.domains.jobs.models import (
@@ -9,6 +9,8 @@ from app.domains.jobs.models import (
     JobLead,
     JobLeadStatus,
     JobSource,
+    JobSourceTrustLevel,
+    JobSourceType,
     RawJobLead,
     SourceSyncRun,
     JobStatus,
@@ -134,6 +136,46 @@ class JobLeadRepository:
         if status is not None:
             statement = statement.where(JobLead.verification_status == status)
         return list(self._session.scalars(statement).all())
+
+    def list_filtered(
+        self,
+        *,
+        source_id: str | None = None,
+        source_type: JobSourceType | None = None,
+        trust_level: JobSourceTrustLevel | None = None,
+        verification_status: JobLeadStatus | None = None,
+        company: str | None = None,
+        job_direction: str | None = None,
+        graduation_year: str | None = None,
+        keyword: str | None = None,
+        limit: int = 50,
+    ) -> list[JobLead]:
+        statement = select(JobLead).join(JobLead.source).order_by(JobLead.created_at.desc())
+        if source_id is not None:
+            statement = statement.where(JobLead.source_id == source_id)
+        if source_type is not None:
+            statement = statement.where(JobSource.source_type == source_type)
+        if trust_level is not None:
+            statement = statement.where(JobLead.trust_level == trust_level)
+        if verification_status is not None:
+            statement = statement.where(JobLead.verification_status == verification_status)
+        if company:
+            statement = statement.where(JobLead.company_name.ilike(f"%{company.strip()}%"))
+        if job_direction:
+            statement = statement.where(JobLead.job_direction == job_direction)
+        if graduation_year:
+            statement = statement.where(JobLead.graduation_year == graduation_year)
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            statement = statement.where(
+                or_(
+                    JobLead.company_name.ilike(pattern),
+                    JobLead.title.ilike(pattern),
+                    JobLead.job_direction.ilike(pattern),
+                    JobLead.jd_text.ilike(pattern),
+                )
+            )
+        return list(self._session.scalars(statement.limit(limit)).all())
 
     def add(self, lead: JobLead) -> JobLead:
         self._session.add(lead)

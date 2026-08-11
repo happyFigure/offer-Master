@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, TypedDict
+import warnings
 
-from app.domains.jobs.models import JobLead, SourceSyncRun, SourceSyncRunStatus
+from app.domains.jobs.models import (
+    JobLead,
+    JobSource,
+    JobSourceFetchMode,
+    JobSourceType,
+    SourceSyncRun,
+    SourceSyncRunStatus,
+)
 from app.domains.jobs.schemas import RawJobLeadCreate, SourceSyncRunCreate
 from app.domains.jobs.service import JobLeadService, RawJobLeadCaptureResult
 
@@ -39,6 +48,21 @@ class UniversityCareerSyncResult:
     failed_count: int
 
 
+@dataclass(frozen=True)
+class DueJobSourceSyncCommand:
+    limit_per_source: int = 20
+    now: datetime | None = None
+
+
+@dataclass(frozen=True)
+class DueJobSourceSyncResult:
+    sync_runs: list[SourceSyncRun]
+    processed_source_ids: list[str]
+    succeeded_count: int
+    failed_count: int
+    skipped_count: int
+
+
 class SocialLeadProvider(Protocol):
     def extract(
         self,
@@ -66,6 +90,11 @@ class UniversityCareerContentProvider(Protocol):
 class ManualSocialLeadImportState(TypedDict, total=False):
     command: ManualSocialLeadImportCommand
     result: ManualSocialLeadImportResult
+
+
+class DueJobSourceSyncState(TypedDict, total=False):
+    command: DueJobSourceSyncCommand
+    result: DueJobSourceSyncResult
 
 
 def run_manual_social_lead_import(
@@ -168,12 +197,98 @@ def run_university_career_source_sync(
     )
 
 
+def run_due_job_source_syncs(
+    command: DueJobSourceSyncCommand,
+    *,
+    lead_service: JobLeadService,
+    university_provider: UniversityCareerContentProvider,
+    social_provider: SocialLeadProvider,
+) -> DueJobSourceSyncResult:
+    enabled_sources = lead_service.list_enabled_sources()
+    due_sources = lead_service.list_due_sources(command.now)
+    skipped_count = len(enabled_sources) - len(due_sources)
+    sync_runs: list[SourceSyncRun] = []
+    processed_source_ids: list[str] = []
+    succeeded_count = 0
+    failed_count = 0
+
+    for source in due_sources:
+        processed_source_ids.append(source.id)
+        if _supports_public_university_sync(source):
+            try:
+                result = run_university_career_source_sync(
+                    UniversityCareerSyncCommand(
+                        source_id=source.id,
+                        limit=command.limit_per_source,
+                    ),
+                    lead_service=lead_service,
+                    content_provider=university_provider,
+                    social_provider=social_provider,
+                )
+            except Exception:
+                failed_count += 1
+                continue
+
+            sync_runs.append(result.sync_run)
+            if result.sync_run.status == SourceSyncRunStatus.FAILED:
+                failed_count += 1
+            else:
+                succeeded_count += 1
+            continue
+
+        sync_runs.append(_record_unsupported_sync_run(lead_service, source))
+        failed_count += 1
+
+    return DueJobSourceSyncResult(
+        sync_runs=sync_runs,
+        processed_source_ids=processed_source_ids,
+        succeeded_count=succeeded_count,
+        failed_count=failed_count,
+        skipped_count=skipped_count,
+    )
+
+
+def _supports_public_university_sync(source: JobSource) -> bool:
+    return (
+        _enum_value(source.source_type) == JobSourceType.UNIVERSITY_CAREER_SITE.value
+        and _enum_value(source.fetch_mode) == JobSourceFetchMode.PUBLIC_HTML.value
+    )
+
+
+def _record_unsupported_sync_run(
+    lead_service: JobLeadService,
+    source: JobSource,
+) -> SourceSyncRun:
+    sync_run = lead_service.start_sync_run(
+        SourceSyncRunCreate(
+            source_id=source.id,
+            run_metadata={"reason": "unsupported_automated_sync"},
+        )
+    )
+    return lead_service.finish_sync_run(
+        sync_run,
+        status=SourceSyncRunStatus.FAILED,
+        fetched_count=0,
+        extracted_count=0,
+        failed_count=1,
+        error=(
+            "No automated sync provider for "
+            f"source_type={_enum_value(source.source_type)}, "
+            f"fetch_mode={_enum_value(source.fetch_mode)}"
+        ),
+    )
+
+
+def _enum_value(value: object) -> object:
+    return getattr(value, "value", value)
+
+
 def build_manual_social_lead_import_graph(
     *,
     lead_service: JobLeadService,
     provider: SocialLeadProvider,
 ):
-    from langgraph.graph import END, START, StateGraph
+    END, START, StateGraph = _load_langgraph_graph()
 
     def import_social_leads_node(
         state: ManualSocialLeadImportState,
@@ -186,8 +301,45 @@ def build_manual_social_lead_import_graph(
             )
         }
 
-    graph = StateGraph(ManualSocialLeadImportState)
-    graph.add_node("import_social_leads", import_social_leads_node)
-    graph.add_edge(START, "import_social_leads")
-    graph.add_edge("import_social_leads", END)
-    return graph.compile()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = StateGraph(ManualSocialLeadImportState)
+        graph.add_node("import_social_leads", import_social_leads_node)
+        graph.add_edge(START, "import_social_leads")
+        graph.add_edge("import_social_leads", END)
+        return graph.compile()
+
+
+def build_due_job_source_sync_graph(
+    *,
+    lead_service: JobLeadService,
+    university_provider: UniversityCareerContentProvider,
+    social_provider: SocialLeadProvider,
+):
+    END, START, StateGraph = _load_langgraph_graph()
+
+    def sync_due_sources_node(state: DueJobSourceSyncState) -> DueJobSourceSyncState:
+        return {
+            "result": run_due_job_source_syncs(
+                state["command"],
+                lead_service=lead_service,
+                university_provider=university_provider,
+                social_provider=social_provider,
+            )
+        }
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = StateGraph(DueJobSourceSyncState)
+        graph.add_node("sync_due_sources", sync_due_sources_node)
+        graph.add_edge(START, "sync_due_sources")
+        graph.add_edge("sync_due_sources", END)
+        return graph.compile()
+
+
+def _load_langgraph_graph():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from langgraph.graph import END, START, StateGraph
+
+    return END, START, StateGraph

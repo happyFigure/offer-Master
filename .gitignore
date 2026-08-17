@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
 .idea/
 *.egg-info/
 .venv/
@@ -15,6 +16,8 @@ build/
 *.tsbuildinfo
 logs/
 runtime/
+.runtime/
+.tmp-test-artifacts/
 .env
 .env.*
 !.env.example
@@ -34,3 +37,5 @@ data/vector_store/*
 !data/uploads/.gitkeep
 !data/exports/.gitkeep
 !data/vector_store/.gitkeep
+vendor/external-skills/*
+!vendor/external-skills/README.md

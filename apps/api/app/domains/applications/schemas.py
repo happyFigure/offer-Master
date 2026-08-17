@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from app.domains.applications.models import ApplicationStatus
+from app.domains.jobs.schemas import JobImportDraft, JobSummaryRead
 
 
 class ApplicationCreate(BaseModel):
@@ -16,6 +17,27 @@ class ApplicationCreate(BaseModel):
     applied_at: datetime | None = None
     next_follow_up_at: datetime | None = None
     notes: str | None = None
+
+
+class ApplicationFromJobCreate(BaseModel):
+    job: JobImportDraft
+    status: ApplicationStatus = ApplicationStatus.EVALUATING
+    priority: str = "medium"
+    channel: str | None = None
+    applied_at: datetime | None = None
+    next_follow_up_at: datetime | None = None
+    notes: str | None = None
+
+
+class ApplicationUpdate(BaseModel):
+    status: ApplicationStatus | None = None
+    priority: str | None = None
+    channel: str | None = None
+    applied_at: datetime | None = None
+    next_follow_up_at: datetime | None = None
+    notes: str | None = None
+    actor: str = "user"
+    source: str = "manual"
 
 
 class ApplicationEventCreate(BaseModel):
@@ -43,6 +65,14 @@ class ApplicationRead(BaseModel):
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ApplicationBoardItem(ApplicationRead):
+    job: JobSummaryRead
+
+
+class ApplicationListResponse(BaseModel):
+    items: list[ApplicationBoardItem]
 
 
 class ApplicationEventRead(BaseModel):

@@ -54,6 +54,14 @@ class Settings(BaseSettings):
         default="open_page,read_page,fill_form",
         validation_alias="JOBPILOT_MCP_TOOL_ALLOWLIST",
     )
+    xiaohongshu_mcp_base_url: str | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_XIAOHONGSHU_MCP_BASE_URL",
+    )
+    xiaohongshu_mcp_auth_token: SecretStr | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_XIAOHONGSHU_MCP_AUTH_TOKEN",
+    )
     job_providers: str = Field(
         default="mock,import_file",
         validation_alias="JOBPILOT_JOB_PROVIDERS",
@@ -113,10 +121,10 @@ class Settings(BaseSettings):
             return value
         return PROJECT_ROOT / value
 
-    @field_validator("llm_base_url", mode="after")
+    @field_validator("llm_base_url", "xiaohongshu_mcp_base_url", mode="after")
     @classmethod
-    def strip_base_url(cls, value: str) -> str:
-        return value.rstrip("/")
+    def strip_base_url(cls, value: str | None) -> str | None:
+        return value.rstrip("/") if value else value
 
 
 @lru_cache

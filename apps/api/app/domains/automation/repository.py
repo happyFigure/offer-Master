@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.domains.automation.models import (
@@ -77,6 +79,26 @@ class ApprovalRequestRepository:
         self._session.add(approval_request)
         self._session.flush()
         return approval_request
+
+    def mark_decision(
+        self,
+        approval_request_id: str,
+        *,
+        status: str,
+        decision: str,
+        decided_at: datetime,
+    ) -> ApprovalRequest:
+        self._session.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == approval_request_id)
+            .values(status=status, decision=decision, decided_at=decided_at)
+        )
+        self._session.flush()
+        approval = self.get(approval_request_id)
+        if approval is None:
+            raise ValueError(f"Approval request not found: {approval_request_id}")
+        self._session.refresh(approval)
+        return approval
 
 
 class AutomationRunRepository:

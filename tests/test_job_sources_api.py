@@ -50,6 +50,41 @@ class FakeUniversityCareerProvider:
         ]
 
 
+class FakeRestrictedUniversityCareerProvider:
+    def fetch(self, entry_url, limit):
+        raise RuntimeError("access restricted: redirected to captcha page")
+
+
+class FakeOfferIOProvider:
+    def list_company_openings(self, **kwargs):
+        from app.domains.jobs.providers.offerio import OfferIOCompanyOpening, OfferIOPage
+
+        self.kwargs = kwargs
+        return OfferIOPage(
+            items=[
+                OfferIOCompanyOpening(
+                    id="opening-001",
+                    company_name="Tencent",
+                    company_nature="private",
+                    industry="internet/software",
+                    batch="autumn",
+                    target="2027",
+                    location="Shenzhen",
+                    positions="Java backend, AI agent platform " * 20,
+                    update_date="2026/08/17",
+                    deadline="until filled",
+                    apply_link="https://join.qq.com/",
+                    has_written_test="written test required",
+                    raw_payload={"id": "opening-001"},
+                )
+            ],
+            page=1,
+            page_size=50,
+            total=1,
+            total_pages=1,
+        )
+
+
 class FakeOpenLeadVerifier:
     def verify(self, lead):
         from app.domains.jobs.verification import LeadVerificationCheck
@@ -80,9 +115,10 @@ class JobSourcesApiTest(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _app(self, social_provider=None, university_provider=None, lead_verifier=None):
+    def _app(self, social_provider=None, university_provider=None, lead_verifier=None, offerio_provider=None):
         from app.api.v1.job_sources import (
             get_lead_verifier,
+            get_offerio_provider,
             get_social_lead_provider,
             get_university_career_provider,
         )
@@ -102,6 +138,8 @@ class JobSourcesApiTest(unittest.TestCase):
             app.dependency_overrides[get_university_career_provider] = lambda: university_provider
         if lead_verifier is not None:
             app.dependency_overrides[get_lead_verifier] = lambda: lead_verifier
+        if offerio_provider is not None:
+            app.dependency_overrides[get_offerio_provider] = lambda: offerio_provider
         return app
 
     def test_create_and_list_job_sources(self):
@@ -129,6 +167,94 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertEqual(200, list_response.status_code)
         self.assertEqual("小红书-薯条派秋招汇总", created_response.json()["name"])
         self.assertEqual("xiaohongshu_note", list_response.json()["items"][0]["source_type"])
+
+    def test_update_and_disable_job_source(self):
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                created = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "DLMU wrong source",
+                        "source_type": "university_career_site",
+                        "entry_url": "https://mp.weixin.qq.com/s/example",
+                        "trust_level": "high",
+                        "fetch_mode": "public_html",
+                    },
+                )
+                source_id = created.json()["id"]
+                updated = await client.patch(
+                    f"/api/v1/job-sources/{source_id}",
+                    json={
+                        "name": "DLMU WeChat article",
+                        "source_type": "wechat_article",
+                        "fetch_mode": "manual_clip",
+                        "trust_level": "medium_high",
+                        "sync_interval_hours": 12,
+                        "notes": "Corrected source type after manual test.",
+                    },
+                )
+                disabled = await client.delete(f"/api/v1/job-sources/{source_id}")
+                listed = await client.get("/api/v1/job-sources")
+                return created, updated, disabled, listed
+
+        created_response, updated_response, disabled_response, list_response = run(call_api())
+
+        self.assertEqual(201, created_response.status_code)
+        self.assertEqual(200, updated_response.status_code)
+        self.assertEqual("DLMU WeChat article", updated_response.json()["name"])
+        self.assertEqual("wechat_article", updated_response.json()["source_type"])
+        self.assertEqual("manual_clip", updated_response.json()["fetch_mode"])
+        self.assertEqual("medium_high", updated_response.json()["trust_level"])
+        self.assertEqual(12, updated_response.json()["sync_interval_hours"])
+        self.assertEqual(200, disabled_response.status_code)
+        self.assertFalse(disabled_response.json()["enabled"])
+        self.assertEqual([], list_response.json()["items"])
+
+    def test_create_source_reactivates_disabled_source_with_same_name(self):
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                created = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "DLMU WeChat account",
+                        "source_type": "wechat_article",
+                        "entry_url": "https://mp.weixin.qq.com/s/old",
+                        "trust_level": "medium_high",
+                        "fetch_mode": "manual_clip",
+                    },
+                )
+                source_id = created.json()["id"]
+                await client.delete(f"/api/v1/job-sources/{source_id}")
+                recreated = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "DLMU WeChat account",
+                        "source_type": "wechat_account",
+                        "entry_url": "gh_dlmujob",
+                        "trust_level": "high",
+                        "fetch_mode": "mcp_visible_page",
+                        "sync_interval_hours": 24,
+                    },
+                )
+                listed = await client.get("/api/v1/job-sources")
+                return source_id, recreated, listed
+
+        source_id, recreated_response, list_response = run(call_api())
+
+        self.assertEqual(201, recreated_response.status_code)
+        self.assertEqual(source_id, recreated_response.json()["id"])
+        self.assertTrue(recreated_response.json()["enabled"])
+        self.assertEqual("wechat_account", recreated_response.json()["source_type"])
+        self.assertEqual("mcp_visible_page", recreated_response.json()["fetch_mode"])
+        self.assertEqual("gh_dlmujob", recreated_response.json()["entry_url"])
+        self.assertEqual(1, len(list_response.json()["items"]))
+        self.assertEqual(source_id, list_response.json()["items"][0]["id"])
 
     def test_create_verify_and_convert_job_lead(self):
         from app.domains.jobs.models import Job
@@ -290,6 +416,90 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertEqual("succeeded", runs[0].status)
         self.assertEqual("extracted", raw_leads[0].status)
         self.assertEqual("Xiaomi", stored_leads[0].company_name)
+
+    def test_sync_offerio_official_api_source_creates_raw_and_job_leads(self):
+        from app.domains.jobs.models import JobLead, RawJobLead, SourceSyncRun
+
+        offerio_provider = FakeOfferIOProvider()
+        app = self._app(offerio_provider=offerio_provider)
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "OfferIO company openings",
+                        "source_type": "official_api",
+                        "entry_url": "https://offerio.work/api/recruitment/companies?page=1&pageSize=50",
+                        "trust_level": "medium_high",
+                        "fetch_mode": "official_api",
+                    },
+                )
+                synced = await client.post(
+                    f"/api/v1/job-sources/{source.json()['id']}/sync",
+                    json={"limit": 50},
+                )
+                return synced
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            runs = session.scalars(select(SourceSyncRun)).all()
+            raw_leads = session.scalars(select(RawJobLead)).all()
+            stored_leads = session.scalars(select(JobLead)).all()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("succeeded", response.json()["status"])
+        self.assertEqual(1, response.json()["fetched_count"])
+        self.assertEqual(1, response.json()["extracted_count"])
+        self.assertEqual(50, offerio_provider.kwargs["page_size"])
+        self.assertEqual(1, len(runs))
+        self.assertEqual("application/json", raw_leads[0].content_type)
+        self.assertEqual("Tencent", stored_leads[0].company_name)
+        self.assertLessEqual(len(stored_leads[0].title), 255)
+        self.assertLessEqual(len(stored_leads[0].job_direction), 128)
+        self.assertTrue(stored_leads[0].job_direction.startswith("Java backend"))
+
+    def test_sync_source_returns_failed_run_when_provider_access_is_restricted(self):
+        from app.domains.jobs.models import SourceSyncRun
+
+        app = self._app(
+            social_provider=FakeSocialLeadProvider(),
+            university_provider=FakeRestrictedUniversityCareerProvider(),
+        )
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "WeChat article saved as source",
+                        "source_type": "university_career_site",
+                        "entry_url": "https://mp.weixin.qq.com/s/example",
+                        "trust_level": "high",
+                        "fetch_mode": "public_html",
+                    },
+                )
+                return await client.post(
+                    f"/api/v1/job-sources/{source.json()['id']}/sync",
+                    json={"limit": 5},
+                )
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            runs = session.scalars(select(SourceSyncRun)).all()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("failed", response.json()["status"])
+        self.assertEqual(0, response.json()["fetched_count"])
+        self.assertEqual(1, response.json()["failed_count"])
+        self.assertIn("验证码", response.json()["error"])
+        self.assertEqual(1, len(runs))
+        self.assertEqual("failed", runs[0].status)
+        self.assertIn("验证码", runs[0].error)
 
     def test_lazy_verify_job_lead_converts_to_formal_job(self):
         from app.domains.jobs.models import Job

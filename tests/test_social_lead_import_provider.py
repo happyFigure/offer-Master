@@ -66,6 +66,22 @@ class SocialLeadImportProviderTest(unittest.TestCase):
         self.assertEqual(JobSourceTrustLevel.MEDIUM, drafts[0].trust_level)
         self.assertEqual("蚂蚁集团", drafts[1].company_name)
 
+    def test_provider_accepts_string_trust_level_loaded_from_database(self):
+        from app.domains.jobs.providers.social_lead import SocialLeadImportProvider
+
+        provider = SocialLeadImportProvider(extractor=FakeExtractor())
+
+        drafts = provider.extract(
+            source_id="source-001",
+            raw_lead_id="raw-001",
+            raw_content="小米、蚂蚁集团 2027 秋招开放，后端和 Agent 岗位。",
+            source_url="https://mp.weixin.qq.com/s/example",
+            trust_level="high",
+        )
+
+        self.assertEqual(2, len(drafts))
+        self.assertEqual("high", drafts[0].trust_level)
+
 
 if __name__ == "__main__":
     unittest.main()

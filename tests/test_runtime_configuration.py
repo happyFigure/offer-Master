@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,23 @@ class RuntimeConfigurationTest(unittest.TestCase):
         self.assertEqual("web_speech", settings.speech_provider)
         self.assertEqual(30, settings.worker_poll_interval_seconds)
         self.assertEqual(3, settings.worker_max_retries)
+
+    def test_xiaohongshu_rest_service_can_be_configured_without_c_drive_runtime_state(self):
+        from app.core.config import Settings
+
+        with patch.dict(
+            "os.environ",
+            {
+                "JOBPILOT_XIAOHONGSHU_MCP_BASE_URL": "http://127.0.0.1:18060/",
+                "JOBPILOT_XIAOHONGSHU_MCP_AUTH_TOKEN": "local-test-token",
+            },
+            clear=False,
+        ):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual("http://127.0.0.1:18060", settings.xiaohongshu_mcp_base_url)
+        self.assertEqual("local-test-token", settings.xiaohongshu_mcp_auth_token.get_secret_value())
+        self.assertNotEqual("c:", settings.imports_path.drive.lower())
 
 
 if __name__ == "__main__":

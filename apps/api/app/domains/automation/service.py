@@ -144,3 +144,28 @@ class AutomationService:
                 occurred_at=utc_now(),
             ),
         )
+
+    def decide_approval(self, approval_request_id: str, *, approved: bool, decision: str | None = None) -> ApprovalRequest:
+        approval = self._approvals.get(approval_request_id)
+        if approval is None:
+            raise ValueError(f"Approval request not found: {approval_request_id}")
+        if approval.status != ApprovalRequestStatus.PENDING:
+            raise ValueError(f"Approval request is not pending: {approval_request_id}")
+
+        decision_status = ApprovalRequestStatus.APPROVED.value if approved else ApprovalRequestStatus.REJECTED.value
+        approval = self._approvals.mark_decision(
+            approval_request_id,
+            status=decision_status,
+            decision=decision or decision_status,
+            decided_at=utc_now(),
+        )
+
+        workflow_run = approval.workflow_run
+        if approved:
+            workflow_run.status = WorkflowRunStatus.RUNNING.value
+        else:
+            workflow_run.status = WorkflowRunStatus.CANCELED.value
+            workflow_run.current_step = "approval_rejected"
+            workflow_run.completed_at = utc_now()
+        self._workflow_runs.flush()
+        return approval

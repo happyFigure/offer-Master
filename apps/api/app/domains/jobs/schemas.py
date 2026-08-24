@@ -307,7 +307,12 @@ class JobSourceListResponse(BaseModel):
 
 
 class JobSourceSyncRequest(BaseModel):
-    limit: int = Field(default=20, ge=1, le=100)
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=5000,
+        description="Maximum total items to sync. OfferIO official API pagination still requests 50 items per page.",
+    )
 
 
 class JobSourceSyncResponse(BaseModel):

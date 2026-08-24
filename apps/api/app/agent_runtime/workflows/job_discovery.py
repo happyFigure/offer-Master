@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from math import ceil
 from typing import Protocol, TypedDict
 import warnings
 
@@ -54,7 +55,7 @@ class UniversityCareerSyncResult:
 @dataclass(frozen=True)
 class OfficialApiSyncCommand:
     source_id: str
-    limit: int = 50
+    limit: int = 1000
 
 
 @dataclass(frozen=True)
@@ -268,11 +269,14 @@ def run_offerio_official_api_source_sync(
     sync_run = lead_service.start_sync_run(SourceSyncRunCreate(source_id=command.source_id))
     raw_captures: list[RawJobLeadCaptureResult] = []
     leads: list[JobLead] = []
+    limit = max(1, command.limit)
 
     try:
         if "/api/recruitment/companies" in source.entry_url:
-            page = provider.list_company_openings(page=1, page_size=command.limit)
-            items = list(page.items)
+            items = _fetch_offerio_pages(
+                lambda page, page_size: provider.list_company_openings(page=page, page_size=page_size),
+                limit=limit,
+            )
             for item in items:
                 raw_capture = lead_service.capture_raw_lead(
                     RawJobLeadCreate(
@@ -289,8 +293,10 @@ def run_offerio_official_api_source_sync(
                 leads.append(lead)
                 lead_service.mark_raw_lead_extracted(raw_capture.raw_lead)
         elif "/api/recruitment/job-companies" in source.entry_url:
-            page = provider.list_companies(job_type="校招", page=1, page_size=command.limit)
-            items = list(page.items)
+            items = _fetch_offerio_pages(
+                lambda page, page_size: provider.list_companies(job_type="校招", page=page, page_size=page_size),
+                limit=limit,
+            )
             for item in items:
                 raw_capture = lead_service.capture_raw_lead(
                     RawJobLeadCreate(
@@ -344,6 +350,49 @@ def run_offerio_official_api_source_sync(
         extracted_count=len(leads),
         failed_count=0,
     )
+
+
+def _fetch_offerio_pages(fetch_page, *, limit: int, max_page_size: int = 50) -> list:
+    items: list = []
+    page_number = 1
+    page_size = max_page_size
+    while len(items) < limit:
+        page = fetch_page(page_number, page_size)
+        page_items = list(getattr(page, "items", []) or [])
+        if not page_items:
+            break
+
+        remaining = limit - len(items)
+        items.extend(page_items[:remaining])
+        if len(items) >= limit:
+            break
+
+        total_pages = _offerio_total_pages(page, page_size)
+        current_page = _positive_int(getattr(page, "page", None)) or page_number
+        if total_pages is not None and current_page >= total_pages:
+            break
+        if total_pages is None and len(page_items) < page_size:
+            break
+        page_number += 1
+    return items[:limit]
+
+
+def _offerio_total_pages(page, page_size: int) -> int | None:
+    total_pages = _positive_int(getattr(page, "total_pages", None))
+    total = _positive_int(getattr(page, "total", None))
+    if total is not None and total > page_size:
+        inferred_pages = ceil(total / page_size)
+        if total_pages is None or total_pages < inferred_pages:
+            total_pages = inferred_pages
+    return total_pages
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def run_wechat_account_source_sync(

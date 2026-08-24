@@ -11,8 +11,16 @@ from app.infrastructure.llm.client import LLMRuntimeConfig, build_llm_runtime_co
 
 
 @dataclass(frozen=True)
+class LLMToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class LLMChatCompletion:
     content: str
+    tool_calls: list[LLMToolCall] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     raw_response: dict[str, Any] = field(default_factory=dict)
 
@@ -26,12 +34,22 @@ class LLMChatClient:
         self._config = config or build_llm_runtime_config()
         self._client = client
 
-    def complete(self, *, messages: list[dict[str, Any]]) -> LLMChatCompletion:
+    def complete(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMChatCompletion:
         payload = {
             "model": self._config.model,
             "temperature": 0.2,
             "messages": _normalize_messages(messages),
         }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         response_payload = self._post_chat_completion(payload)
         return _parse_chat_completion(response_payload)
 
@@ -109,14 +127,48 @@ def _parse_chat_completion(response_payload: dict[str, Any]) -> LLMChatCompletio
         raise RuntimeError("LLM response did not contain choices")
     message = choices[0].get("message", {})
     content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("LLM response did not contain assistant text content")
+    tool_calls = _parse_tool_calls(message.get("tool_calls"))
+    if not isinstance(content, str):
+        content = ""
+    if not content.strip() and not tool_calls:
+        raise RuntimeError("LLM response did not contain assistant text content or tool calls")
     usage = response_payload.get("usage")
     return LLMChatCompletion(
         content=content,
+        tool_calls=tool_calls,
         usage=usage if isinstance(usage, dict) else {},
         raw_response=response_payload,
     )
+
+
+def _parse_tool_calls(raw_tool_calls: Any) -> list[LLMToolCall]:
+    if not isinstance(raw_tool_calls, list):
+        return []
+    parsed: list[LLMToolCall] = []
+    for index, raw_call in enumerate(raw_tool_calls):
+        if not isinstance(raw_call, dict):
+            continue
+        function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        raw_arguments = function.get("arguments")
+        arguments: dict[str, Any]
+        if isinstance(raw_arguments, dict):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, str) and raw_arguments.strip():
+            loaded = json.loads(raw_arguments)
+            arguments = loaded if isinstance(loaded, dict) else {}
+        else:
+            arguments = {}
+        parsed.append(
+            LLMToolCall(
+                id=str(raw_call.get("id") or f"tool-call-{index}"),
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return parsed
 
 
 def _parse_chat_completion_stream(lines: Iterator[str | bytes]) -> Iterator[str]:

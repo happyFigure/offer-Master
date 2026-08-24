@@ -144,6 +144,94 @@ class AgentToolPermissionPolicyTest(TestCase):
         self.assertEqual("TOOL_SKILL_CONFIRMATION_REQUIRED", result.error_code)
         self.assertEqual("ask", result.error_details["permission_decision"])
 
+    def test_low_risk_external_web_search_can_run_outside_skill_allowlist(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
+        from app.agent_runtime.tool_registry import (
+            EXTERNAL_WEB_SEARCH_TOOL,
+            AgentToolDefinition,
+            AgentToolRegistry,
+            AgentToolRiskLevel,
+        )
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search public web results through an external agent.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.LOW,
+                    requires_confirmation=False,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            ]
+        )
+        policy = AgentToolPermissionPolicy.from_skill_metadata(
+            "skill-wechat",
+            {"allowed_tools": ["weixin-articles-mcp.read_article"]},
+        )
+
+        result = AgentToolRuntimeGuard().pre_check(
+            AgentToolCallContext(stage="search", tool_name=EXTERNAL_WEB_SEARCH_TOOL, source_type="agent_chat"),
+            registry=registry,
+            skill_permission_policy=policy,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("allow_low_risk_runtime_capability", result.artifacts["skill_permission_decision"])
+        self.assertEqual("skill-wechat", result.artifacts["skill_id"])
+
+    def test_low_risk_local_overview_tools_can_run_outside_skill_allowlist(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
+        from app.agent_runtime.tool_registry import (
+            LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+            LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+            AgentToolDefinition,
+            AgentToolRegistry,
+            AgentToolRiskLevel,
+        )
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name=LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+                    description="Read local company database overview.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.LOW,
+                    requires_confirmation=False,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                ),
+                AgentToolDefinition(
+                    name=LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+                    description="Read local job source and company board overview.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.LOW,
+                    requires_confirmation=False,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                ),
+            ]
+        )
+        policy = AgentToolPermissionPolicy.from_skill_metadata(
+            "skill-wechat",
+            {"allowed_tools": ["weixin-articles-mcp.read_article"]},
+        )
+
+        for tool_name in (LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, LOCAL_JOB_SOURCE_OVERVIEW_TOOL):
+            with self.subTest(tool_name=tool_name):
+                result = AgentToolRuntimeGuard().pre_check(
+                    AgentToolCallContext(stage="overview", tool_name=tool_name, source_type="agent_chat"),
+                    registry=registry,
+                    skill_permission_policy=policy,
+                )
+
+                self.assertTrue(result.ok)
+                self.assertEqual("allow_low_risk_runtime_capability", result.artifacts["skill_permission_decision"])
+                self.assertEqual("skill-wechat", result.artifacts["skill_id"])
+
     def test_skill_permission_policy_round_trips_loaded_skill_snapshot(self) -> None:
         from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
 

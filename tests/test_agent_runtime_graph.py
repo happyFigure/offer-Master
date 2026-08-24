@@ -1,6 +1,7 @@
 import sys
 import unittest
 import shutil
+from datetime import date
 from pathlib import Path
 
 from sqlalchemy import create_engine, select
@@ -14,6 +15,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
 class AgentRuntimeGraphTest(unittest.TestCase):
     def setUp(self) -> None:
         from app.db.base import Base
+        import app.agent_runtime.durable_state.models  # noqa: F401
+        import app.agent_runtime.external_tasks.models  # noqa: F401
         import app.domains.agent_memory.models  # noqa: F401
         import app.domains.automation.models  # noqa: F401
         import app.domains.conversations.models  # noqa: F401
@@ -29,7 +32,17 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.engine.dispose()
         shutil.rmtree(self.skill_root, ignore_errors=True)
 
-    def _dependencies(self, session, *, skill_repository=None, llm_client=None):
+    def _dependencies(
+        self,
+        session,
+        *,
+        skill_repository=None,
+        llm_client=None,
+        intent_detector=None,
+        execution_planner=None,
+        capability_routing_middleware=None,
+        durable_state_service=None,
+    ):
         from app.agent_runtime.checkpoints import AgentCheckpointStore
         from app.agent_runtime.guardrails import AgentToolPolicy, AgentToolRuntimeGuard
         from app.agent_runtime.graph_factory import AgentGraphDependencies
@@ -59,6 +72,10 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             skill_repository=skill_repository,
             db_session=session,
             llm_client=llm_client,
+            intent_detector=intent_detector,
+            execution_planner=execution_planner,
+            capability_routing_middleware=capability_routing_middleware,
+            durable_state_service=durable_state_service,
         )
 
     def _skill_repository(self, session):
@@ -108,6 +125,33 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual([], result.state.loaded_skill_ids)
         self.assertEqual([], result.state.tool_call_ids)
 
+    def test_local_company_overview_uses_requested_sample_count_from_user_message(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, _resolved_tool_input
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL
+
+        for message, expected_limit in (
+            ("给我看一下有哪些公司，给我20个就行", 20),
+            ("列出三十七家公司", 37),
+            ("给我80家公司", 50),
+        ):
+            with self.subTest(message=message):
+                command = AgentRunCommand(
+                    session_id="session-1",
+                    user_message=message,
+                    requested_tool_name=LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+                )
+                state = AgentState(
+                    session_id="session-1",
+                    workflow_run_id="workflow-1",
+                    agent_run_id="agent-run-1",
+                    user_message=message,
+                    current_step="maybe_tool",
+                    requested_tool_name=LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+                )
+
+                self.assertEqual({"sample_limit": expected_limit}, _resolved_tool_input(command, state))
+
     def test_agent_run_checkpoints_loaded_skill_ids_from_runtime_context(self) -> None:
         from app.agent_runtime.checkpoints import AgentCheckpointStore
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -138,6 +182,61 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         self.assertEqual([skill.id], result.state.loaded_skill_ids)
         self.assertEqual([skill.id], latest.state.loaded_skill_ids)
+
+    def test_context_builder_loaded_skill_and_history_are_recorded_as_memory_snapshots(self) -> None:
+        from app.agent_runtime.durable_state.models import AgentMemorySnapshot
+        from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
+        from app.agent_runtime.durable_state.service import DurableStateService
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.agent_memory.schemas import AgentSkillCreate
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            skill_repository = self._skill_repository(session)
+            skill = skill_repository.create_skill(
+                AgentSkillCreate(
+                    name="java-context-snapshot",
+                    title="Java Context Snapshot",
+                    description="Use this skill when the user asks for Java campus recruiting leads.",
+                    category="job_discovery",
+                )
+            )
+            durable_state_service = DurableStateService(SqlAlchemyDurableStateRepository(session))
+            dependencies = self._dependencies(
+                session,
+                skill_repository=skill_repository,
+                durable_state_service=durable_state_service,
+            )
+            previous_message = dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text="previous Java campus target context",
+                    visible_content_text="previous Java campus target context",
+                    token_estimate=8,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="Java"),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+            snapshots = list(session.scalars(select(AgentMemorySnapshot)).all())
+
+        snapshots_by_memory_id = {snapshot.memory_id: snapshot for snapshot in snapshots}
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertIn(skill.id, snapshots_by_memory_id)
+        self.assertIn(previous_message.id, snapshots_by_memory_id)
+        self.assertEqual("agent_skill", snapshots_by_memory_id[skill.id].source_type)
+        self.assertIn("ContextBuilder loaded skill", snapshots_by_memory_id[skill.id].usage_reason)
+        self.assertEqual("session_history", snapshots_by_memory_id[previous_message.id].source_type)
+        self.assertIn("ContextBuilder loaded session history", snapshots_by_memory_id[previous_message.id].usage_reason)
+        self.assertFalse(snapshots_by_memory_id[skill.id].passed_to_executor)
+        self.assertFalse(snapshots_by_memory_id[previous_message.id].passed_to_executor)
 
     def test_high_risk_tool_stops_at_waiting_user_confirmation_node(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -461,7 +560,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             messages = dependencies.conversation_service.list_messages(session_id, limit=20)
 
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual("handler", tool_log.output_payload["execution"])
+        self.assertEqual("agent_runtime", tool_log.output_payload["execution"])
+        self.assertEqual("agent_tool_registry", tool_log.output_payload["agent_runtime"]["executor_id"])
         self.assertEqual("sessions", tool_log.output_payload["result"]["corpus"])
         self.assertIn("previous Java anchor", tool_log.output_payload["result"]["items"][0]["excerpt"])
         self.assertEqual([tool_log.id], result.state.tool_call_ids)
@@ -515,8 +615,163 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual([{"tool_name": "open_page", "arguments": {"url": "https://example.com"}}], fake_client.calls)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual("mcp.open_page", tool_log.tool_name)
-        self.assertEqual("handler", tool_log.output_payload["execution"])
+        self.assertEqual("agent_runtime", tool_log.output_payload["execution"])
+        self.assertEqual("agent_tool_registry", tool_log.output_payload["agent_runtime"]["executor_id"])
         self.assertEqual("Example", tool_log.output_payload["result"]["result"]["title"])
+        self.assertEqual([tool_log.id], result.state.tool_call_ids)
+
+    def test_web_search_can_be_dispatched_to_registered_claude_sdk_agent_executor(self) -> None:
+        from app.agent_runtime.agent_as_tool import CLAUDE_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        calls = []
+
+        class FakeClaudeSdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                calls.append({"task": task, "context": context})
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="腾讯校招官网：https://join.qq.com/",
+                    observation="腾讯校招官网可查看产品岗。",
+                    evidence=[{"type": "url", "title": "腾讯校招", "url": "https://join.qq.com/"}],
+                    raw_result={
+                        "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                        "ok": True,
+                        "result": {
+                            "executor_name": CLAUDE_SDK_AGENT_EXECUTOR_ID,
+                            "query": task.input_payload["query"],
+                            "answer": "腾讯校招官网：https://join.qq.com/",
+                            "artifacts": [{"type": "url", "title": "腾讯校招", "url": "https://join.qq.com/"}],
+                        },
+                    },
+                )
+
+        def legacy_handler(_session, **_arguments):
+            raise AssertionError("legacy handler should not run when claude-sdk-agent is registered for web search")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=legacy_handler,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={CLAUDE_SDK_AGENT_EXECUTOR_ID: FakeClaudeSdkAgent()},
+                capability_executor_ids={EXTERNAL_WEB_SEARCH_TOOL: CLAUDE_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="搜一下腾讯校招官网",
+                    requested_tool_name=EXTERNAL_WEB_SEARCH_TOOL,
+                    source_type="agent_chat",
+                    tool_input={"query": "腾讯 校园招聘 官网"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("agent_runtime", tool_log.output_payload["execution"])
+        self.assertEqual(CLAUDE_SDK_AGENT_EXECUTOR_ID, tool_log.output_payload["agent_runtime"]["executor_id"])
+        self.assertEqual(CLAUDE_SDK_AGENT_EXECUTOR_ID, tool_log.output_payload["result"]["result_envelope"]["executor"])
+        self.assertEqual("腾讯 校园招聘 官网", calls[0]["task"].input_payload["query"])
+        self.assertEqual(CLAUDE_SDK_AGENT_EXECUTOR_ID, calls[0]["context"].namespace)
+        self.assertEqual([tool_log.id], result.state.tool_call_ids)
+
+    def test_agent_runtime_tool_call_records_transient_retry_metadata_after_recovery(self) -> None:
+        from app.agent_runtime.agent_as_tool import CLAUDE_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        calls = []
+
+        class FlakyClaudeSdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                calls.append({"task": task, "context": context})
+                if len(calls) < 3:
+                    return StandardAgentResult(
+                        status="failed",
+                        summary="SDK 限流，稍后重试",
+                        raw_result={
+                            "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                            "ok": False,
+                            "error": "429 rate limit",
+                            "error_type": "RateLimitError",
+                        },
+                    )
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="腾讯校招官网：https://join.qq.com/",
+                    raw_result={
+                        "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                        "ok": True,
+                        "result": {"answer": "腾讯校招官网：https://join.qq.com/"},
+                    },
+                )
+
+        def legacy_handler(_session, **_arguments):
+            raise AssertionError("legacy handler should not run when claude-sdk-agent is registered for web search")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=legacy_handler,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={CLAUDE_SDK_AGENT_EXECUTOR_ID: FlakyClaudeSdkAgent()},
+                capability_executor_ids={EXTERNAL_WEB_SEARCH_TOOL: CLAUDE_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="搜一下腾讯校招官网",
+                    requested_tool_name=EXTERNAL_WEB_SEARCH_TOOL,
+                    source_type="agent_chat",
+                    tool_input={"query": "腾讯 校园招聘 官网"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        retry = tool_log.output_payload["result"]["runtime_retry"]
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(3, len(calls))
+        self.assertTrue(retry["recovered"])
+        self.assertEqual(3, retry["attempts"])
+        self.assertEqual("RateLimitError", retry["errors"][0]["error_type"])
         self.assertEqual([tool_log.id], result.state.tool_call_ids)
 
     def test_agent_auto_selects_weixin_article_tool_from_public_article_url(self) -> None:
@@ -586,21 +841,57 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("weixin-articles-mcp.read_article", tool_log.tool_name)
         self.assertEqual({"url": "https://mp.weixin.qq.com/s/example"}, tool_log.input_payload)
 
-    def test_agent_auto_selects_xiaohongshu_search_tool_from_keyword_request(self) -> None:
+    def test_tool_choice_loop_enters_xiaohongshu_search_from_declared_content_tool(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
         from app.domains.agent_memory.schemas import AgentSkillCreate
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
         from app.mcp_gateway.client import MCPToolCallResult
 
         calls = []
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class LegacyRoutingShouldNotRun:
+            def decide(self, *, user_message, intent_frame, context_pack):  # pragma: no cover - failing path
+                raise AssertionError("legacy capability routing should not run before tool choice loop")
+
+        test_case = self
+
+        class FakeXiaohongshuSearchLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "小红书秋招笔记" not in combined:
+                    test_case.assertEqual(
+                        ["xiaohongshu_mcp_search_feeds"],
+                        [tool["function"]["name"] for tool in tools],
+                    )
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-xhs-search",
+                                name="xiaohongshu_mcp_search_feeds",
+                                arguments={"keyword": "2027 秋招 Java 岗位"},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="已从小红书找到 2027 秋招 Java 岗位相关笔记。")
 
         def fake_search(_session, *, keyword: str, filters=None) -> MCPToolCallResult:
             calls.append({"keyword": keyword, "filters": filters})
             return MCPToolCallResult(
                 tool_name="xiaohongshu-mcp.search_feeds",
                 ok=True,
-                result={"items": [{"title": "2027 秋招 Java"}]},
+                result={"items": [{"title": "小红书秋招笔记"}]},
             )
 
         with self.Session() as session:
@@ -612,11 +903,21 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                     title="Xiaohongshu Content Fetch",
                     description="Use this skill when the user asks to search Xiaohongshu recruiting notes.",
                     category="content_source",
-                    metadata_json={"allowed_tools": ["xiaohongshu-mcp.search_feeds"], "source_types": ["xiaohongshu_note"]},
+                    metadata_json={
+                        "allowed_tools": ["xiaohongshu-mcp.search_feeds"],
+                        "source_types": ["agent_chat", "xiaohongshu_note"],
+                    },
                     sections={"workflow": "Search Xiaohongshu recruiting notes."},
                 )
             )
-            dependencies = self._dependencies(session, skill_repository=skill_repository)
+            fake_llm = FakeXiaohongshuSearchLLM()
+            dependencies = self._dependencies(
+                session,
+                skill_repository=skill_repository,
+                llm_client=fake_llm,
+                intent_detector=FakeNormalIntentDetector(),
+                capability_routing_middleware=LegacyRoutingShouldNotRun(),
+            )
             registry = AgentToolRegistry(
                 definition
                 for definition in dependencies.registry.list_definitions()
@@ -630,6 +931,11 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                     output_schema={"type": "object", "required": ["tool_name", "ok"]},
                     handler=fake_search,
                     allowed_source_types=frozenset({"agent_chat", "xiaohongshu_note"}),
+                    candidate_profile=AgentToolCandidateProfile(
+                        categories=frozenset({"xiaohongshu_content_search", "content_source_search"}),
+                        keywords=frozenset({"小红书", "红书", "搜索笔记"}),
+                        examples=("请在小红书搜索 2027 秋招 Java 岗位",),
+                    ),
                 )
             )
 
@@ -643,10 +949,18 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             tool_log = session.scalars(select(ToolCallLog)).one()
 
         self.assertEqual("xiaohongshu-mcp.search_feeds", result.state.requested_tool_name)
-        self.assertEqual("xiaohongshu_note", result.state.source_type)
-        self.assertEqual([{"keyword": message, "filters": None}], calls)
+        self.assertEqual("agent_chat", result.state.source_type)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("已从小红书找到 2027 秋招 Java 岗位相关笔记。", result.state.final_response)
+        self.assertIn(
+            "xiaohongshu-mcp.search_feeds",
+            result.state.context_metadata["tool_candidate_selection"]["capabilities"],
+        )
+        self.assertNotIn("capability_routing", result.state.context_metadata)
+        self.assertEqual([{"keyword": "2027 秋招 Java 岗位", "filters": None}], calls)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual("xiaohongshu-mcp.search_feeds", tool_log.tool_name)
+        self.assertEqual(2, len(fake_llm.calls))
 
     def test_agent_records_failed_status_when_tool_result_ok_false(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -699,6 +1013,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 AgentRunCommand(
                     session_id=session_id,
                     user_message="\u8bf7\u5728\u5c0f\u7ea2\u4e66\u641c\u7d22 2027 \u79cb\u62db Java \u5c97\u4f4d",
+                    requested_tool_name="xiaohongshu-mcp.search_feeds",
+                    source_type="xiaohongshu_note",
                 ),
                 dependencies=dependencies.with_registry(registry),
             )
@@ -778,6 +1094,2637 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual("xiaohongshu-mcp.get_feed_detail", tool_log.tool_name)
 
+    def test_agent_does_not_auto_select_offerio_company_jobs_sync_from_update_request(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog
+
+        calls = []
+
+        def fake_sync(_session, *, limit: int = 50, source_id: str | None = None):
+            calls.append({"limit": limit, "source_id": source_id})
+            return {
+                "tool_name": "offerio.sync_company_jobs",
+                "ok": True,
+                "result": {
+                    "source_name": "OfferIO 公司聚合岗位库",
+                    "status": "succeeded",
+                    "fetched_count": 1,
+                    "extracted_count": 1,
+                    "failed_count": 0,
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != "offerio.sync_company_jobs"
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name="offerio.sync_company_jobs",
+                    description="Sync OfferIO company aggregated campus recruiting jobs into job leads.",
+                    input_schema={"type": "object", "properties": {"limit": {"type": "integer"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok"]},
+                    handler=fake_sync,
+                    allowed_source_types=frozenset({"agent_chat", "official_api", "job_discovery"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="请从 OfferIO 公司聚合岗位库更新一下岗位"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertIsNone(result.state.requested_tool_name)
+        self.assertEqual("agent_chat", result.state.source_type)
+        self.assertEqual([], calls)
+        self.assertEqual([], tool_logs)
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+
+    def test_agent_does_not_auto_select_external_web_search_for_recent_search_request(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog
+
+        calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "claude-sdk-agent",
+                    "query": query,
+                    "answer": "联网搜索结果：梅西最近一场比赛信息。",
+                    "sources": [{"title": "MLS", "url": "https://example.com/messi"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"]},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜索一下梅西最近的比赛"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertIsNone(result.state.requested_tool_name)
+        self.assertEqual("agent_chat", result.state.source_type)
+        self.assertEqual([], tool_logs)
+        self.assertEqual([], calls)
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+
+    def test_agent_context_engineering_records_campus_search_intent_without_running_tool(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        context_pack = result.state.context_metadata["context_pack"]
+        intent_frame = result.state.context_metadata["intent_frame"]
+        self.assertEqual("campus_recruiting_search", intent_frame["intent"])
+        self.assertEqual(["中科曙光"], intent_frame["entities"]["company_names"])
+        self.assertEqual(["external.web_search"], context_pack["allowed_capabilities"])
+        self.assertIn("offerio.sync_company_jobs", context_pack["excluded_capabilities"])
+        self.assertIsNone(result.state.requested_tool_name)
+        self.assertEqual([], result.state.tool_call_ids)
+        self.assertEqual([], tool_logs)
+
+    def test_capability_routing_middleware_keeps_normal_chat_out_of_execution_planner(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class PlannerShouldNotRun:
+            def plan(self, *, user_message, context_pack):  # pragma: no cover - failing path
+                raise AssertionError("planner should not run for chat_direct route")
+
+        class FakeLLMClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages):
+                self.calls.append(messages)
+                return LLMChatCompletion(content="Planner Gate 是规划器启用门控。")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            llm_client = FakeLLMClient()
+            dependencies = self._dependencies(
+                session,
+                llm_client=llm_client,
+                execution_planner=PlannerShouldNotRun(),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="Planner Gate 是什么？"),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+        routing = result.state.context_metadata["capability_routing"]
+        self.assertEqual("chat_direct", routing["route"])
+        self.assertEqual("llm", result.state.response_mode)
+        self.assertEqual("Planner Gate 是规划器启用门控。", result.state.final_response)
+        self.assertEqual(1, len(llm_client.calls))
+
+    def test_capability_routing_middleware_dispatches_campus_search_to_external_agent_tool(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "claude-sdk-agent",
+                    "answer": "联网搜索结果：中科曙光校园招聘官网：https://jobs.example.com/sugon",
+                    "sources": [{"title": "中科曙光校园招聘官网", "url": "https://jobs.example.com/sugon"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        routing = result.state.context_metadata["capability_routing"]
+        self.assertEqual("external_agent", routing["route"])
+        self.assertEqual("claude_sdk_agent", routing["executor_name"])
+        self.assertEqual([{"query": "中科曙光 校园招聘 官网", "max_results": 5}], search_calls)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("tool_result_summary", result.state.response_mode)
+        self.assertIn("中科曙光校园招聘官网", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        envelope = tool_log.output_payload["result"]["result_envelope"]
+        self.assertEqual("succeeded", envelope["status"])
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, envelope["capability"])
+        self.assertEqual("claude-sdk-agent", envelope["executor"])
+        self.assertIn("中科曙光校园招聘官网", envelope["summary"])
+        self.assertEqual("low", envelope["risk_level"])
+
+    def test_external_search_result_is_synthesized_by_main_llm_before_final_answer(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["公牛集团"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        test_case = self
+
+        class FakeMainLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                test_case.assertIn("芝加哥公牛队", combined)
+                test_case.assertIn("公牛集团校园招聘", combined)
+                test_case.assertIn("不要向用户展示无关结果", combined)
+                test_case.assertIn("不要解释过滤过程", combined)
+                return LLMChatCompletion(content="公牛集团校招入口：https://campus.gongniu.cn/。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "claude-sdk-agent",
+                    "answer": (
+                        "联网搜索结果：\n"
+                        "- 公牛集团校园招聘：https://campus.gongniu.cn/\n"
+                        "- 芝加哥公牛队_百度百科：NBA 球队资料：https://baike.baidu.com/item/bulls"
+                    ),
+                    "sources": [
+                        {"title": "公牛集团校园招聘", "url": "https://campus.gongniu.cn/"},
+                        {"title": "芝加哥公牛队_百度百科", "url": "https://baike.baidu.com/item/bulls"},
+                    ],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeMainLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你搜索一下公牛的校园招聘"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("llm_tool_result_summary", result.state.response_mode)
+        self.assertEqual("公牛集团校招入口：https://campus.gongniu.cn/。", result.state.final_response)
+        self.assertNotIn("NBA", result.state.final_response)
+        self.assertNotIn("芝加哥", result.state.final_response)
+        self.assertNotIn("过滤", result.state.final_response)
+        self.assertEqual(1, len(fake_llm.calls))
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+
+    def test_external_search_synthesis_does_not_expose_irrelevant_noisy_results(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["公牛集团"],"keywords":["2026年校园秋招"],"time_range":"2026"}}'
+                    )
+                )
+
+        test_case = self
+
+        class FakeMainLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                test_case.assertIn("汉字“我”", combined)
+                test_case.assertIn("我的世界", combined)
+                test_case.assertIn("不要提及无关结果的标题、类型、数量或分类", combined)
+                test_case.assertIn("不能因为检索结果全是无关内容，就推断目标公司尚未发布招聘", combined)
+                return LLMChatCompletion(content="我没有找到公牛集团 2026 年校园秋招的可靠招聘入口或官方公告。建议继续关注公牛集团官网招聘页、官方招聘公众号和高校就业网。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "claude-sdk-agent",
+                    "answer": (
+                        "联网搜索结果：\n"
+                        "- 我_百度百科：汉字“我”的解释\n"
+                        "- 张国荣歌曲《我》_百度百科\n"
+                        "- Minecraft 我的世界 官网"
+                    ),
+                    "sources": [
+                        {"title": "我_百度百科", "url": "https://baike.baidu.com/item/%E6%88%91"},
+                        {"title": "我的世界官网", "url": "https://www.minecraft.net/"},
+                    ],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                llm_client=FakeMainLLM(),
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="我要的是2026年的校园秋招信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+        self.assertEqual("llm_tool_result_summary", result.state.response_mode)
+        self.assertNotIn("汉字", result.state.final_response)
+        self.assertNotIn("张国荣", result.state.final_response)
+        self.assertNotIn("我的世界", result.state.final_response)
+        self.assertNotIn("这说明", result.state.final_response)
+        self.assertNotIn("尚未发布", result.state.final_response)
+
+    def test_capability_routing_middleware_dispatches_offerio_sync_to_local_workflow_tool(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import OFFERIO_COMPANY_JOBS_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        calls = []
+
+        def fake_sync(_session, *, limit: int = 50, source_id: str | None = None):
+            calls.append({"limit": limit, "source_id": source_id})
+            return {
+                "tool_name": OFFERIO_COMPANY_JOBS_TOOL,
+                "ok": True,
+                "result": {
+                    "source_name": "OfferIO 公司聚合岗位库",
+                    "status": "succeeded",
+                    "fetched_count": 50,
+                    "extracted_count": 50,
+                    "failed_count": 0,
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, capability_routing_middleware=CapabilityRoutingMiddleware())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != OFFERIO_COMPANY_JOBS_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=OFFERIO_COMPANY_JOBS_TOOL,
+                    description="Sync OfferIO company aggregated campus recruiting jobs into job leads.",
+                    input_schema={"type": "object", "properties": {"limit": {"type": "integer"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok"]},
+                    handler=fake_sync,
+                    allowed_source_types=frozenset({"agent_chat", "official_api", "job_discovery"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="请从 OfferIO 公司聚合岗位库更新一下岗位"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        routing = result.state.context_metadata["capability_routing"]
+        self.assertEqual("local_workflow", routing["route"])
+        self.assertEqual(OFFERIO_COMPANY_JOBS_TOOL, routing["capability"])
+        self.assertEqual([{"limit": 1000, "source_id": None}], calls)
+        self.assertEqual(OFFERIO_COMPANY_JOBS_TOOL, result.state.requested_tool_name)
+        self.assertEqual("tool_result_summary", result.state.response_mode)
+        self.assertIn("已从 OfferIO 公司聚合岗位库同步岗位", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+
+    def test_runtime_guard_blocks_routed_capability_outside_context_pack(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.schemas import RouteDecision
+        from app.agent_runtime.tool_registry import OFFERIO_COMPANY_JOBS_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class BadRoutingMiddleware:
+            def decide(self, *, user_message, intent_frame, context_pack):
+                return RouteDecision(
+                    route="local_workflow",
+                    capability=OFFERIO_COMPANY_JOBS_TOOL,
+                    executor_type="local_workflow",
+                    executor_name="offerio_company_jobs_sync",
+                    reason="bad route should be blocked",
+                    allowed_capabilities=list(context_pack.get("allowed_capabilities") or []),
+                    tool_input={"limit": 1000},
+                )
+
+        calls = []
+
+        def fake_sync(_session, *, limit: int = 50, source_id: str | None = None):
+            calls.append({"limit": limit, "source_id": source_id})
+            return {"tool_name": OFFERIO_COMPANY_JOBS_TOOL, "ok": True, "result": {}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=BadRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != OFFERIO_COMPANY_JOBS_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=OFFERIO_COMPANY_JOBS_TOOL,
+                    description="Sync OfferIO company aggregated campus recruiting jobs into job leads.",
+                    input_schema={"type": "object", "properties": {"limit": {"type": "integer"}}},
+                    output_schema={"type": "object", "required": ["tool_name", "ok"]},
+                    handler=fake_sync,
+                    allowed_source_types=frozenset({"agent_chat", "official_api", "job_discovery"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual([], calls)
+        self.assertEqual([], tool_logs)
+        self.assertEqual("capability_route_blocked", result.state.response_mode)
+        self.assertIn("outside this turn's ContextPack", result.state.final_response)
+        self.assertTrue(result.state.context_metadata["capability_routing_guard"]["blocked"])
+
+    def test_runtime_guard_blocks_routed_capability_with_invalid_tool_input(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.schemas import RouteDecision
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class BadInputRoutingMiddleware:
+            def decide(self, *, user_message, intent_frame, context_pack):
+                return RouteDecision(
+                    route="external_agent",
+                    capability=EXTERNAL_WEB_SEARCH_TOOL,
+                    executor_type="external_agent",
+                    executor_name="claude_sdk_agent",
+                    reason="bad input should be blocked",
+                    allowed_capabilities=list(context_pack.get("allowed_capabilities") or []),
+                    tool_input={"max_results": 5},
+                )
+
+        calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            calls.append({"query": query, "max_results": max_results})
+            return {"tool_name": EXTERNAL_WEB_SEARCH_TOOL, "ok": True, "result": {}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=BadInputRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual([], calls)
+        self.assertEqual([], tool_logs)
+        self.assertEqual("capability_route_blocked", result.state.response_mode)
+        self.assertIn("missing required arguments", result.state.final_response)
+        self.assertTrue(result.state.context_metadata["capability_routing_guard"]["blocked"])
+
+    def test_capability_routing_high_risk_route_asks_user_without_running_tools_or_llm(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"application_entry_discovery","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"high",'
+                        '"entities":{"job_ids":["lead-risk-1"]}}'
+                    )
+                )
+
+        class LLMShouldNotRun:
+            def complete(self, *, messages):  # pragma: no cover - failing path
+                raise AssertionError("llm should not run for high-risk ask_user route")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                llm_client=LLMShouldNotRun(),
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我上传简历并提交这个岗位 job_id=lead-risk-1"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        routing = result.state.context_metadata["capability_routing"]
+        self.assertEqual("ask_user", routing["route"])
+        self.assertEqual([], tool_logs)
+        self.assertEqual("capability_route_ask_user", result.state.response_mode)
+        self.assertIn("需要你确认", result.state.final_response)
+
+    def test_ambiguous_search_route_asks_user_before_running_external_search(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.62,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"candidate_intents":["campus_recruiting_search","external_agent_task"],'
+                        '"entities":{"company_names":["公牛"],"keywords":[],"time_range":"latest"}}'
+                    )
+                )
+
+        class LLMShouldNotRun:
+            def complete(self, *, messages):  # pragma: no cover - failing path
+                raise AssertionError("main llm should not run before clarification")
+
+        calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            calls.append({"query": query, "max_results": max_results})
+            return {"tool_name": EXTERNAL_WEB_SEARCH_TOOL, "ok": True, "result": {}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                llm_client=LLMShouldNotRun(),
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"]},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我搜一下公牛"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        routing = result.state.context_metadata["capability_routing"]
+        self.assertEqual("ask_user", routing["route"])
+        self.assertEqual("entity_ambiguity", routing["metadata"]["clarification_kind"])
+        self.assertEqual([], calls)
+        self.assertEqual([], tool_logs)
+        self.assertEqual("clarification_ask_user", result.state.response_mode)
+        self.assertIn("公牛集团", result.state.final_response)
+        self.assertIn("芝加哥公牛队", result.state.final_response)
+
+    def test_native_tool_loop_executes_allowed_web_search_once_and_finalizes_with_observation(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        test_case = self
+
+        class FakeToolLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-search-1",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                test_case.assertIn("Tool result: external.web_search succeeded", combined)
+                test_case.assertIn("中科曙光校园招聘官网", combined)
+                return LLMChatCompletion(content="已找到中科曙光校园招聘官网：https://jobs.example.com/sugon")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "answer": "中科曙光校园招聘官网：https://jobs.example.com/sugon",
+                    "sources": [{"title": "中科曙光校园招聘官网", "url": "https://jobs.example.com/sugon"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeToolLoopLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+            registry = AgentToolRegistry(
+                definition for definition in dependencies.registry.list_definitions() if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5}], search_calls)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertEqual("已找到中科曙光校园招聘官网：https://jobs.example.com/sugon", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
+        self.assertEqual(2, len(fake_llm.calls))
+        self.assertEqual("auto", fake_llm.calls[0]["tool_choice"])
+        self.assertEqual("external_web_search", fake_llm.calls[0]["tools"][0]["function"]["name"])
+
+    def test_tool_choice_loop_enters_web_search_for_public_company_question_without_fixed_intent(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        test_case = self
+
+        class FakeToolChoiceLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "Canonical 是 Ubuntu 背后的公司" not in combined:
+                    test_case.assertEqual("auto", tool_choice)
+                    test_case.assertIn("external_web_search", [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-canonical-public-info",
+                                name="external_web_search",
+                                arguments={"query": "Canonical Ltd. 主要业务", "max_results": 3},
+                            )
+                        ],
+                    )
+                test_case.assertIn("Canonical 是 Ubuntu 背后的公司", combined)
+                return LLMChatCompletion(content="Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "fake-public-search",
+                    "query": query,
+                    "answer": "Canonical 是 Ubuntu 背后的公司，主要提供企业 Linux、云基础设施和安全支持。",
+                    "sources": [{"title": "Canonical", "url": "https://canonical.com/"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeToolChoiceLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="Canonical Ltd. 是做什么的？主要业务是什么？"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"query": "Canonical Ltd. 主要业务", "max_results": 3}], search_calls)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
+        self.assertEqual(2, len(fake_llm.calls))
+        self.assertEqual("model_final", result.state.context_metadata["tool_choice_loop"]["stop_reason"])
+
+    def test_tool_choice_loop_streams_candidate_and_model_decision_events(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeToolChoiceLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "Canonical 是 Ubuntu 背后的公司" not in combined:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-canonical-event-test",
+                                name="external_web_search",
+                                arguments={"query": "Canonical Ltd. 主要业务", "max_results": 3},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="Canonical Ltd. 主要做 Ubuntu。")
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "fake-public-search",
+                    "query": query,
+                    "answer": "Canonical 是 Ubuntu 背后的公司。",
+                    "sources": [{"title": "Canonical", "url": "https://canonical.com/"}],
+                },
+            }
+
+        emitted_events = []
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeToolChoiceLLM())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="Canonical Ltd. 是做什么的？主要业务是什么？"),
+                dependencies=dependencies.with_registry(registry).with_event_sink(emitted_events.append),
+            )
+            session.commit()
+
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        event_types = [event["event_type"] for event in emitted_events]
+        self.assertIn("candidate_capabilities", event_types)
+        self.assertIn("model_decision", event_types)
+        self.assertIn("turn_started", event_types)
+        self.assertIn("turn_finished", event_types)
+        candidate_event = next(event for event in emitted_events if event["event_type"] == "candidate_capabilities")
+        self.assertEqual([EXTERNAL_WEB_SEARCH_TOOL], candidate_event["candidate_capabilities"])
+        decision_event = next(event for event in emitted_events if event["event_type"] == "model_decision")
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, decision_event["tool_name"])
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, decision_event["capability"])
+
+    def test_tool_choice_loop_runs_before_legacy_capability_routing(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class LegacyRoutingShouldNotRun:
+            def decide(self, *, user_message, intent_frame, context_pack):  # pragma: no cover - failing path
+                raise AssertionError("legacy capability routing should not run before tool choice loop")
+
+        class FakeToolChoiceLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "Canonical 是 Ubuntu 背后的公司" not in combined:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-canonical-new-route",
+                                name="external_web_search",
+                                arguments={"query": "Canonical Ltd. 主要业务", "max_results": 3},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="Canonical Ltd. 主要做 Ubuntu。")
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "fake-public-search",
+                    "query": query,
+                    "answer": "Canonical 是 Ubuntu 背后的公司。",
+                    "sources": [{"title": "Canonical", "url": "https://canonical.com/"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                llm_client=FakeToolChoiceLLM(),
+                capability_routing_middleware=LegacyRoutingShouldNotRun(),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="Canonical Ltd. 是做什么的？主要业务是什么？"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertNotIn("capability_routing", result.state.context_metadata)
+
+    def test_tool_choice_loop_enters_web_search_for_realtime_question_without_fixed_intent(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        test_case = self
+
+        class FakeRealtimeLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "梅西今天有比赛" not in combined:
+                    self_tool_names = [tool["function"]["name"] for tool in tools]
+                    self_tool_names.sort()
+                    test_case.assertEqual(["external_web_search"], self_tool_names)
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-messi-match",
+                                name="external_web_search",
+                                arguments={"query": "梅西 今天 比赛 赛程 结果", "max_results": 5},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="梅西今天有比赛，具体时间以官方赛程为准。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "query": query,
+                    "answer": "梅西今天有比赛，开球时间为当地时间晚上。",
+                    "sources": [{"title": "Match schedule", "url": "https://example.com/match"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeRealtimeLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm, intent_detector=FakeNormalIntentDetector())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="给我查一下梅西今天的比赛"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(1, len(search_calls))
+        self.assertEqual(5, search_calls[0]["max_results"])
+        self.assertIn("Lionel Messi", search_calls[0]["query"])
+        self.assertIn("梅西", search_calls[0]["query"])
+        self.assertIn("Inter Miami", search_calls[0]["query"])
+        self.assertIn("football fixtures", search_calls[0]["query"])
+        self.assertIn(date.today().isoformat(), search_calls[0]["query"])
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("梅西今天有比赛，具体时间以官方赛程为准。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+
+    def test_tool_choice_loop_enters_web_search_for_this_week_match_question_without_fixed_intent(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class FakeTextualToolCallLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "C 罗本周赛程以官方公布为准" not in combined:
+                    return LLMChatCompletion(
+                        content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
+                    )
+                return LLMChatCompletion(content="C 罗本周赛程以官方公布为准。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "query": query,
+                    "answer": "C 罗本周赛程以官方公布为准。",
+                    "sources": [{"title": "Al Nassr fixtures", "url": "https://example.com/al-nassr"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeTextualToolCallLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm, intent_detector=FakeNormalIntentDetector())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你看一下c罗这个星期有什么比赛吗"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(1, len(search_calls))
+        self.assertEqual(5, search_calls[0]["max_results"])
+        self.assertIn("C罗", search_calls[0]["query"])
+        self.assertIn("Cristiano Ronaldo", search_calls[0]["query"])
+        self.assertIn("Al Nassr", search_calls[0]["query"])
+        self.assertIn("football fixtures", search_calls[0]["query"])
+        self.assertIn(date.today().isoformat(), search_calls[0]["query"])
+        self.assertNotIn("你看一下", search_calls[0]["query"])
+        self.assertNotIn("2024年10月", search_calls[0]["query"])
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("C 罗本周赛程以官方公布为准。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
+
+    def test_tool_choice_loop_changes_web_search_query_after_off_target_result(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "Al Nassr fixtures official" not in combined:
+                    return LLMChatCompletion(
+                        content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
+                    )
+                return LLMChatCompletion(content="C 罗本周赛程以官方公布为准。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            if len(search_calls) == 1:
+                return {
+                    "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                    "ok": True,
+                    "result": {
+                        "query": query,
+                        "answer": "检索结果均为UTF-8编码转换类工具网站，与足球赛程无关。",
+                        "sources": [{"title": "UTF-8 编码转换", "url": "https://example.com/utf8"}],
+                    },
+                }
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "query": query,
+                    "answer": "Al Nassr fixtures official：C 罗本周赛程以官方公布为准。",
+                    "sources": [{"title": "Al Nassr fixtures official", "url": "https://example.com/al-nassr"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm, intent_detector=FakeNormalIntentDetector())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你看一下c罗这个星期有什么比赛吗"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = session.scalars(select(ToolCallLog)).all()
+
+        self.assertEqual(2, len(search_calls))
+        self.assertNotEqual(search_calls[0]["query"], search_calls[1]["query"])
+        self.assertIn("Cristiano Ronaldo", search_calls[1]["query"])
+        self.assertIn("Al Nassr", search_calls[1]["query"])
+        self.assertIn("fixtures", search_calls[1]["query"])
+        self.assertNotIn("校园招聘", search_calls[1]["query"])
+        self.assertEqual(2, len(tool_logs))
+        trace = result.state.context_metadata["tool_choice_loop"]["trace"]
+        self.assertEqual("retry", trace[0]["metadata"]["observation"]["suggested_next_decision"]["metadata"]["reflection"]["next_action"])
+
+    def test_tool_choice_loop_does_not_summarize_bad_web_search_as_answer(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class FakeLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                if tools:
+                    return LLMChatCompletion(
+                        content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
+                    )
+                return LLMChatCompletion(content="C 罗通常周末比赛，本周可能有沙特联赛。")
+
+        search_calls = []
+
+        def fake_bad_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "query": query,
+                    "answer": "检索结果均为贝锐向日葵远程控制软件相关页面，与足球赛程无关。",
+                    "sources": [{"title": "向日葵远程控制", "url": "https://example.com/sunlogin"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(), intent_detector=FakeNormalIntentDetector())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_bad_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你看一下c罗这个星期有什么比赛吗"),
+                dependencies=dependencies.with_registry(registry),
+            )
+
+        self.assertEqual(2, len(search_calls))
+        self.assertIn("没有找到可靠", result.state.final_response)
+        self.assertIn("联网搜索", result.state.final_response)
+        self.assertNotIn("通常周末", result.state.final_response)
+        self.assertEqual("tool_result_summary_unreliable", result.state.response_mode)
+
+    def test_tool_choice_loop_enters_local_company_database_without_fixed_intent(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.jobs.models import Company
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        test_case = self
+
+        class FakeCompanyDatabaseLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "腾讯" not in combined:
+                    test_case.assertEqual(["local_company_database_overview"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-local-company-db",
+                                name="local_company_database_overview",
+                                arguments={"sample_limit": 20},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="下面是本地数据库里的公司表格，包含腾讯和 Canonical Ltd.。")
+
+        with self.Session() as session:
+            session.add_all(
+                [
+                    Company(name="Canonical Ltd.", normalized_name="canonical ltd"),
+                    Company(name="腾讯", normalized_name="tencent"),
+                ]
+            )
+            session.commit()
+            session_id = self._session_id(session)
+            fake_llm = FakeCompanyDatabaseLLM()
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="数据库里有哪些公司，给我20个"),
+                dependencies=self._dependencies(
+                    session,
+                    llm_client=fake_llm,
+                    intent_detector=FakeNormalIntentDetector(),
+                ),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("下面是本地数据库里的公司表格，包含腾讯和 Canonical Ltd.。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, tool_log.tool_name)
+        self.assertEqual({"sample_limit": 20}, tool_log.input_payload)
+        self.assertEqual(2, len(fake_llm.calls))
+
+    def test_tool_choice_loop_enters_local_job_source_overview_without_fixed_intent(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        test_case = self
+        job_source_calls = []
+
+        class FakeJobSourceLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "source_count" not in combined:
+                    test_case.assertEqual(["local_job_source_overview"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-local-job-source-overview",
+                                name="local_job_source_overview",
+                                arguments={"sample_limit": 20, "include_external_job_board": True},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="来源库共有 7 条，下面按表格列出主要来源。")
+
+        def fake_job_source_overview(_session, *, sample_limit: int = 10, include_external_job_board: bool = True):
+            job_source_calls.append(
+                {"sample_limit": sample_limit, "include_external_job_board": include_external_job_board}
+            )
+            return {
+                "tool_name": LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+                "ok": True,
+                "result": {
+                    "source_count": 7,
+                    "lead_count": 71,
+                    "external_job_board": {"company_count": 1247},
+                    "sample_sources": ["开放岗位来源库"],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeJobSourceLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm, intent_detector=FakeNormalIntentDetector())
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != LOCAL_JOB_SOURCE_OVERVIEW_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+                    description="Read a safe overview of local job sources.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "sample_limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                            "include_external_job_board": {"type": "boolean"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_job_source_overview,
+                    allowed_source_types=frozenset({"agent_chat", "job_discovery"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="岗位来源库现在有多少条，给我20个"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"sample_limit": 20, "include_external_job_board": True}], job_source_calls)
+        self.assertEqual(LOCAL_JOB_SOURCE_OVERVIEW_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("来源库共有 7 条，下面按表格列出主要来源。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(LOCAL_JOB_SOURCE_OVERVIEW_TOOL, tool_log.tool_name)
+        self.assertEqual({"sample_limit": 20, "include_external_job_board": True}, tool_log.input_payload)
+        self.assertEqual(2, len(fake_llm.calls))
+
+    def test_tool_choice_loop_can_offer_declared_sub_agent_capability(self) -> None:
+        from app.agent_runtime.agent_as_tool import AgentCapabilityDefinition, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class FakeOpenAIAgent:
+            executor_id = "openai-sdk-agent"
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def capabilities(self):
+                return [
+                    AgentCapabilityDefinition(
+                        capability_id="resume.tailor",
+                        name="简历优化",
+                        description="根据目标岗位优化简历表达。",
+                        executor_id=self.executor_id,
+                        input_schema={
+                            "type": "object",
+                            "required": ["resume_text", "job_description"],
+                            "properties": {
+                                "resume_text": {"type": "string"},
+                                "job_description": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                        output_schema={"type": "object", "required": ["revised_resume"]},
+                        risk_level="low",
+                        allowed_source_types=frozenset({"agent_chat"}),
+                        candidate_profile=AgentToolCandidateProfile(
+                            categories=frozenset({"resume_tailoring", "content_processing"}),
+                            keywords=frozenset({"优化简历", "改简历", "匹配 JD"}),
+                            examples=("帮我优化这段简历，让它更适合腾讯后端岗位",),
+                        ),
+                    )
+                ]
+
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                self.calls.append({"task": task, "context": context})
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="已优化简历，突出 Java 后端项目经验。",
+                    observation="已优化简历：突出分布式系统、Java 后端和项目结果。",
+                    raw_result={"revised_resume": "优化后的简历内容"},
+                )
+
+        test_case = self
+
+        class FakeResumeLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "已优化简历" not in combined:
+                    test_case.assertEqual(["resume_tailor"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-resume-tailor",
+                                name="resume_tailor",
+                                arguments={
+                                    "resume_text": "旧简历：做过 Java 项目。",
+                                    "job_description": "腾讯后端岗位，要求 Java 和分布式系统。",
+                                },
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="已根据腾讯后端岗位优化简历，重点突出 Java 和分布式项目经验。")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_agent = FakeOpenAIAgent()
+            fake_llm = FakeResumeLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=FakeNormalIntentDetector(),
+            ).with_agent_runtime(executors={fake_agent.executor_id: fake_agent})
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我优化这段简历，让它更适合腾讯后端岗位"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("resume.tailor", result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual("已根据腾讯后端岗位优化简历，重点突出 Java 和分布式项目经验。", result.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("resume.tailor", tool_log.tool_name)
+        self.assertEqual("openai-sdk-agent", tool_log.output_payload["agent_runtime"]["executor_id"])
+        self.assertEqual("resume.tailor", fake_agent.calls[0]["task"].capability_id)
+        self.assertEqual("openai-sdk-agent", fake_agent.calls[0]["context"].namespace)
+        self.assertEqual(2, len(fake_llm.calls))
+
+    def test_native_tool_loop_can_execute_multiple_tool_steps_before_final_answer(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["腾讯","京东"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class FakeMultiStepToolLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "腾讯校招官网" not in combined:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-tencent",
+                                name="external_web_search",
+                                arguments={"query": "腾讯 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                if tools and "京东校招官网" not in combined:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-jd",
+                                name="external_web_search",
+                                arguments={"query": "京东 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                if tools:
+                    return LLMChatCompletion(content="腾讯校招官网：https://join.qq.com/；京东校招官网：https://campus.jd.com/")
+                return LLMChatCompletion(content="premature final answer")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            if "腾讯" in query:
+                answer = "腾讯校招官网：https://join.qq.com/"
+                source = {"title": "腾讯校招官网", "url": "https://join.qq.com/"}
+            else:
+                answer = "京东校招官网：https://campus.jd.com/"
+                source = {"title": "京东校招官网", "url": "https://campus.jd.com/"}
+            return {"tool_name": EXTERNAL_WEB_SEARCH_TOOL, "ok": True, "result": {"answer": answer, "sources": [source]}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeMultiStepToolLoopLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+            registry = AgentToolRegistry(
+                definition for definition in dependencies.registry.list_definitions() if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="分别查一下腾讯和京东的校园招聘官网"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual(
+            [
+                {"query": "腾讯 校园招聘 官网", "max_results": 5},
+                {"query": "京东 校园招聘 官网", "max_results": 5},
+            ],
+            search_calls,
+        )
+        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertIn("腾讯校招官网", result.state.final_response)
+        self.assertIn("京东校招官网", result.state.final_response)
+        self.assertEqual([ToolCallStatus.SUCCEEDED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual(3, len(fake_llm.calls))
+        self.assertEqual(2, result.state.context_metadata["tool_calling_loop"]["executed_tool_call_count"])
+        loop_agent = result.state.context_metadata["loop_agent"]
+        self.assertTrue(loop_agent["enabled"])
+        self.assertEqual("runtime_controlled", loop_agent["control_mode"])
+        self.assertEqual("bounded_react", loop_agent["strategy"])
+        self.assertTrue(loop_agent["react_strategy"]["enabled"])
+        self.assertEqual("bounded_react", loop_agent["react_strategy"]["mode"])
+        self.assertEqual("model_final", loop_agent["stop_reason"])
+        self.assertEqual(2, loop_agent["executed_step_count"])
+        self.assertEqual(["external.web_search", "external.web_search"], [step["capability"] for step in loop_agent["trace"]])
+        self.assertNotIn("thought", loop_agent["trace"][0])
+
+    def test_native_tool_loop_records_reflection_retry_when_web_search_result_is_off_target(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class FakeToolLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-bad-sugon",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="未找到可靠官网，建议换关键词重试。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "answer": "中（汉语汉字）_百度百科",
+                    "sources": [{"title": "中（汉语汉字）_百度百科", "url": "https://baike.baidu.com/item/中"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                llm_client=FakeToolLoopLLM(),
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+            registry = AgentToolRegistry(
+                definition for definition in dependencies.registry.list_definitions() if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="搜一下中科曙光校园招聘官网"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+        self.assertEqual(
+            [
+                {"query": "中科曙光 校园招聘 官网", "max_results": 5},
+                {"query": "中科曙光 校园招聘 官网 2026", "max_results": 5},
+            ],
+            search_calls,
+        )
+        self.assertEqual(1, result.state.context_metadata["loop_agent"]["reflection_retry_count"])
+        self.assertEqual(2, result.state.context_metadata["loop_agent"]["executed_step_count"])
+        trace_entry = result.state.context_metadata["loop_agent"]["trace"][0]
+        reflection = trace_entry["metadata"]["reflection"]
+        self.assertEqual("bad", reflection["quality"])
+        self.assertEqual("retry", reflection["next_action"])
+        self.assertIn("中科曙光", reflection["suggested_input_patch"]["query"])
+        self.assertIn("校园招聘", reflection["suggested_input_patch"]["query"])
+
+    def test_reflection_retry_budget_is_configurable_but_capped(self) -> None:
+        from app.agent_runtime.graph_factory import _native_tool_loop_reflection_retry_budget
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL
+
+        self.assertEqual(
+            3,
+            _native_tool_loop_reflection_retry_budget(
+                {"loop_agent": {"reflection_retry_budget": None}},
+                [EXTERNAL_WEB_SEARCH_TOOL],
+            ),
+        )
+        self.assertEqual(
+            0,
+            _native_tool_loop_reflection_retry_budget(
+                {"loop_agent": {"reflection_retry_budget": 0}},
+                [EXTERNAL_WEB_SEARCH_TOOL],
+            ),
+        )
+        self.assertEqual(
+            3,
+            _native_tool_loop_reflection_retry_budget(
+                {"loop_agent": {"reflection_retry_budget": 9}},
+                [EXTERNAL_WEB_SEARCH_TOOL],
+            ),
+        )
+        self.assertEqual(
+            2,
+            _native_tool_loop_reflection_retry_budget(
+                {"reflection_retry_budget": "2"},
+                [EXTERNAL_WEB_SEARCH_TOOL],
+            ),
+        )
+        self.assertEqual(
+            0,
+            _native_tool_loop_reflection_retry_budget(
+                {"loop_agent": {"reflection_retry_budget": 2}},
+                ["applications.find_apply_entry"],
+            ),
+        )
+
+    def test_native_tool_loop_retries_web_search_with_reflection_suggested_query(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class FakeToolLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-bad-sugon",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 招聘", "max_results": 5},
+                            )
+                        ],
+                    )
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                self.final_messages = combined
+                return LLMChatCompletion(content="已找到中科曙光校招官网：https://jobs.example.com/sugon")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            if query == "中科曙光 招聘":
+                return {
+                    "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                    "ok": True,
+                    "result": {
+                        "answer": "中（汉语汉字）_百度百科",
+                        "sources": [{"title": "中（汉语汉字）_百度百科", "url": "https://baike.baidu.com/item/中"}],
+                    },
+                }
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "answer": "中科曙光校园招聘官网：https://jobs.example.com/sugon",
+                    "sources": [{"title": "中科曙光校园招聘官网", "url": "https://jobs.example.com/sugon"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeToolLoopLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+            registry = AgentToolRegistry(
+                definition for definition in dependencies.registry.list_definitions() if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="搜一下中科曙光校园招聘官网"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual(
+            [
+                {"query": "中科曙光 招聘", "max_results": 5},
+                {"query": "中科曙光 校园招聘 官网 2026", "max_results": 5},
+            ],
+            search_calls,
+        )
+        self.assertEqual([ToolCallStatus.SUCCEEDED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertIn("中科曙光校招官网", result.state.final_response)
+        self.assertIn("中科曙光校园招聘官网", fake_llm.final_messages)
+        loop_agent = result.state.context_metadata["loop_agent"]
+        self.assertEqual(2, loop_agent["executed_step_count"])
+        self.assertEqual(["retry", "continue"], [step["metadata"]["reflection"]["next_action"] for step in loop_agent["trace"]])
+
+    def test_execution_planner_executes_capability_action_without_native_tool_call_selection(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.planning.schemas import ExecutionPlan, ExecutionPlannerAction
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["经纬恒润"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class FakeExecutionPlanner:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def plan(self, *, user_message, context_pack):
+                self.calls.append({"user_message": user_message, "context_pack": context_pack})
+                return ExecutionPlan(
+                    mode="simple_tool_call",
+                    confidence=0.92,
+                    risk_level="low",
+                    actions=[
+                        ExecutionPlannerAction(
+                            type="call_capability",
+                            capability=EXTERNAL_WEB_SEARCH_TOOL,
+                            arguments={"query": "经纬恒润 校园招聘 官网", "max_results": 5},
+                            reason="需要查询公司校招入口",
+                        )
+                    ],
+                    reason="用户要求查询最新校招信息",
+                )
+
+        test_case = self
+
+        class FakeFinalLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                test_case.assertIsNone(tools)
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                test_case.assertIn("Tool result: external.web_search succeeded", combined)
+                test_case.assertIn("经纬恒润校园招聘官网", combined)
+                return LLMChatCompletion(content="已找到经纬恒润校园招聘官网：https://jobs.example.com/hirain")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "answer": "经纬恒润校园招聘官网：https://jobs.example.com/hirain",
+                    "sources": [{"title": "经纬恒润校园招聘官网", "url": "https://jobs.example.com/hirain"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            planner = FakeExecutionPlanner()
+            final_llm = FakeFinalLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=final_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+                execution_planner=planner,
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="查一下经纬恒润的校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"query": "经纬恒润 校园招聘 官网", "max_results": 5}], search_calls)
+        self.assertEqual(1, len(planner.calls))
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("execution_planner", result.state.response_mode)
+        self.assertEqual("已找到经纬恒润校园招聘官网：https://jobs.example.com/hirain", result.state.final_response)
+        self.assertEqual("simple_tool_call", result.state.context_metadata["execution_plan"]["mode"])
+        self.assertEqual("call_capability", result.state.context_metadata["execution_plan"]["actions"][0]["type"])
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.context_metadata["execution_plan"]["actions"][0]["capability"])
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(1, len(final_llm.calls))
+
+    def test_native_tool_loop_preserves_tool_input_through_confirmation(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, ToolCallStatus, WorkflowRun, WorkflowRunStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeIntentLLM:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        '{"intent":"campus_recruiting_search","confidence":0.95,'
+                        '"needs_external_info":true,"risk_level":"low",'
+                        '"entities":{"company_names":["中科曙光"],"keywords":["校园招聘"],"time_range":"latest"}}'
+                    )
+                )
+
+        class FakeToolLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-search-confirmed",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="确认后已完成联网搜索：中科曙光校园招聘官网")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {"answer": "中科曙光校园招聘官网", "sources": []},
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeToolLoopLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
+            )
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+
+            first = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你给我搜一下中科曙光的校园招聘信息"),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+
+            self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
+            self.assertEqual("wait_confirmation", first.state.current_step)
+            self.assertEqual({"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5}, approval.payload["tool_input"])
+            self.assertEqual([], search_calls)
+
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=True,
+                decision_reason="allow search",
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5}], search_calls)
+        self.assertEqual("final_response", continued.state.current_step)
+        self.assertEqual("llm_tool_loop", continued.state.response_mode)
+        self.assertEqual("确认后已完成联网搜索：中科曙光校园招聘官网", continued.state.final_response)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(2, len(fake_llm.calls))
+
+    def test_agent_does_not_auto_select_external_web_search_for_campus_recruiting_search_request(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog
+
+        calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "http-web-search-fallback",
+                    "query": query,
+                    "answer": "联网搜索结果：腾讯校招官方入口：https://join.qq.com/",
+                    "sources": [{"title": "腾讯校招", "url": "https://join.qq.com/"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"]},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我搜一下腾讯秋招校园招聘信息"),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertIsNone(result.state.requested_tool_name)
+        self.assertEqual("agent_chat", result.state.source_type)
+        self.assertEqual([], tool_logs)
+        self.assertEqual([], calls)
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+
+    def test_agent_does_not_auto_select_find_apply_entry_from_job_id_request(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.automation.models import ToolCallLog
+        from app.domains.jobs.models import (
+            JobLead,
+            JobLeadStatus,
+            JobSource,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+        )
+
+        with self.Session() as session:
+            source = JobSource(
+                name="Campus leads",
+                source_type=JobSourceType.OFFICIAL_API,
+                entry_url="https://example.com/jobs",
+                trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                fetch_mode=JobSourceFetchMode.OFFICIAL_API,
+            )
+            session.add(
+                JobLead(
+                    id="lead-apply-1",
+                    source=source,
+                    lead_hash="lead-apply-1",
+                    company_name="Tencent",
+                    title="Backend Engineer Intern",
+                    source_url="https://careers.tencent.com/job/1",
+                    apply_url="https://careers.tencent.com/apply/1",
+                    jd_text="Campus backend role requiring Java and distributed systems.",
+                    skills=[],
+                    trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                    verification_status=JobLeadStatus.VERIFIED,
+                )
+            )
+            session.flush()
+            session_id = self._session_id(session)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="open application entry for job_id=lead-apply-1",
+                ),
+                dependencies=self._dependencies(session),
+            )
+            session.commit()
+
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertIsNone(result.state.requested_tool_name)
+        self.assertEqual("agent_chat", result.state.source_type)
+        self.assertEqual([], tool_logs)
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+
+    def test_explicit_tool_execution_records_durable_orchestration_step(self) -> None:
+        from app.agent_runtime.durable_state.models import AgentStepState, AgentTaskState
+        from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
+        from app.agent_runtime.durable_state.schemas import AgentStepStatus, AgentTaskStatus
+        from app.agent_runtime.durable_state.service import DurableStateService
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            durable_state_service = DurableStateService(SqlAlchemyDurableStateRepository(session))
+            dependencies = self._dependencies(session, durable_state_service=durable_state_service)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="查一下这轮会话里的岗位线索",
+                    requested_tool_name="sessions_search",
+                    source_type="agent_chat",
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+            task = session.get(AgentTaskState, result.workflow_run_id)
+            steps = list(session.scalars(select(AgentStepState)).all())
+
+        self.assertIsNotNone(task)
+        self.assertEqual(AgentTaskStatus.RUNNING, task.status)
+        self.assertEqual("sessions_search", task.capability)
+        self.assertEqual(1, len(steps))
+        self.assertEqual(task.current_step_id, steps[0].id)
+        self.assertEqual(AgentStepStatus.SUCCEEDED, steps[0].status)
+        self.assertEqual("sessions_search", steps[0].capability)
+        self.assertEqual(result.state.tool_call_ids[0], steps[0].tool_call_log_id)
+        self.assertEqual({"query": "查一下这轮会话里的岗位线索", "limit": 10}, steps[0].input_payload["tool_input"])
+
+    def test_memory_search_tool_records_memory_snapshot_for_durable_step(self) -> None:
+        from app.agent_runtime.durable_state.models import AgentMemorySnapshot
+        from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
+        from app.agent_runtime.durable_state.service import DurableStateService
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.agent_memory.models import AgentMemory, AgentMemoryStatus
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            session.add(
+                AgentMemory(
+                    id="memory-java-backend",
+                    memory_type="user_preference",
+                    scope="candidate_profile",
+                    title="Java 后端偏好",
+                    content="用户偏好 Java 后端和分布式系统方向。",
+                    source_type="user_profile",
+                    status=AgentMemoryStatus.ACTIVE,
+                    importance=10,
+                    metadata_json={"source": "test"},
+                )
+            )
+            session.commit()
+
+        with self.Session() as session:
+            durable_state_service = DurableStateService(SqlAlchemyDurableStateRepository(session))
+            dependencies = self._dependencies(session, durable_state_service=durable_state_service)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="Java 后端偏好",
+                    requested_tool_name="memory_search",
+                    source_type="agent_chat",
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+            snapshots = list(session.scalars(select(AgentMemorySnapshot)).all())
+
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual("memory-java-backend", snapshots[0].memory_id)
+        self.assertEqual("agent_memory", snapshots[0].source_type)
+        self.assertIn("memory_search matched", snapshots[0].usage_reason)
+        self.assertFalse(snapshots[0].passed_to_executor)
+
+    def test_tool_result_envelope_artifacts_are_indexed_for_durable_step(self) -> None:
+        from app.agent_runtime.durable_state.models import AgentArtifactIndex
+        from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
+        from app.agent_runtime.durable_state.service import DurableStateService
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "executor_name": "claude-sdk-agent",
+                    "query": query,
+                    "answer": "腾讯校招官网：https://join.qq.com/",
+                    "artifacts": [
+                        {"type": "url", "title": "腾讯校招", "url": "https://join.qq.com/"},
+                    ],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            durable_state_service = DurableStateService(SqlAlchemyDurableStateRepository(session))
+            dependencies = self._dependencies(session, durable_state_service=durable_state_service)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={"type": "object", "required": ["query"]},
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="搜一下腾讯校招官网",
+                    requested_tool_name=EXTERNAL_WEB_SEARCH_TOOL,
+                    source_type="agent_chat",
+                    tool_input={"query": "腾讯 校园招聘 官网", "max_results": 5},
+                ),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+            artifacts = list(session.scalars(select(AgentArtifactIndex)).all())
+
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertEqual(1, len(artifacts))
+        self.assertEqual("url", artifacts[0].artifact_type)
+        self.assertEqual("https://join.qq.com/", artifacts[0].uri)
+        self.assertEqual("claude-sdk-agent", artifacts[0].artifact_metadata["executor"])
+
+    def test_tool_summary_reports_apply_entry_when_external_dispatch_succeeds(self) -> None:
+        from app.agent_runtime.graph_factory import tool_result_summary_response
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import APPLICATION_FIND_APPLY_ENTRY_TOOL
+
+        state = AgentState(
+            session_id="session-apply-summary",
+            workflow_run_id="workflow-apply-summary",
+            agent_run_id="agent-run-apply-summary",
+            user_message="open application entry for job_id=lead-apply-1",
+            current_step="maybe_tool",
+            requested_tool_name=APPLICATION_FIND_APPLY_ENTRY_TOOL,
+            llm_messages=[
+                {
+                    "role": "assistant",
+                    "content": "Tool result: applications.find_apply_entry succeeded",
+                    "metadata": {
+                        "content_json": {
+                            "tool_name": APPLICATION_FIND_APPLY_ENTRY_TOOL,
+                            "status": "succeeded",
+                            "result": {
+                                "tool_name": APPLICATION_FIND_APPLY_ENTRY_TOOL,
+                                "ok": True,
+                                "result": {
+                                    "task_id": "external-task-apply-1",
+                                    "status": "succeeded",
+                                    "task_envelope": {
+                                        "job": {
+                                            "job_id": "lead-apply-1",
+                                            "company_name": "Tencent",
+                                            "title": "Backend Engineer Intern",
+                                        }
+                                    },
+                                    "dispatch": {
+                                        "ok": True,
+                                        "executor_name": "claude-sdk-agent",
+                                        "status": "succeeded",
+                                        "result_status": "found_opened",
+                                        "apply_url": "https://careers.tencent.com/apply/1",
+                                        "next_action": "wait_user_review",
+                                    },
+                                },
+                            },
+                        }
+                    },
+                }
+            ],
+        )
+
+        response = tool_result_summary_response(state)
+
+        self.assertIsNotNone(response)
+        content, mode = response
+        self.assertEqual("tool_result_summary", mode)
+        self.assertIn("已找到申请入口", content)
+        self.assertIn("https://careers.tencent.com/apply/1", content)
+        self.assertIn("claude-sdk-agent", content)
+        self.assertIn("停在最终提交前", content)
+
     def test_agent_run_uses_llm_client_for_final_response(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
 
@@ -807,6 +3754,57 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertIsNotNone(fake_llm.messages)
         self.assertEqual("user", fake_llm.messages[-1]["role"])
         self.assertEqual("我想找 Java 后端秋招", fake_llm.messages[-1]["content"])
+
+    def test_agent_run_sanitizes_internal_tool_protocol_from_final_response(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+                return LLMChatCompletion(
+                    content=(
+                        'Tool call: external.web_search{"query":"Canonical Ltd. 主要业务"}\n\n'
+                        "Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。"
+                    ),
+                    usage={"total_tokens": 42},
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
+                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+            )
+            session.commit()
+
+        self.assertEqual("Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。", result.state.final_response)
+        self.assertEqual("llm", result.state.response_mode)
+        self.assertTrue(result.state.context_metadata["output_sanitizer"]["removed_internal_protocol"])
+        self.assertFalse(result.state.context_metadata["output_sanitizer"]["needs_regeneration"])
+
+    def test_agent_run_uses_safe_fallback_when_final_response_is_only_internal_protocol(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+                return LLMChatCompletion(content='Tool call: external.web_search{"query":"Canonical Ltd."}')
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
+                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+            )
+            session.commit()
+
+        self.assertNotIn("Tool call:", result.state.final_response)
+        self.assertIn("最终回答需要重新整理", result.state.final_response)
+        self.assertEqual("sanitized_empty_fallback", result.state.response_mode)
+        self.assertTrue(result.state.context_metadata["output_sanitizer"]["removed_internal_protocol"])
+        self.assertTrue(result.state.context_metadata["output_sanitizer"]["needs_regeneration"])
 
     def test_agent_run_auto_compacts_when_context_exceeds_budget_before_llm_call(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow

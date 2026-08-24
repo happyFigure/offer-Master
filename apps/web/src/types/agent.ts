@@ -123,6 +123,44 @@ export interface AgentApprovalDecisionResponse {
   context_metadata: AgentContextMetadata;
 }
 
+export interface AgentStreamOuterSessionEvent {
+  event_type: string;
+  event_label: string;
+  session_id: string;
+  task_id?: string | null;
+  run_id?: string | null;
+  status?: string | null;
+  summary?: string | null;
+  is_resume?: boolean;
+  turn_index?: number;
+  user_goal?: string | null;
+  requires_user_action?: boolean;
+  waiting_message?: string | null;
+  final_answer?: string | null;
+  outer_session?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface AgentStreamToolEvent {
+  event_type: string;
+  event_label: string;
+  session_id: string;
+  workflow_run_id?: string | null;
+  agent_run_id?: string | null;
+  step_index?: number;
+  tool_name?: string | null;
+  capability?: string | null;
+  tool_call_id?: string | null;
+  status?: string | null;
+  summary?: string | null;
+  tool_input_keys?: string[];
+  candidate_capabilities?: string[];
+  metadata?: Record<string, unknown> | null;
+  reflection?: Record<string, unknown> | null;
+  suggested_input_patch?: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
 export interface AgentSessionCreateInput {
   title?: string | null;
   primary_intent?: string | null;

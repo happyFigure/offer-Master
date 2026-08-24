@@ -9,7 +9,9 @@ import {
   ChevronRight,
   CircleDot,
   Clock3,
+  Copy,
   DatabaseZap,
+  Download,
   ExternalLink,
   FileSearch,
   Gauge,
@@ -40,9 +42,9 @@ import { createApplicationFromJob, listApplications, updateApplication } from ".
 import { listOfferIOCompanies, listOfferIOCompanyOpenings, listOfferIOJobs } from "../api/jobBoard";
 import { createJobSource, disableJobSource, listJobSources, syncJobSource, updateJobSource } from "../api/jobSources";
 import { extractJobLeads, listJobLeads, verifyAndConvertJobLead, verifyJobLead } from "../api/jobLeads";
-import { listArticleCandidates, listRecruitingSignals } from "../api/recruitingSignals";
+import { listArticleCandidates } from "../api/recruitingSignals";
 import { importJobLeadsFromUrl, listDomainHealth, listDomainHealthByDomain, pollUrlImportRun, submitVisiblePageContent } from "../api/urlImport";
-import type { AgentApprovalRequiredPayload, AgentContextMetadata, AgentMessage, AgentSession } from "../types/agent";
+import type { AgentApprovalRequiredPayload, AgentContextMetadata, AgentMessage, AgentSession, AgentStreamOuterSessionEvent, AgentStreamToolEvent } from "../types/agent";
 import type { AgentSkill, AgentSkillAvailabilityState, AgentSkillImportInput } from "../types/agentSkills";
 import type {
   ArticleCandidate,
@@ -62,7 +64,6 @@ import type {
   OfferIOCompany,
   OfferIOCompanyOpening,
   OfferIOJob,
-  RecruitingSignal,
   UrlImportInput,
 } from "../types/jobs";
 
@@ -146,6 +147,24 @@ interface ChatMessage {
   meta?: string;
 }
 
+type ChatRuntimeEventKind = "outer_session" | "tool";
+type ChatRuntimeEventTone = "running" | "success" | "warning" | "danger" | "muted";
+
+interface ChatRuntimeTimelineEvent {
+  id: string;
+  kind: ChatRuntimeEventKind;
+  eventType: string;
+  label: string;
+  summary: string;
+  status?: string | null;
+  toolName?: string | null;
+  stepIndex?: number | null;
+  inputHint?: string | null;
+  candidateNames?: string[];
+  createdAt: number;
+  tone: ChatRuntimeEventTone;
+}
+
 interface SkillImportDraft {
   source_path: string;
   category: string;
@@ -156,7 +175,7 @@ const NAV_ITEMS: Array<{ id: PageId; label: string; description: string; icon: L
   { id: "skills", label: "Skill 管理", description: "内容源能力与依赖", icon: Layers3 },
   { id: "dashboard", label: "总览", description: "同步态势与下一步", icon: Gauge },
   { id: "sources", label: "信息源", description: "高校/企业/社媒入口", icon: RadioTower },
-  { id: "jobs", label: "岗位展览", description: "公司/岗位结构化浏览", icon: Building2 },
+  { id: "jobs", label: "公司展览", description: "公司结构化浏览", icon: Building2 },
   { id: "leads", label: "线索导入", description: "文章/链接/手动兜底", icon: FileSearch },
   { id: "pipeline", label: "投递进度", description: "看板阶段可修改", icon: BriefcaseBusiness },
   { id: "guardrails", label: "边界设置", description: "MCP 与确认边界", icon: ShieldCheck },
@@ -250,6 +269,44 @@ const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
   },
 ];
 
+const RUNTIME_TOOL_LABELS: Record<string, string> = {
+  agent_loop: "主 agent 循环",
+  "external.web_search": "网页搜索",
+  "local.company_database_overview": "本地企业库概览",
+  "local.job_source_overview": "岗位来源概览",
+  "offerio.sync_company_jobs": "OfferIO 岗位同步",
+  "applications.find_apply_entry": "申请入口发现",
+  memory_search: "会话记忆检索",
+};
+
+const RUNTIME_EVENT_LABELS: Record<string, string> = {
+  candidate_capabilities: "候选能力",
+  task_started: "任务开始",
+  turn_started: "开始思考",
+  model_decision: "模型选择能力",
+  tool_started: "工具开始",
+  tool_finished: "工具完成",
+  turn_finished: "观察结果",
+  tool_reflection_retry: "结果不足，准备重试",
+  observation_insufficient: "观察不足",
+  waiting_user: "等待用户确认或补充",
+  task_finished: "任务结束",
+};
+
+const RUNTIME_EVENT_SUMMARIES: Record<string, (toolLabel: string) => string> = {
+  candidate_capabilities: () => "主 agent 已把候选能力交给模型选择。",
+  task_started: () => "主 agent 开始处理本轮任务。",
+  turn_started: () => "主 agent 正在判断下一步该直接回答还是调用能力。",
+  model_decision: (toolLabel) => `模型判断下一步要使用：${toolLabel}。`,
+  tool_started: (toolLabel) => `开始调用：${toolLabel}。`,
+  tool_finished: (toolLabel) => `已观察到 ${toolLabel} 的执行结果。`,
+  turn_finished: (toolLabel) => `主 agent 已读取 ${toolLabel} 的观察结果。`,
+  tool_reflection_retry: () => "当前结果不够好，主 agent 准备调整输入后重试。",
+  observation_insufficient: () => "当前观察结果还不足以完成任务，需要继续补充信息。",
+  waiting_user: () => "当前步骤需要用户确认或补充信息后才能继续。",
+  task_finished: () => "本轮 agent loop 已结束。",
+};
+
 const INITIAL_SKILL_IMPORT_DRAFT: SkillImportDraft = {
   source_path: "",
   category: "content_source",
@@ -257,12 +314,90 @@ const INITIAL_SKILL_IMPORT_DRAFT: SkillImportDraft = {
 
 const CHAT_PROMPTS = ["帮我分析这个岗位是否适合我", "帮我优化简历项目描述", "模拟 Java 后端面试", "根据岗位生成投递建议"];
 
+interface ParsedMarkdownTable {
+  headers: string[];
+  rows: string[][];
+}
+
+type ChatContentBlock = { type: "text"; text: string } | { type: "table"; table: ParsedMarkdownTable };
+
+function ChatMessageContent({ content }: { content: string }) {
+  const blocks = useMemo(() => parseMarkdownTables(content), [content]);
+
+  return (
+    <div className="chat-message-content">
+      {blocks.map((block, index) =>
+        block.type === "table" ? (
+          <ChatTableCard key={`table-${index}`} table={block.table} />
+        ) : block.text.trim() ? (
+          <p className="chat-message-text" key={`text-${index}`}>
+            {block.text.trim()}
+          </p>
+        ) : null,
+      )}
+    </div>
+  );
+}
+
+function ChatTableCard({ table }: { table: ParsedMarkdownTable }) {
+  const tableText = markdownTableToText(table);
+
+  const handleCopy = () => {
+    void navigator.clipboard?.writeText(tableText);
+  };
+
+  const handleDownload = () => {
+    const blob = new Blob([tableText], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "offermaster-table.md";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <section className="chat-table-card" aria-label="表格">
+      <div className="chat-table-card-header">
+        <strong>表格</strong>
+        <div className="chat-table-actions">
+          <button type="button" aria-label="下载表格" title="下载表格" onClick={handleDownload}>
+            <Download size={17} />
+          </button>
+          <button type="button" aria-label="复制表格" title="复制表格" onClick={handleCopy}>
+            <Copy size={17} />
+          </button>
+        </div>
+      </div>
+      <div className="chat-table-scroll">
+        <table>
+          <thead>
+            <tr>
+              {table.headers.map((header) => (
+                <th key={header}>{header}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((row, rowIndex) => (
+              <tr key={`row-${rowIndex}`}>
+                {table.headers.map((_, cellIndex) => (
+                  <td key={`cell-${cellIndex}`}>{row[cellIndex] ?? ""}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 function App() {
   const [activePage, setActivePage] = useState<PageId>(() => getInitialPage());
   const [sources, setSources] = useState<JobSource[]>([]);
   const [leads, setLeads] = useState<JobLead[]>([]);
   const [articleCandidates, setArticleCandidates] = useState<ArticleCandidate[]>([]);
-  const [recruitingSignals, setRecruitingSignals] = useState<RecruitingSignal[]>([]);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [loading, setLoading] = useState(true);
   const [workingAction, setWorkingAction] = useState<string | null>(null);
@@ -286,6 +421,7 @@ function App() {
   const [skillImportDraft, setSkillImportDraft] = useState<SkillImportDraft>(INITIAL_SKILL_IMPORT_DRAFT);
   const [chatContextMetadata, setChatContextMetadata] = useState<AgentContextMetadata | null>(null);
   const [pendingApproval, setPendingApproval] = useState<AgentApprovalRequiredPayload | null>(null);
+  const [runtimeEvents, setRuntimeEvents] = useState<ChatRuntimeTimelineEvent[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [jobBoardFilters, setJobBoardFilters] = useState<JobBoardFilterDraft>(INITIAL_JOB_BOARD_FILTERS);
   const [offerioCompanies, setOfferioCompanies] = useState<OfferIOCompany[]>([]);
@@ -301,18 +437,16 @@ function App() {
   const [applications, setApplications] = useState<ApplicationBoardItem[]>([]);
 
   const refreshData = useCallback(async (filters?: JobLeadFilters) => {
-    const [nextSources, nextLeads, nextDomainHealth, nextCandidates, nextSignals] = await Promise.all([
+    const [nextSources, nextLeads, nextDomainHealth, nextCandidates] = await Promise.all([
       listJobSources(),
       listJobLeads(filters ?? { graduation_year: INITIAL_FILTERS.graduation_year, limit: 80 }),
       listDomainHealth(),
       listArticleCandidates({ limit: 80 }),
-      listRecruitingSignals({ graduation_year: filters?.graduation_year ?? INITIAL_FILTERS.graduation_year, limit: 80 }),
     ]);
     setSources(nextSources);
     setLeads(nextLeads);
     setDomainHealth(nextDomainHealth);
     setArticleCandidates(nextCandidates);
-    setRecruitingSignals(nextSignals);
     setExtractDraft((current) => ({
       ...current,
       source_id: current.source_id || nextSources[0]?.id || "",
@@ -347,6 +481,7 @@ function App() {
       setChatMessages(toChatMessages(messages));
       setChatContextMetadata(latestAssistantContext);
       setPendingApproval(null);
+      setRuntimeEvents([]);
     } finally {
       setChatLoading(false);
     }
@@ -425,11 +560,11 @@ function App() {
 
   useEffect(() => {
     refreshJobBoard().catch((error: unknown) => {
-      setNotice({ kind: "warning", message: `岗位展览暂未连接：${toDisplayError(error)}` });
+      setNotice({ kind: "warning", message: `公司展览暂未连接：${toDisplayError(error)}` });
     });
   }, [refreshJobBoard]);
 
-  const summary = useMemo(() => buildSummary(sources, leads, recruitingSignals), [sources, leads, recruitingSignals]);
+  const summary = useMemo(() => buildSummary(sources, leads), [sources, leads]);
 
   const navigate = (pageId: PageId) => {
     window.location.hash = pageId;
@@ -456,7 +591,7 @@ function App() {
       await refreshSkills();
       await refreshApplications();
       await refreshJobBoard(jobBoardFilters);
-      return "已刷新岗位信息源、岗位展览与投递进度。";
+      return "已刷新岗位信息源、公司展览与投递进度。";
     });
 
   const handleImportSkill = (event: FormEvent<HTMLFormElement>) => {
@@ -564,7 +699,7 @@ function App() {
 
   const handleSyncSource = (source: JobSource) => {
     void runAction(`sync-${source.id}`, async () => {
-      const result = await syncJobSource(source.id, 20);
+      const result = await syncJobSource(source.id, syncLimitForSource(source));
       await refreshData(buildLeadFilters(leadFilters));
       if (result.status === "failed") {
         throw new Error(`${source.name} 同步失败：${result.error || "来源页面无法抓取，请检查来源类型、入口 URL 或改用岗位线索页的粘贴链接解析。"}`);
@@ -585,7 +720,7 @@ function App() {
       await refreshJobBoard(nextFilters);
       setOfferioJobs([]);
       setSelectedOfferioCompany(null);
-      return "岗位展览已从 OfferIO 临时接口刷新。";
+      return "公司展览已从 OfferIO 临时接口刷新。";
     });
   };
 
@@ -596,7 +731,7 @@ function App() {
       await refreshJobBoard(nextFilters);
       setOfferioJobs([]);
       setSelectedOfferioCompany(null);
-      return "岗位展览分页已刷新。";
+      return "公司展览分页已刷新。";
     });
   };
 
@@ -635,7 +770,7 @@ function App() {
         status: "evaluating",
         priority: "medium",
         channel: "offerio-openings",
-        notes: "来自 OfferIO 开放岗位来源库，投递前仍需官网验证。",
+        notes: "来自 OfferIO 开放岗位公司库，投递前仍需官网验证。",
       });
       await refreshApplications();
       return `${opening.company_name} 已加入投递板。`;
@@ -791,6 +926,7 @@ function App() {
       setChatMessages(INITIAL_CHAT_MESSAGES);
       setChatContextMetadata(null);
       setPendingApproval(null);
+      setRuntimeEvents([]);
       setChatDraft("");
       return "已创建新对话。";
     });
@@ -850,13 +986,14 @@ function App() {
     void runAction(`agent-approval-approve-${approval.approval_request_id}`, async () => {
       const result = await approveAgentApproval(approval.approval_request_id, { decision_reason: "approved from chat UI" });
       const messages = await getAgentMessages(session.id, 100);
-      const lastMessage = result.assistant_message ?? messages[messages.length - 1] ?? null;
+      const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
+      const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
       setPendingApproval(null);
       setChatContextMetadata(result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null));
-      setChatMessages(toChatMessages(messages));
+      setChatMessages(toChatMessages(nextMessages));
       setAgentSession({
         ...session,
-        message_count: Math.max(session.message_count, messages.length),
+        message_count: Math.max(session.message_count, nextMessages.length),
         last_message_at: lastMessage?.created_at ?? session.last_message_at,
         updated_at: lastMessage?.created_at ?? session.updated_at,
       });
@@ -865,7 +1002,7 @@ function App() {
           item.id === session.id
             ? {
                 ...item,
-                message_count: Math.max(item.message_count, messages.length),
+                message_count: Math.max(item.message_count, nextMessages.length),
                 last_message_at: lastMessage?.created_at ?? item.last_message_at,
                 updated_at: lastMessage?.created_at ?? item.updated_at,
               }
@@ -886,13 +1023,14 @@ function App() {
     void runAction(`agent-approval-reject-${approval.approval_request_id}`, async () => {
       const result = await rejectAgentApproval(approval.approval_request_id, { decision_reason: "rejected from chat UI" });
       const messages = await getAgentMessages(session.id, 100);
-      const lastMessage = result.assistant_message ?? messages[messages.length - 1] ?? null;
+      const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
+      const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
       setPendingApproval(null);
       setChatContextMetadata(result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null));
-      setChatMessages(toChatMessages(messages));
+      setChatMessages(toChatMessages(nextMessages));
       setAgentSession({
         ...session,
-        message_count: Math.max(session.message_count, messages.length),
+        message_count: Math.max(session.message_count, nextMessages.length),
         last_message_at: lastMessage?.created_at ?? session.last_message_at,
         updated_at: lastMessage?.created_at ?? session.updated_at,
       });
@@ -923,6 +1061,7 @@ function App() {
       setAgentSessions((current) => (current.some((item) => item.id === session.id) ? current : [session, ...current]));
       setPendingApproval(null);
       setChatDraft("");
+      setRuntimeEvents([]);
       setChatMessages((current) => [
         ...withoutWelcomeMessage(current),
         { id: tempUserId, role: "user", content, meta: "你" },
@@ -962,6 +1101,12 @@ function App() {
                 : item,
             ),
           );
+        },
+        onOuterSessionEvent: (payload) => {
+          setRuntimeEvents((current) => appendRuntimeEvent(current, toRuntimeEventFromOuterSession(payload, current.length)));
+        },
+        onToolEvent: (payload) => {
+          setRuntimeEvents((current) => appendRuntimeEvent(current, toRuntimeEventFromTool(payload, current.length)));
         },
       });
 
@@ -1091,6 +1236,7 @@ function App() {
                   isWorking={workingAction === "agent-chat-send"}
                   messages={chatMessages}
                   pendingApproval={pendingApproval}
+                  runtimeEvents={runtimeEvents}
                   session={agentSession}
                   sessions={agentSessions}
                   onDraftChange={setChatDraft}
@@ -1116,7 +1262,7 @@ function App() {
                   onPin={handlePinSkill}
                 />
               ) : null}
-              {activePage === "dashboard" ? <DashboardPage summary={summary} sources={sources} leads={leads} recruitingSignals={recruitingSignals} navigate={navigate} /> : null}
+              {activePage === "dashboard" ? <DashboardPage summary={summary} sources={sources} leads={leads} navigate={navigate} /> : null}
               {activePage === "sources" ? (
                 <SourcesPage
                   draft={sourceDraft}
@@ -1145,7 +1291,6 @@ function App() {
                   openingPage={offerioOpeningPage}
                   openingTotal={offerioOpeningTotal}
                   openingTotalPages={offerioOpeningTotalPages}
-                  recruitingSignals={recruitingSignals}
                   selectedCompany={selectedOfferioCompany}
                   workingAction={workingAction}
                   onAddOpeningToPipeline={handleAddOfferIOOpeningToPipeline}
@@ -1194,6 +1339,7 @@ function ChatPage({
   messages,
   navigate,
   pendingApproval,
+  runtimeEvents,
   session,
   sessions,
   onApprovePendingApproval,
@@ -1212,6 +1358,7 @@ function ChatPage({
   isWorking: boolean;
   messages: ChatMessage[];
   pendingApproval: AgentApprovalRequiredPayload | null;
+  runtimeEvents: ChatRuntimeTimelineEvent[];
   session: AgentSession | null;
   sessions: AgentSession[];
   navigate: (page: PageId) => void;
@@ -1225,11 +1372,6 @@ function ChatPage({
   onSelectSession: (sessionId: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const loadedMessageCount = contextMetadata?.loaded_session_history_ids?.length ?? 0;
-  const tokenEstimate = contextMetadata?.token_estimate ?? 0;
-  const needCompaction = contextMetadata?.need_compaction === true;
-  const autoCompacted = contextMetadata?.auto_compacted === true;
-  const autoCompactedCount = Number(contextMetadata?.auto_compacted_message_count ?? 0);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
 
@@ -1342,7 +1484,7 @@ function ChatPage({
                   <strong>{message.role === "assistant" ? "OfferMaster AI" : "你"}</strong>
                   {message.meta ? <span>{message.meta}</span> : null}
                 </div>
-                <p>{message.content || (message.role === "assistant" && isWorking ? "正在生成回复..." : "")}</p>
+                <ChatMessageContent content={message.content || (message.role === "assistant" && isWorking ? "正在生成回复..." : "")} />
               </div>
             </article>
           ))}
@@ -1386,51 +1528,65 @@ function ChatPage({
       </div>
 
       <aside className="glass-panel chat-side-panel">
-        <p className="eyebrow">Session Memory</p>
-        <h3>{session ? "会话记忆已连接" : "等待会话创建"}</h3>
-        <div className="state-stack">
-          <MetricRow label="Session" value={session ? session.id.slice(0, 8) : "未创建"} />
-          <MetricRow label="消息数" value={String(session?.message_count ?? messages.length)} />
-          <MetricRow label="Token 估算" value={tokenEstimate ? String(tokenEstimate) : "待构建"} />
-          <MetricRow label="压缩状态" value={autoCompacted ? `已自动压缩 ${autoCompactedCount} 条` : needCompaction ? "下轮自动压缩" : "正常"} />
-          <MetricRow label="加载历史" value={`${loadedMessageCount} 条`} />
-        </div>
-        <div className="chat-summary-box">
-          <strong>Auto Compaction</strong>
-          <p>
-            {autoCompacted
-              ? `本轮已自动生成 summary，并把 ${autoCompactedCount} 条旧消息移出当前上下文。完整 transcript 仍保存在本地数据库。`
-              : "长对话会由后端自动 compact：旧历史变 summary，最近原文和工具调用链继续保留，不需要手动点按钮。"}
-          </p>
-        </div>
-        <div className="action-list">
-          <div className="action-item">
-            <CheckCircle2 size={18} aria-hidden="true" />
-            <div>
-              <strong>已接入</strong>
-              <p>创建 session、读取历史、发送消息、SSE 流式回复和自动 compact 均走后端 Agent API。</p>
-            </div>
-          </div>
-          <div className="action-item">
-            <Clock3 size={18} aria-hidden="true" />
-            <div>
-              <strong>当前回复</strong>
-              <p>AI 输出会边生成边显示；结束后写入会话记忆，并保存本轮 context metadata。</p>
-            </div>
-          </div>
-          <div className="action-item">
-            <ShieldCheck size={18} aria-hidden="true" />
-            <div>
-              <strong>边界不变</strong>
-              <p>真实投递、MCP 自动化和高风险操作仍必须等待用户确认。</p>
-            </div>
-          </div>
-        </div>
+        <ChatRuntimeTimeline events={runtimeEvents} isWorking={isWorking} />
         <button className="button button-ghost full-width" type="button" onClick={() => navigate("leads")}>
           <FileSearch size={16} />
           查看岗位线索
         </button>
       </aside>
+    </section>
+  );
+}
+
+function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelineEvent[]; isWorking: boolean }) {
+  const visibleEvents = events.slice(-8);
+  const latestEvent = visibleEvents[visibleEvents.length - 1] ?? null;
+  const statusLabel = isWorking ? "运行中" : visibleEvents.length ? "已结束" : "待运行";
+
+  return (
+    <section className="chat-runtime-timeline" aria-label="Agent 执行过程" aria-live="polite">
+      <div className="chat-runtime-heading">
+        <div>
+          <p className="eyebrow">执行过程</p>
+          <h4>本轮执行过程</h4>
+        </div>
+        <span className={`runtime-status-pill ${isWorking ? "is-running" : visibleEvents.length ? "is-finished" : "is-idle"}`}>{statusLabel}</span>
+      </div>
+      {visibleEvents.length ? (
+        <ol className="runtime-event-list">
+          {visibleEvents.map((event) => {
+            const Icon = runtimeEventIcon(event);
+            return (
+              <li className={`runtime-event-item runtime-event-${event.tone}`} key={event.id}>
+                <span className="runtime-event-icon" aria-hidden="true">
+                  <Icon className={runtimeEventShouldSpin(event, latestEvent, isWorking) ? "spin-slow" : undefined} size={15} />
+                </span>
+                <div className="runtime-event-copy">
+                  <div className="runtime-event-title-row">
+                    <strong>{event.label}</strong>
+                    {event.toolName ? <code>{formatRuntimeToolName(event.toolName)}</code> : null}
+                    {event.stepIndex ? <span>第 {event.stepIndex} 步</span> : null}
+                  </div>
+                  <p>{formatRuntimeEventSummary(event)}</p>
+                  {event.inputHint ? <small>{event.inputHint}</small> : null}
+                  {event.candidateNames?.length ? (
+                    <div className="runtime-event-candidates" aria-label="候选能力">
+                      {event.candidateNames.map((candidate) => (
+                        <span key={candidate}>{candidate}</span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      ) : (
+        <div className="runtime-event-empty">
+          {isWorking ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Activity size={15} aria-hidden="true" />}
+          <span>{isWorking ? "正在等待后端运行事件。" : "暂无执行过程，本轮还未调用工具。"}</span>
+        </div>
+      )}
     </section>
   );
 }
@@ -1633,17 +1789,14 @@ function DashboardPage({
   summary,
   sources,
   leads,
-  recruitingSignals,
   navigate,
 }: {
   summary: ReturnType<typeof buildSummary>;
   sources: JobSource[];
   leads: JobLead[];
-  recruitingSignals: RecruitingSignal[];
   navigate: (page: PageId) => void;
 }) {
   const latestLeads = leads.slice(0, 5);
-  const latestSignals = recruitingSignals.slice(0, 5);
   const unsyncedSources = sources.filter((source) => !source.last_synced_at).slice(0, 4);
 
   return (
@@ -1651,7 +1804,7 @@ function DashboardPage({
       <section className="metric-grid" aria-label="关键指标">
         <StatCard icon={RadioTower} label="信息源" value={summary.totalSources} helper={`${summary.unsyncedSources} 个待首轮同步`} tone="cyan" />
         <StatCard icon={FileSearch} label="岗位线索" value={summary.totalLeads} helper={`${summary.unverifiedLeads} 条未验证`} tone="amber" />
-        <StatCard icon={Sparkles} label="文章公司" value={summary.totalSignals} helper={`${summary.signalsNeedingEnrichment} 个待补岗位`} tone="blue" />
+        <StatCard icon={ShieldCheck} label="待验证" value={summary.unverifiedLeads} helper="未验证线索暂不进公司数" tone="blue" />
         <StatCard icon={BadgeCheck} label="已验证" value={summary.verifiedLeads} helper="可转正式岗位" tone="green" />
       </section>
 
@@ -1705,16 +1858,16 @@ function DashboardPage({
           )}
         </Panel>
 
-        <Panel className="span-5" title="文章/社媒公司来源" eyebrow="Social + Article Sources" actionLabel="去岗位展览" onAction={() => navigate("jobs")}>
-          {latestSignals.length ? (
-            <div className="signal-list">
-              {latestSignals.map((signal) => (
-                <SignalStrip key={signal.id} signal={signal} />
-              ))}
+        <Panel className="span-5" title="公司数据口径" eyebrow="Company Scope" actionLabel="去公司展览" onAction={() => navigate("jobs")}>
+          <div className="action-list">
+            <div className="action-item">
+              <Building2 size={18} aria-hidden="true" />
+              <div>
+                <strong>只展示完整公司</strong>
+                <p>文章或社媒识别出的公司信号数据不完整，先保留在线索补全流程里，暂不进入公司展览，也不计入公司数量。</p>
+              </div>
             </div>
-          ) : (
-            <EmptyState icon={Sparkles} title="还没有额外公司来源" body="公众号账号同步或文章链接解析后，只有未在岗位展览里出现的公司会在这里提示补全岗位。" />
-          )}
+          </div>
         </Panel>
       </section>
 
@@ -1741,8 +1894,8 @@ function DashboardPage({
             <div className="action-item">
               <ShieldCheck size={18} aria-hidden="true" />
               <div>
-                <strong>公司来源不是正式岗位</strong>
-                <p>公众号或社媒只说明某公司已开放校招时，平台先记录公司来源，等岗位补全和验证后再进入投递确认。</p>
+                <strong>公司展览只放完整数据</strong>
+                <p>公众号或社媒只说明某公司已开放校招时，平台先记录为待补全信号，等岗位和公司字段补齐后再进入公司展览。</p>
               </div>
             </div>
           </div>
@@ -1765,7 +1918,6 @@ function JobExhibitionPage({
   openingPage,
   openingTotal,
   openingTotalPages,
-  recruitingSignals,
   selectedCompany,
   workingAction,
   onAddOpeningToPipeline,
@@ -1789,7 +1941,6 @@ function JobExhibitionPage({
   openingPage: number;
   openingTotal: number;
   openingTotalPages: number;
-  recruitingSignals: RecruitingSignal[];
   selectedCompany: string | null;
   workingAction: string | null;
   onAddOpeningToPipeline: (opening: OfferIOCompanyOpening) => void;
@@ -1806,18 +1957,16 @@ function JobExhibitionPage({
   const activePage = isOpeningMode ? openingPage : companyPage;
   const totalPages = isOpeningMode ? openingTotalPages : companyTotalPages;
   const totalItems = isOpeningMode ? openingTotal : companyTotal;
-  const visibleCompanyNames = buildVisibleCompanyNameSet(companies, openings, leads);
-  const socialCompanies = dedupeRecruitingSignalsForJobBoard(recruitingSignals, visibleCompanyNames);
   const importedLeads = dedupeJobLeadsForJobBoard(leads);
 
   return (
     <section className="job-board-layout">
-      <Panel className="span-12" title="公司与岗位展览" eyebrow="Company + Job Board">
+      <Panel className="span-12" title="公司展览" eyebrow="Company Board">
         <form className="filter-bar job-board-filters" onSubmit={onSearch}>
           <label>
-            <span>岗位来源分类</span>
+            <span>公司来源分类</span>
             <select value={filters.source_mode} onChange={(event) => onFiltersChange({ ...filters, source_mode: event.target.value as JobBoardFilterDraft["source_mode"], page: 1 })}>
-              <option value="company_openings">开放岗位来源库</option>
+              <option value="company_openings">开放岗位公司库</option>
               <option value="company_jobs">公司聚合岗位库</option>
             </select>
           </label>
@@ -1866,11 +2015,10 @@ function JobExhibitionPage({
           </button>
         </form>
 
-        <div className="job-board-summary" aria-label="岗位展览概览">
-          <MetricRow label="当前来源" value={isOpeningMode ? "开放岗位来源库" : "公司聚合岗位库"} />
-          <MetricRow label="总数" value={`${totalItems || (isOpeningMode ? openings.length : companies.length)} 条`} />
-          <MetricRow label="导入线索" value={`${importedLeads.length} 条`} />
-          <MetricRow label="社媒/文章公司" value={`${socialCompanies.length} 个`} />
+        <div className="job-board-summary" aria-label="公司展览概览">
+          <MetricRow label="当前来源" value={isOpeningMode ? "开放岗位公司库" : "公司聚合岗位库"} />
+          <MetricRow label="来源库公司数" value={`${totalItems || (isOpeningMode ? openings.length : companies.length)} 个`} />
+          <MetricRow label="当前筛选导入线索" value={`${importedLeads.length} 条`} />
         </div>
 
         {isOpeningMode ? (
@@ -1883,8 +2031,6 @@ function JobExhibitionPage({
       </Panel>
 
       <ImportedLeadList leads={importedLeads} workingAction={workingAction} onMarkStatus={onMarkLeadStatus} onVerifyAndConvert={onVerifyAndConvertLead} />
-
-      <ArticleCompanySourceList signals={recruitingSignals} existingCompanyNames={visibleCompanyNames} />
 
       {!isOpeningMode ? <Panel className="span-12" title={selectedCompany ? `${selectedCompany} 岗位` : "岗位详情"} eyebrow="Job Detail List">
         {jobs.length ? (
@@ -1984,7 +2130,7 @@ function OpeningSourceList({
   onAddOpeningToPipeline: (opening: OfferIOCompanyOpening) => void;
 }) {
   if (!openings.length) {
-    return <EmptyState icon={BriefcaseBusiness} title="暂无开放岗位来源" body="调整关键词、行业、批次或届别后再筛选。" />;
+    return <EmptyState icon={BriefcaseBusiness} title="暂无开放岗位公司" body="调整关键词、行业、批次或届别后再筛选。" />;
   }
 
   return (
@@ -2029,7 +2175,7 @@ function OpeningSourceList({
 
 function JobBoardPagination({ page, totalPages, onPageChange }: { page: number; totalPages: number; onPageChange: (page: number) => void }) {
   return (
-    <div className="pagination-row" aria-label="岗位展览分页">
+    <div className="pagination-row" aria-label="公司展览分页">
       <button className="button button-ghost" type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>
         上一页
       </button>
@@ -2285,12 +2431,12 @@ function LeadsPage({
             ))}
           </div>
         ) : (
-          <EmptyState icon={FileSearch} title="还没有候选文章" body="添加微信公众号账号并同步后，近期招聘相关文章会先进入这里；公司和岗位统一到“岗位展览”里去重展示。" />
+          <EmptyState icon={FileSearch} title="还没有候选文章" body="添加微信公众号账号并同步后，近期招聘相关文章会先进入这里；只有公司和岗位字段完整的数据才进入“公司展览”。" />
         )}
       </Panel>
 
       <Panel className="span-4 utility-panel" title="临时链接导入" eyebrow="One-off Import">
-        <p className="section-helper">URL 粘贴解析只是一次性兜底：用于还没登记成信息源的公众号文章、小红书笔记或临时招聘页。长期来源请先放到“信息源”，结构化岗位请去“岗位展览”。</p>
+        <p className="section-helper">URL 粘贴解析只是一次性兜底：用于还没登记成信息源的公众号文章、小红书笔记或临时招聘页。长期来源请先放到“信息源”，结构化公司和岗位请去“公司展览”。</p>
         <form className="form-stack" onSubmit={onImportUrl}>
           <label htmlFor="url-import-input">
             <span>招聘信息链接</span>
@@ -2471,91 +2617,6 @@ function ImportedLeadList({
   );
 }
 
-function ArticleCompanySourceList({ signals, existingCompanyNames }: { signals: RecruitingSignal[]; existingCompanyNames: Set<string> }) {
-  const visibleSignals = dedupeRecruitingSignalsForJobBoard(signals, existingCompanyNames);
-  const needsEnrichmentCount = visibleSignals.filter((signal) => signal.status === "needs_job_enrichment").length;
-
-  return (
-    <Panel className="span-12 signal-showcase-panel" title="文章/社媒公司来源" eyebrow="Social + Article Sources">
-      <div className="signal-showcase-summary" aria-label="文章和社媒公司来源概览">
-        <div>
-          <span>新增公司</span>
-          <strong>{visibleSignals.length}</strong>
-          <small>已排除岗位展览里已有的同名公司</small>
-        </div>
-        <div>
-          <span>需补岗位</span>
-          <strong>{needsEnrichmentCount}</strong>
-          <small>后续由 Agent 去官网或招聘站补全 JD</small>
-        </div>
-      </div>
-
-      {visibleSignals.length ? (
-        <div className="signal-showcase-list">
-          {visibleSignals.map((signal) => (
-            <article className="signal-showcase-card" key={signal.id}>
-              <div className="signal-company-mark" aria-hidden="true">
-                <Sparkles size={18} />
-              </div>
-              <div className="signal-showcase-main">
-                <div className="signal-showcase-title">
-                  <div>
-                    <p className="eyebrow">{SIGNAL_TYPE_LABELS[signal.signal_type]}</p>
-                    <h3>{signal.company_name}</h3>
-                  </div>
-                  <span className="pill signal-status">{SIGNAL_STATUS_LABELS[signal.status]}</span>
-                </div>
-                <p>{signal.original_source ? `来源：${signal.original_source}` : "来自文章或社媒内容，暂未补全具体岗位 JD。"}</p>
-                <div className="tag-row">
-                  {signal.graduation_year ? <span>{signal.graduation_year} 届</span> : null}
-                  {signal.confidence_score ? <span>置信度 {Math.round(signal.confidence_score)}%</span> : null}
-                  <span>可信度 {TRUST_LABELS[signal.trust_level]}</span>
-                  <span>同名公司已去重</span>
-                </div>
-              </div>
-              {signal.source_url ? (
-                <a className="button button-small button-ghost" href={signal.source_url} target="_blank" rel="noreferrer">
-                  <ExternalLink size={14} />
-                  来源
-                </a>
-              ) : null}
-            </article>
-          ))}
-        </div>
-      ) : (
-        <EmptyState icon={Sparkles} title="暂无额外公司来源" body="如果公众号、小红书和 OfferIO 都出现京东，这里只保留岗位展览里没有覆盖的公司，避免重复展示。" />
-      )}
-    </Panel>
-  );
-}
-
-function uniqueRecruitingSignals(signals: RecruitingSignal[]): RecruitingSignal[] {
-  const seen = new Set<string>();
-  const genericNames = new Set(["宣讲信息", "招聘信息", "实习信息", "就业信息", "信息来源"]);
-
-  return signals.filter((signal) => {
-    const companyName = signal.company_name.trim();
-    if (!companyName || genericNames.has(companyName)) {
-      return false;
-    }
-
-    const key = `${signal.normalized_company_name || companyName}:${signal.graduation_year ?? "unknown"}:${signal.signal_type}`;
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function buildVisibleCompanyNameSet(companies: OfferIOCompany[], openings: OfferIOCompanyOpening[], leads: JobLead[]): Set<string> {
-  const names = new Set<string>();
-  companies.forEach((company) => addCompanyNameForDedupe(names, company.name));
-  openings.forEach((opening) => addCompanyNameForDedupe(names, opening.company_name));
-  leads.forEach((lead) => addCompanyNameForDedupe(names, lead.company_name));
-  return names;
-}
-
 function dedupeJobLeadsForJobBoard(leads: JobLead[]): JobLead[] {
   const seen = new Set<string>();
   return leads.filter((lead) => {
@@ -2568,25 +2629,6 @@ function dedupeJobLeadsForJobBoard(leads: JobLead[]): JobLead[] {
     seen.add(key);
     return true;
   });
-}
-
-function dedupeRecruitingSignalsForJobBoard(signals: RecruitingSignal[], existingCompanyNames: Set<string>): RecruitingSignal[] {
-  const seen = new Set<string>(existingCompanyNames);
-  return uniqueRecruitingSignals(signals).filter((signal) => {
-    const company = normalizeCompanyNameForDedupe(signal.normalized_company_name || signal.company_name);
-    if (!company || seen.has(company)) {
-      return false;
-    }
-    seen.add(company);
-    return true;
-  });
-}
-
-function addCompanyNameForDedupe(names: Set<string>, companyName: string | null | undefined): void {
-  const normalized = normalizeCompanyNameForDedupe(companyName);
-  if (normalized) {
-    names.add(normalized);
-  }
 }
 
 function normalizeCompanyNameForDedupe(companyName: string | null | undefined): string {
@@ -2985,20 +3027,6 @@ function LeadStrip({ lead }: { lead: JobLead }) {
   );
 }
 
-function SignalStrip({ signal }: { signal: RecruitingSignal }) {
-  return (
-    <article className="signal-strip">
-      <div>
-        <strong>{signal.company_name}</strong>
-        <p>
-          {SIGNAL_TYPE_LABELS[signal.signal_type]} · {signal.graduation_year ? `${signal.graduation_year} 届` : "届别待确认"}
-        </p>
-      </div>
-      <span className="pill signal-status">{SIGNAL_STATUS_LABELS[signal.status]}</span>
-    </article>
-  );
-}
-
 function PipelineColumn({ count, icon: Icon, title }: { count: number; icon: LucideIcon; title: string }) {
   return (
     <div className="pipeline-column">
@@ -3059,6 +3087,17 @@ function sourceToDraft(source: JobSource): SourceDraft {
     fetch_mode: source.fetch_mode,
     notes: source.notes ?? "",
   };
+}
+
+function syncLimitForSource(source: JobSource): number {
+  if (
+    source.source_type === "official_api" &&
+    source.fetch_mode === "official_api" &&
+    source.entry_url?.includes("/api/recruitment/job-companies")
+  ) {
+    return 1000;
+  }
+  return 20;
 }
 
 function defaultFetchModeForSourceType(sourceType: JobSourceType): JobSourceFetchMode {
@@ -3188,13 +3227,143 @@ function scrollChatMessagesToBottom(element: HTMLDivElement | null): void {
   });
 }
 
+function appendAgentMessageIfMissing(messages: AgentMessage[], message: AgentMessage | null | undefined): AgentMessage[] {
+  if (!message || messages.some((item) => item.id === message.id)) {
+    return messages;
+  }
+  return [...messages, message];
+}
+
+function parseMarkdownTables(content: string): ChatContentBlock[] {
+  const lines = String(content || "").split("\n");
+  const blocks: ChatContentBlock[] = [];
+  let textBuffer: string[] = [];
+  let index = 0;
+
+  const flushText = () => {
+    const text = textBuffer.join("\n").trim();
+    if (text) {
+      blocks.push({ type: "text", text });
+    }
+    textBuffer = [];
+  };
+
+  while (index < lines.length) {
+    const current = lines[index] ?? "";
+    const next = lines[index + 1] ?? "";
+    if (isMarkdownTableRow(current) && isMarkdownTableSeparator(next)) {
+      flushText();
+      const headers = parseMarkdownTableRow(current);
+      index += 2;
+      const rows: string[][] = [];
+      while (index < lines.length && isMarkdownTableRow(lines[index] ?? "") && !isMarkdownTableSeparator(lines[index] ?? "")) {
+        rows.push(parseMarkdownTableRow(lines[index] ?? ""));
+        index += 1;
+      }
+      if (headers.length && rows.length) {
+        blocks.push({ type: "table", table: { headers, rows } });
+      }
+      continue;
+    }
+    textBuffer.push(current);
+    index += 1;
+  }
+
+  flushText();
+  return blocks.length ? blocks : [{ type: "text", text: content }];
+}
+
+function isMarkdownTableRow(line: string): boolean {
+  return line.includes("|") && parseMarkdownTableRow(line).length >= 2;
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = parseMarkdownTableRow(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function parseMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim()).filter(Boolean);
+}
+
+function markdownTableToText(table: ParsedMarkdownTable): string {
+  const separator = table.headers.map(() => "---");
+  return [table.headers, separator, ...table.rows].map((row) => `| ${row.map(escapeMarkdownTableCell).join(" | ")} |`).join("\n");
+}
+
+function escapeMarkdownTableCell(value: string): string {
+  return String(value || "").replaceAll("|", "／").replaceAll("\n", " ");
+}
+
 function toChatMessages(messages: AgentMessage[]): ChatMessage[] {
-  const mapped = messages
-    .filter((message) => message.role === "user" || message.role === "assistant")
+  const mapped = orderAgentMessagesForChat(messages)
     .map(toChatMessage)
     .filter((message) => message.content.trim());
 
   return mapped.length ? mapped : INITIAL_CHAT_MESSAGES;
+}
+
+function orderAgentMessagesForChat(messages: AgentMessage[]): AgentMessage[] {
+  const visibleMessages = messages.filter(isChatAgentMessage);
+  const messagesById = new Map(visibleMessages.map((message) => [message.id, message]));
+  const pendingRepliesByParentId = new Map<string, AgentMessage[]>();
+
+  visibleMessages.forEach((message) => {
+    if (message.role !== "assistant" || !message.parent_message_id) {
+      return;
+    }
+
+    const parent = messagesById.get(message.parent_message_id);
+    if (parent?.role !== "user") {
+      return;
+    }
+
+    const replies = pendingRepliesByParentId.get(parent.id) ?? [];
+    replies.push(message);
+    pendingRepliesByParentId.set(parent.id, replies);
+  });
+
+  const ordered: AgentMessage[] = [];
+  const emittedIds = new Set<string>();
+  const flushAssistantReplies = (parentMessageId: string) => {
+    const replies = pendingRepliesByParentId.get(parentMessageId) ?? [];
+    replies.forEach((reply) => {
+      if (emittedIds.has(reply.id)) {
+        return;
+      }
+      ordered.push(reply);
+      emittedIds.add(reply.id);
+    });
+  };
+
+  visibleMessages.forEach((message) => {
+    if (emittedIds.has(message.id)) {
+      return;
+    }
+    if (message.role === "assistant" && message.parent_message_id && pendingRepliesByParentId.has(message.parent_message_id)) {
+      return;
+    }
+
+    ordered.push(message);
+    emittedIds.add(message.id);
+    flushAssistantReplies(message.id);
+  });
+
+  visibleMessages.forEach((message) => {
+    if (emittedIds.has(message.id)) {
+      return;
+    }
+    ordered.push(message);
+    emittedIds.add(message.id);
+    flushAssistantReplies(message.id);
+  });
+
+  return ordered;
+}
+
+function isChatAgentMessage(message: AgentMessage): boolean {
+  return message.role === "user" || message.role === "assistant";
 }
 
 function toChatMessage(message: AgentMessage): ChatMessage {
@@ -3213,6 +3382,154 @@ function withoutWelcomeMessage(messages: ChatMessage[]): ChatMessage[] {
 function buildApprovalChatMessage(approval: AgentApprovalRequiredPayload): string {
   const reason = approval.user_message || approval.reason || "当前 Skill 要求用户确认后才能执行该工具。";
   return `工具 ${approval.tool_name} 需要确认。${reason}`;
+}
+
+function appendRuntimeEvent(current: ChatRuntimeTimelineEvent[], nextEvent: ChatRuntimeTimelineEvent): ChatRuntimeTimelineEvent[] {
+  return [...current, nextEvent].slice(-24);
+}
+
+function toRuntimeEventFromOuterSession(payload: AgentStreamOuterSessionEvent, ordinal: number): ChatRuntimeTimelineEvent {
+  const eventType = payload.event_type;
+  const status = payload.status ?? null;
+  return {
+    id: runtimeEventId("outer_session", eventType, payload.run_id ?? payload.task_id ?? null, ordinal),
+    kind: "outer_session",
+    eventType,
+    label: payload.event_label || formatRuntimeEventType(eventType),
+    summary: stringOrNull(payload.waiting_message) ?? stringOrNull(payload.summary) ?? "主 agent 正在推进当前任务。",
+    status,
+    createdAt: Date.now(),
+    tone: runtimeEventTone(eventType, status),
+  };
+}
+
+function toRuntimeEventFromTool(payload: AgentStreamToolEvent, ordinal: number): ChatRuntimeTimelineEvent {
+  const eventType = payload.event_type;
+  const status = payload.status ?? null;
+  const inputHint = runtimeInputHint(payload.suggested_input_patch ?? null);
+  const toolName = stringOrNull(payload.tool_name) ?? stringOrNull(payload.capability);
+  const candidateNames = runtimeCandidateNames(payload.candidate_capabilities ?? null);
+  return {
+    id: runtimeEventId("tool", eventType, payload.tool_call_id ?? payload.workflow_run_id ?? null, ordinal),
+    kind: "tool",
+    eventType,
+    label: runtimeEventLabel(eventType, payload.event_label),
+    summary: runtimeEventSummary(eventType, payload, toolName),
+    status,
+    toolName,
+    stepIndex: typeof payload.step_index === "number" ? payload.step_index : null,
+    inputHint,
+    candidateNames,
+    createdAt: Date.now(),
+    tone: runtimeEventTone(eventType, status),
+  };
+}
+
+function runtimeEventId(kind: ChatRuntimeEventKind, eventType: string, runOrCallId: string | null, ordinal: number): string {
+  return `${kind}-${eventType}-${runOrCallId ?? "runtime"}-${ordinal}-${Date.now()}`;
+}
+
+function runtimeEventTone(eventType: string, status?: string | null): ChatRuntimeEventTone {
+  if (status === "failed" || status === "error" || status === "denied") {
+    return "danger";
+  }
+  if (eventType === "waiting_user" || eventType === "tool_reflection_retry" || eventType === "observation_insufficient" || status === "retry") {
+    return "warning";
+  }
+  if (eventType === "task_finished" || status === "succeeded" || status === "success") {
+    return "success";
+  }
+  if (eventType === "task_started" || eventType === "turn_started" || eventType === "model_decision" || eventType === "candidate_capabilities" || eventType === "tool_started" || status === "running") {
+    return "running";
+  }
+  return "muted";
+}
+
+function runtimeEventShouldSpin(
+  event: ChatRuntimeTimelineEvent,
+  latestEvent: ChatRuntimeTimelineEvent | null,
+  isWorking: boolean,
+): boolean {
+  return Boolean(isWorking && event.tone === "running" && latestEvent?.id === event.id);
+}
+
+function runtimeEventIcon(event: ChatRuntimeTimelineEvent): LucideIcon {
+  if (event.tone === "danger") {
+    return AlertTriangle;
+  }
+  if (event.eventType === "tool_reflection_retry" || event.eventType === "observation_insufficient") {
+    return RefreshCcw;
+  }
+  if (event.eventType === "candidate_capabilities") {
+    return Layers3;
+  }
+  if (event.eventType === "model_decision") {
+    return Sparkles;
+  }
+  if (event.eventType === "waiting_user") {
+    return Clock3;
+  }
+  if (event.tone === "success") {
+    return CheckCircle2;
+  }
+  if (event.toolName?.includes("search")) {
+    return Search;
+  }
+  if (event.toolName?.includes("database")) {
+    return DatabaseZap;
+  }
+  return event.kind === "tool" ? Activity : Workflow;
+}
+
+function formatRuntimeEventSummary(event: ChatRuntimeTimelineEvent): string {
+  if (event.eventType === "tool_reflection_retry" && event.inputHint) {
+    return `${event.summary} ${event.inputHint}`;
+  }
+  return event.summary;
+}
+
+function runtimeEventLabel(eventType: string, fallbackLabel?: string | null): string {
+  return RUNTIME_EVENT_LABELS[eventType] ?? stringOrNull(fallbackLabel) ?? formatRuntimeEventType(eventType);
+}
+
+function runtimeEventSummary(eventType: string, payload: AgentStreamToolEvent, toolName: string | null): string {
+  const explicitSummary = stringOrNull(payload.summary);
+  if (explicitSummary) {
+    return explicitSummary;
+  }
+  const toolLabel = toolName ? formatRuntimeToolName(toolName) : "候选能力";
+  return RUNTIME_EVENT_SUMMARIES[eventType]?.(toolLabel) ?? "工具事件已更新。";
+}
+
+function formatRuntimeToolName(toolName: string): string {
+  return RUNTIME_TOOL_LABELS[toolName] ?? toolName;
+}
+
+function formatRuntimeEventType(eventType: string): string {
+  return eventType.replaceAll("_", " ");
+}
+
+function runtimeCandidateNames(capabilities: string[] | null): string[] {
+  if (!Array.isArray(capabilities)) {
+    return [];
+  }
+  return capabilities.map((capability) => formatRuntimeToolName(capability)).filter(Boolean).slice(0, 6);
+}
+
+function runtimeInputHint(patch: Record<string, unknown> | null): string | null {
+  if (!patch) {
+    return null;
+  }
+  const query = stringOrNull(patch.query);
+  if (query) {
+    return `下一次会改用关键词：${query}`;
+  }
+  const keys = Object.keys(patch);
+  return keys.length ? `下一次会调整输入字段：${keys.join("、")}` : null;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function formatSessionTitle(session: AgentSession): string {
@@ -3287,7 +3604,7 @@ function buildUrlImportFlowSteps(run: ImportUrlRun | null, accepted: ImportUrlAc
     {
       id: "save",
       title: "线索入库",
-      detail: extracted ? "岗位线索已进入岗位展览" : hasRecruitingSignal ? "等待根据公司来源补全具体岗位" : "等待有效岗位线索",
+      detail: extracted ? "岗位线索已进入公司展览" : hasRecruitingSignal ? "等待根据公司信号补全具体岗位" : "等待有效岗位线索",
       icon: CheckCircle2,
       state: extracted || status === "succeeded" ? "done" : failed ? "failed" : blocked ? "blocked" : stage === "save_job_leads" || stage === "completed" ? "running" : "pending",
     },
@@ -3376,7 +3693,7 @@ function getUrlImportRunExplanation(run: ImportUrlRun): { title: string; body: s
   return { title: "正在处理", body: "系统正在按流程抓取、保存和抽取岗位线索。", tone: "info" };
 }
 
-function buildSummary(sources: JobSource[], leads: JobLead[], recruitingSignals: RecruitingSignal[]) {
+function buildSummary(sources: JobSource[], leads: JobLead[]) {
   const unverifiedLeads = leads.filter((lead) => ["unverified", "pending_review"].includes(lead.verification_status)).length;
   const verifiedLeads = leads.filter((lead) => lead.verification_status === "verified").length;
 
@@ -3384,8 +3701,6 @@ function buildSummary(sources: JobSource[], leads: JobLead[], recruitingSignals:
     totalSources: sources.length,
     unsyncedSources: sources.filter((source) => !source.last_synced_at).length,
     totalLeads: leads.length,
-    totalSignals: recruitingSignals.length,
-    signalsNeedingEnrichment: recruitingSignals.filter((signal) => signal.status === "needs_job_enrichment").length,
     unverifiedLeads,
     verifiedLeads,
     convertedLeads: leads.filter((lead) => lead.verification_status === "converted").length,
@@ -3444,7 +3759,7 @@ const PAGE_TITLES: Record<PageId, string> = {
   skills: "Skill 管理",
   dashboard: "秋招发现总览",
   sources: "岗位信息源管理",
-  jobs: "岗位展览",
+  jobs: "公司展览",
   leads: "线索导入",
   pipeline: "投递进度面板",
   guardrails: "自动化边界",
@@ -3455,8 +3770,8 @@ const PAGE_DESCRIPTIONS: Record<PageId, string> = {
   skills: "管理内容源解析 Skill，展示依赖工具和 Agent 可加载能力。",
   dashboard: "先广撒网收集来源，再让线索进入验证与用户确认流程。",
   sources: "管理高校就业网、企业官网、公众号、小红书和可见招聘页来源。",
-  jobs: "临时接入 OfferIO 结构化接口，先展示公司和岗位，投递前仍做官网验证。",
-  leads: "只负责候选文章、临时链接和手动文本导入；公司和岗位统一到岗位展览去重展示。",
+  jobs: "临时接入 OfferIO 结构化接口，先按公司展示，再查看岗位，投递前仍做官网验证。",
+  leads: "只负责候选文章、临时链接和手动文本导入；字段不完整的文章/社媒信号暂不作为公司展示。",
   pipeline: "岗位申请阶段可人工修改，后续 agent 也会通过同一 API 更新进度。",
   guardrails: "保留 DDD、LangGraph checkpoint、MCP Gateway 和用户确认边界。",
 };
@@ -3496,19 +3811,6 @@ const APPLICATION_STATUS_LABELS: Record<ApplicationStatus, string> = Object.from
   ApplicationStatus,
   string
 >;
-
-const SIGNAL_TYPE_LABELS: Record<string, string> = {
-  campus_recruitment_open: "校招开放",
-  internship_open: "实习开放",
-  info_summary: "招聘汇总",
-};
-
-const SIGNAL_STATUS_LABELS: Record<string, string> = {
-  needs_job_enrichment: "待补全岗位",
-  job_found: "已找到岗位",
-  no_matching_job: "无匹配岗位",
-  expired: "已过期",
-};
 
 const ARTICLE_STATUS_LABELS: Record<string, string> = {
   pending: "待解析",

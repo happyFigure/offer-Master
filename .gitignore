@@ -39,3 +39,10 @@ data/vector_store/*
 !data/vector_store/.gitkeep
 vendor/external-skills/*
 !vendor/external-skills/README.md
+vendor/claude-sdk-agent/.claude/
+vendor/claude-sdk-agent/.venv/
+vendor/claude-sdk-agent/data/
+vendor/claude-sdk-agent/log/
+vendor/claude-sdk-agent/logs/
+.tmp-research/
+$out/

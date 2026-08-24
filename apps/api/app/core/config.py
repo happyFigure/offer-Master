@@ -71,6 +71,26 @@ class Settings(BaseSettings):
         validation_alias="JOBPILOT_WORKER_POLL_INTERVAL_SECONDS",
     )
     worker_max_retries: int = Field(default=3, validation_alias="JOBPILOT_WORKER_MAX_RETRIES")
+    external_agent_auto_dispatch: bool = Field(
+        default=False,
+        validation_alias="JOBPILOT_EXTERNAL_AGENT_AUTO_DISPATCH",
+    )
+    claude_sdk_agent_base_url: str | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_BASE_URL",
+    )
+    claude_sdk_agent_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_API_KEY",
+    )
+    claude_sdk_agent_model: str = Field(
+        default="MiniMax-M2.7",
+        validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_MODEL",
+    )
+    claude_sdk_agent_timeout_seconds: float = Field(
+        default=300.0,
+        validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_TIMEOUT_SECONDS",
+    )
     speech_provider: str = Field(
         default="web_speech",
         validation_alias="JOBPILOT_SPEECH_PROVIDER",
@@ -90,6 +110,16 @@ class Settings(BaseSettings):
         validation_alias="JOBPILOT_LLM_TIMEOUT_SECONDS",
     )
     llm_max_retries: int = Field(default=2, validation_alias="JOBPILOT_LLM_MAX_RETRIES")
+    execution_planner_enabled: bool = Field(default=False, validation_alias="JOBPILOT_EXECUTION_PLANNER_ENABLED")
+    intent_llm_provider: str | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_PROVIDER")
+    intent_llm_base_url: str | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_BASE_URL")
+    intent_llm_api_key: SecretStr | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_API_KEY")
+    intent_llm_model: str | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_MODEL")
+    intent_llm_timeout_seconds: float | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_INTENT_LLM_TIMEOUT_SECONDS",
+    )
+    intent_llm_max_retries: int | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_MAX_RETRIES")
     embedding_provider: str = Field(
         default="disabled",
         validation_alias="JOBPILOT_EMBEDDING_PROVIDER",
@@ -121,7 +151,13 @@ class Settings(BaseSettings):
             return value
         return PROJECT_ROOT / value
 
-    @field_validator("llm_base_url", "xiaohongshu_mcp_base_url", mode="after")
+    @field_validator(
+        "llm_base_url",
+        "intent_llm_base_url",
+        "xiaohongshu_mcp_base_url",
+        "claude_sdk_agent_base_url",
+        mode="after",
+    )
     @classmethod
     def strip_base_url(cls, value: str | None) -> str | None:
         return value.rstrip("/") if value else value

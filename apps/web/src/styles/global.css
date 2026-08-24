@@ -1991,10 +1991,313 @@ textarea {
   white-space: pre-wrap;
 }
 
+.chat-message-content {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.chat-message-text {
+  margin: 0;
+}
+
+.chat-table-card {
+  overflow: hidden;
+  width: min(100%, 1120px);
+  border: 1px solid rgba(226, 232, 240, 0.18);
+  border-radius: 16px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.025)),
+    rgba(15, 23, 42, 0.62);
+  box-shadow: 0 22px 60px rgba(2, 6, 23, 0.28);
+}
+
+.chat-table-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 0 18px 0 20px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.15);
+}
+
+.chat-table-card-header strong {
+  color: var(--text-strong);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.chat-table-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-table-actions button {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: rgba(226, 232, 240, 0.78);
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+}
+
+.chat-table-actions button:hover,
+.chat-table-actions button:focus-visible {
+  border-color: rgba(125, 211, 252, 0.28);
+  background: rgba(125, 211, 252, 0.09);
+  color: var(--text-strong);
+  outline: none;
+}
+
+.chat-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.chat-table-card table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  color: var(--text);
+}
+
+.chat-table-card th,
+.chat-table-card td {
+  padding: 16px 20px;
+  border-right: 1px solid rgba(226, 232, 240, 0.13);
+  border-bottom: 1px solid rgba(226, 232, 240, 0.13);
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-table-card th:last-child,
+.chat-table-card td:last-child {
+  border-right: 0;
+}
+
+.chat-table-card tr:last-child td {
+  border-bottom: 0;
+}
+
+.chat-table-card th {
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.chat-table-card td {
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.chat-table-card td:first-child {
+  color: var(--text-strong);
+  font-weight: 800;
+}
+
 .chat-message-user .chat-bubble p {
   color: var(--text-strong);
   font-size: 15px;
   line-height: 1.55;
+}
+
+.chat-runtime-timeline {
+  display: grid;
+  gap: 10px;
+  min-height: 420px;
+  max-height: calc(100dvh - 250px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: var(--radius);
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.chat-runtime-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chat-runtime-heading h4 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.runtime-status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.runtime-status-pill.is-running {
+  border-color: rgba(125, 211, 252, 0.28);
+  color: #d8f3ff;
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.runtime-status-pill.is-finished {
+  border-color: rgba(52, 211, 153, 0.24);
+  color: #bbf7d0;
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.runtime-status-pill.is-idle {
+  border-color: rgba(148, 163, 184, 0.2);
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.07);
+}
+
+.runtime-event-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runtime-event-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 9px 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.runtime-event-item:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.runtime-event-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.runtime-event-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.runtime-event-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+}
+
+.runtime-event-title-row strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.runtime-event-title-row code,
+.runtime-event-title-row span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.runtime-event-title-row code {
+  padding: 2px 6px;
+  border: 1px solid rgba(125, 211, 252, 0.16);
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.07);
+  white-space: normal;
+  word-break: break-word;
+}
+
+.runtime-event-copy p,
+.runtime-event-copy small,
+.runtime-event-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.runtime-event-copy small {
+  color: #c4eaff;
+}
+
+.runtime-event-candidates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.runtime-event-candidates span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 999px;
+  color: #d8f3ff;
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.runtime-event-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-event-running .runtime-event-icon {
+  border-color: rgba(125, 211, 252, 0.3);
+  color: var(--blue);
+  background: rgba(56, 189, 248, 0.11);
+}
+
+.runtime-event-success .runtime-event-icon {
+  border-color: rgba(52, 211, 153, 0.28);
+  color: var(--green);
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.runtime-event-warning .runtime-event-icon {
+  border-color: rgba(251, 191, 36, 0.3);
+  color: var(--amber);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+.runtime-event-danger .runtime-event-icon {
+  border-color: rgba(251, 113, 133, 0.32);
+  color: var(--red);
+  background: rgba(251, 113, 133, 0.1);
+}
+
+.spin-slow {
+  animation: spin 1.6s linear infinite;
 }
 
 .tool-approval-card {
@@ -2122,9 +2425,12 @@ textarea {
 
 .chat-side-panel {
   display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 14px;
   position: sticky;
   top: 16px;
+  max-height: calc(100dvh - 162px);
+  overflow: hidden;
 }
 
 .chat-summary-box {

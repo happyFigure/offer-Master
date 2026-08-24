@@ -4,8 +4,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from app.agent_runtime.tool_permissions import AgentToolPermissionDecision, AgentToolPermissionPolicy
-from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+from app.agent_runtime.tool_permissions import (
+    AgentToolPermissionDecision,
+    AgentToolPermissionPolicy,
+    AgentToolPermissionResult,
+)
+from app.agent_runtime.tool_registry import (
+    EXTERNAL_WEB_SEARCH_TOOL,
+    LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+    LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+    AgentToolDefinition,
+    AgentToolRegistry,
+    AgentToolRiskLevel,
+)
 
 
 class AgentToolErrorCode(str, Enum):
@@ -22,6 +33,15 @@ class AgentToolNextAction(str, Enum):
     STOP = "stop"
     SELECT_ALTERNATIVE_TOOL = "select_alternative_tool"
     REQUEST_USER_CONFIRMATION = "request_user_confirmation"
+
+
+LOW_RISK_RUNTIME_CAPABILITY_TOOLS = frozenset(
+    {
+        EXTERNAL_WEB_SEARCH_TOOL,
+        LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+        LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -95,11 +115,13 @@ class AgentToolRuntimeGuard:
             )
 
         skill_permission_result = None
+        skill_permission_decision = None
         if skill_permission_policy is not None:
             skill_permission_result = skill_permission_policy.decide(
                 context.tool_name,
                 user_confirmed=context.user_confirmed,
             )
+            skill_permission_decision = skill_permission_result.decision.value
             if skill_permission_result.decision == AgentToolPermissionDecision.DENY:
                 return self._blocked(
                     context,
@@ -111,15 +133,18 @@ class AgentToolRuntimeGuard:
                     error_details=skill_permission_result.error_details,
                 )
             if skill_permission_result.decision == AgentToolPermissionDecision.ASK:
-                return self._blocked(
-                    context,
-                    AgentToolErrorCode.TOOL_SKILL_CONFIRMATION_REQUIRED,
-                    reason=skill_permission_result.reason,
-                    user_message="This tool requires user confirmation because it is outside the active Skill automatic permissions.",
-                    next_action=AgentToolNextAction.REQUEST_USER_CONFIRMATION,
-                    retryable=True,
-                    error_details=skill_permission_result.error_details,
-                )
+                if self._allows_low_risk_runtime_capability(context, definition, skill_permission_result):
+                    skill_permission_decision = "allow_low_risk_runtime_capability"
+                else:
+                    return self._blocked(
+                        context,
+                        AgentToolErrorCode.TOOL_SKILL_CONFIRMATION_REQUIRED,
+                        reason=skill_permission_result.reason,
+                        user_message="This tool requires user confirmation because it is outside the active Skill automatic permissions.",
+                        next_action=AgentToolNextAction.REQUEST_USER_CONFIRMATION,
+                        retryable=True,
+                        error_details=skill_permission_result.error_details,
+                    )
 
         source_type_result = self._check_source_type(context, definition)
         if source_type_result is not None:
@@ -150,8 +175,22 @@ class AgentToolRuntimeGuard:
                 "risk_level": definition.risk_level.value,
                 "requires_confirmation": definition.requires_confirmation,
                 "skill_id": skill_permission_result.skill_id if skill_permission_result else None,
-                "skill_permission_decision": skill_permission_result.decision.value if skill_permission_result else None,
+                "skill_permission_decision": skill_permission_decision,
             },
+        )
+
+    @staticmethod
+    def _allows_low_risk_runtime_capability(
+        context: AgentToolCallContext,
+        definition: AgentToolDefinition,
+        skill_permission_result: AgentToolPermissionResult,
+    ) -> bool:
+        return (
+            context.tool_name in LOW_RISK_RUNTIME_CAPABILITY_TOOLS
+            and definition.risk_level == AgentToolRiskLevel.LOW
+            and not definition.requires_confirmation
+            and context.tool_name not in skill_permission_result.ask_tools
+            and context.tool_name not in skill_permission_result.allowed_tools
         )
 
     def _check_source_type(

@@ -85,6 +85,43 @@ class FakeOfferIOProvider:
         )
 
 
+class FakePagedOfferIOCompanyProvider:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def list_companies(self, **kwargs):
+        from app.domains.jobs.providers.offerio import OfferIOCompany, OfferIOPage
+
+        page = int(kwargs["page"])
+        requested_page_size = int(kwargs["page_size"])
+        page_size = min(50, requested_page_size)
+        self.calls.append({"job_type": kwargs["job_type"], "page": page, "page_size": requested_page_size})
+        start = (page - 1) * page_size
+        remaining = max(0, 120 - start)
+        count = min(page_size, remaining)
+        return OfferIOPage(
+            items=[
+                OfferIOCompany(
+                    name=f"Company {start + index + 1:03d}",
+                    company_nature="private",
+                    industry="internet/software",
+                    locations="Shanghai",
+                    job_count=10,
+                    updated_at="2026-08-17",
+                    raw_payload={"company": f"Company {start + index + 1:03d}"},
+                )
+                for index in range(count)
+            ],
+            page=page,
+            page_size=page_size,
+            total=120,
+            total_pages=3,
+        )
+
+    def list_company_openings(self, **kwargs):  # pragma: no cover - this fake is for job-companies only.
+        raise AssertionError("company openings endpoint should not be called")
+
+
 class FakeOpenLeadVerifier:
     def verify(self, lead):
         from app.domains.jobs.verification import LeadVerificationCheck
@@ -460,6 +497,53 @@ class JobSourcesApiTest(unittest.TestCase):
         self.assertLessEqual(len(stored_leads[0].title), 255)
         self.assertLessEqual(len(stored_leads[0].job_direction), 128)
         self.assertTrue(stored_leads[0].job_direction.startswith("Java backend"))
+
+    def test_sync_offerio_company_jobs_source_accepts_total_limit_and_paginates_with_page_size_50(self):
+        from app.domains.jobs.models import JobLead, RawJobLead
+
+        offerio_provider = FakePagedOfferIOCompanyProvider()
+        app = self._app(offerio_provider=offerio_provider)
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                source = await client.post(
+                    "/api/v1/job-sources",
+                    json={
+                        "name": "OfferIO 公司聚合岗位库",
+                        "source_type": "official_api",
+                        "entry_url": "https://offerio.work/api/recruitment/job-companies?jobType=校招&page=1&pageSize=50",
+                        "trust_level": "medium_high",
+                        "fetch_mode": "official_api",
+                    },
+                )
+                return await client.post(
+                    f"/api/v1/job-sources/{source.json()['id']}/sync",
+                    json={"limit": 120},
+                )
+
+        response = run(call_api())
+
+        with self.Session() as session:
+            raw_leads = session.scalars(select(RawJobLead)).all()
+            stored_leads = session.scalars(select(JobLead)).all()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("succeeded", response.json()["status"])
+        self.assertEqual(120, response.json()["fetched_count"])
+        self.assertEqual(120, response.json()["extracted_count"])
+        self.assertEqual(
+            [
+                {"job_type": "校招", "page": 1, "page_size": 50},
+                {"job_type": "校招", "page": 2, "page_size": 50},
+                {"job_type": "校招", "page": 3, "page_size": 50},
+            ],
+            offerio_provider.calls,
+        )
+        self.assertEqual(120, len(raw_leads))
+        self.assertEqual(120, len(stored_leads))
+        self.assertEqual("Company 001", stored_leads[0].company_name)
+        self.assertEqual("Company 120", stored_leads[-1].company_name)
 
     def test_sync_source_returns_failed_run_when_provider_access_is_restricted(self):
         from app.domains.jobs.models import SourceSyncRun

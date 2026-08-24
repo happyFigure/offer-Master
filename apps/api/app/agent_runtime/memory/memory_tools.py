@@ -322,7 +322,7 @@ def memory_get(session: Session, *, memory_id: str) -> MemoryRead:
 
 
 def _available_memory_tables(session: Session) -> list[str]:
-    inspector = inspect(session.bind)
+    inspector = inspect(session.connection())
     table_names = set(inspector.get_table_names())
     return [table for table in MEMORY_TABLES if table in table_names]
 

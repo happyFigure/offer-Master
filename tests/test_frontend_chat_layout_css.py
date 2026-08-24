@@ -50,6 +50,25 @@ class FrontendChatLayoutCssTest(TestCase):
         self.assertIn("grid", approval_card)
         self.assertIn("display: flex;", approval_actions)
 
+    def test_chat_runtime_timeline_is_compact_and_status_driven(self) -> None:
+        css_source = Path("apps/web/src/styles/global.css").read_text(encoding="utf-8")
+
+        timeline = _css_block(css_source, ".chat-runtime-timeline")
+        heading = _css_block(css_source, ".chat-runtime-heading")
+        event_item = _css_block(css_source, ".runtime-event-item")
+
+        self.assertIn("display: grid;", timeline)
+        self.assertIn("max-height", timeline)
+        self.assertIn("min-height: 420px;", timeline)
+        self.assertIn("grid-template-rows: minmax(0, 1fr) auto;", css_source)
+        self.assertIn("max-height: calc(100dvh - 162px);", css_source)
+        self.assertIn("display: flex;", heading)
+        self.assertIn("grid-template-columns: auto minmax(0, 1fr);", event_item)
+        self.assertIn(".runtime-event-running", css_source)
+        self.assertIn(".runtime-event-success", css_source)
+        self.assertIn(".runtime-event-warning", css_source)
+        self.assertIn(".runtime-event-danger", css_source)
+
 
 def _css_block(css_source: str, selector: str) -> str:
     marker = f"{selector} {{"

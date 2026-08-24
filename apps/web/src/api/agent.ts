@@ -8,6 +8,8 @@ import type {
   AgentSession,
   AgentSessionCreateInput,
   AgentSessionUpdateInput,
+  AgentStreamOuterSessionEvent,
+  AgentStreamToolEvent,
   AgentUserMessageInput,
 } from "../types/agent";
 
@@ -23,6 +25,8 @@ interface AgentStreamHandlers {
   onUserMessage?: (message: AgentMessage) => void;
   onToken?: (content: string) => void;
   onApprovalRequired?: (payload: AgentApprovalRequiredPayload) => void;
+  onOuterSessionEvent?: (payload: AgentStreamOuterSessionEvent) => void;
+  onToolEvent?: (payload: AgentStreamToolEvent) => void;
   onDone?: (assistantMessage: AgentMessage) => void;
   onError?: (message: string) => void;
 }
@@ -133,6 +137,12 @@ function dispatchAgentStreamEvent(rawEvent: string, handlers: AgentStreamHandler
   if (eventName === "approval_required" && isAgentApprovalRequiredPayload(data)) {
     handlers.onApprovalRequired?.(data);
   }
+  if (eventName === "outer_session_event" && isAgentStreamOuterSessionEvent(data)) {
+    handlers.onOuterSessionEvent?.(data);
+  }
+  if (eventName === "tool_event" && isAgentStreamToolEvent(data)) {
+    handlers.onToolEvent?.(data);
+  }
   if (eventName === "done" && isAgentMessage(data.assistant_message)) {
     handlers.onDone?.(data.assistant_message);
   }
@@ -149,4 +159,19 @@ function isAgentMessage(value: unknown): value is AgentMessage {
 
 function isAgentApprovalRequiredPayload(value: unknown): value is AgentApprovalRequiredPayload {
   return typeof value === "object" && value !== null && "approval" in value && "tool_name" in value && "context_metadata" in value;
+}
+
+function isAgentStreamOuterSessionEvent(value: unknown): value is AgentStreamOuterSessionEvent {
+  return typeof value === "object" && value !== null && "event_type" in value && "event_label" in value && "session_id" in value;
+}
+
+function isAgentStreamToolEvent(value: unknown): value is AgentStreamToolEvent {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "event_type" in value &&
+    "event_label" in value &&
+    "session_id" in value &&
+    ("tool_name" in value || "capability" in value)
+  );
 }

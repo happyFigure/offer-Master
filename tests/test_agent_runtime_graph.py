@@ -288,7 +288,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
     def test_skill_permission_snapshot_denies_tool_before_execution(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.domains.agent_memory.schemas import AgentSkillCreate
-        from app.domains.automation.models import ToolCallLog
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
 
         with self.Session() as session:
             session_id = self._session_id(session)
@@ -618,6 +618,55 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("agent_runtime", tool_log.output_payload["execution"])
         self.assertEqual("agent_tool_registry", tool_log.output_payload["agent_runtime"]["executor_id"])
         self.assertEqual("Example", tool_log.output_payload["result"]["result"]["title"])
+        self.assertEqual([tool_log.id], result.state.tool_call_ids)
+
+    def test_unavailable_tool_handler_records_structured_failure_envelope(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name="custom.no_handler",
+                    description="A registered tool without an executable handler.",
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="调用不可用工具",
+                    requested_tool_name="custom.no_handler",
+                    source_type="agent_chat",
+                ),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+
+            tool_log = session.scalars(select(ToolCallLog)).one()
+            messages = dependencies.conversation_service.list_messages(session_id, limit=20)
+
+        self.assertEqual(ToolCallStatus.FAILED, tool_log.status)
+        self.assertEqual("handler_unavailable", tool_log.output_payload["execution"])
+        envelope = tool_log.output_payload["result"]["result_envelope"]
+        self.assertEqual("failed", envelope["status"])
+        self.assertEqual("custom.no_handler", envelope["capability"])
+        self.assertEqual("TOOL_HANDLER_UNAVAILABLE", envelope["error_code"])
+        self.assertFalse(envelope["retryable"])
+        self.assertEqual("select_alternative_tool", envelope["next_action"])
+
+        tool_results = [message for message in messages if message.role == AgentMessageRole.TOOL_RESULT]
+        self.assertEqual(1, len(tool_results))
+        self.assertEqual("TOOL_HANDLER_UNAVAILABLE", tool_results[0].content_json["result"]["result_envelope"]["error_code"])
         self.assertEqual([tool_log.id], result.state.tool_call_ids)
 
     def test_web_search_can_be_dispatched_to_registered_claude_sdk_agent_executor(self) -> None:
@@ -1097,7 +1146,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
     def test_agent_does_not_auto_select_offerio_company_jobs_sync_from_update_request(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
-        from app.domains.automation.models import ToolCallLog
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
 
         calls = []
 
@@ -2814,6 +2863,692 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("openai-sdk-agent", fake_agent.calls[0]["context"].namespace)
         self.assertEqual(2, len(fake_llm.calls))
 
+    def test_tool_choice_loop_reuses_recent_file_path_for_exact_resume_name_replacement(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_payload = "\\name{刘汉卿}\n\\section{项目}原文保持不变"
+        expected_write_payload = read_payload.replace("刘汉卿", "王爷")
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and len(self.calls) == 1:
+                    self._test_case.assertIn(resume_path, combined)
+                    tool_names = [tool["function"]["name"] for tool in tools]
+                    self._test_case.assertIn("filesystem_read_file", tool_names)
+                    self._test_case.assertIn("filesystem_write_text", tool_names)
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-resume",
+                                name="filesystem_read_file",
+                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
+                            )
+                        ],
+                    )
+                if tools and len(self.calls) == 2:
+                    self._test_case.assertIn("刘汉卿", combined)
+                    self._test_case.assertIn("原文保持不变", combined)
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-write-resume",
+                                name="filesystem_write_text",
+                                arguments={
+                                    "path": resume_path,
+                                    "text": expected_write_payload,
+                                    "encoding": "utf-8",
+                                    "overwrite": True,
+                                },
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="已准备好写回，仅替换姓名。")
+
+        read_calls = []
+        write_calls = []
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto", offset: int = 0, limit: int = 200):
+            read_calls.append({"path": path, "encoding": encoding, "offset": offset, "limit": limit})
+            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": read_payload}}
+
+        def fake_write_text(_session, *, path: str, text: str, encoding: str = "utf-8", overwrite: bool = False):
+            write_calls.append({"path": path, "text": text, "encoding": encoding, "overwrite": overwrite})
+            return {"tool_name": "filesystem.write_text", "ok": True, "result": {"path": path, "bytes_written": len(text)}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取用户指定的本地文件。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "encoding": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                ),
+                AgentToolDefinition(
+                    name="filesystem.write_text",
+                    description="写入用户指定的本地文件。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path", "text"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "text": {"type": "string"},
+                            "encoding": {"type": "string"},
+                            "overwrite": {"type": "boolean"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_write_text,
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_write", "filesystem_operation"})),
+                ),
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="你把简历的名字给我换了，其他的啥都不要动"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+            approval = session.scalars(select(ApprovalRequest)).one()
+
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual("filesystem.write_text", result.state.requested_tool_name)
+        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual([], write_calls)
+        self.assertEqual(["filesystem.read_file"], [log.tool_name for log in tool_logs])
+        self.assertEqual(expected_write_payload, approval.payload["tool_input"]["text"])
+        self.assertEqual(resume_path, approval.payload["tool_input"]["path"])
+
+    def test_tool_choice_loop_reuses_recent_file_path_for_short_read_content_followup(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and len(self.calls) == 1:
+                    self._test_case.assertIn(resume_path, combined)
+                    tool_names = [tool["function"]["name"] for tool in tools]
+                    self._test_case.assertEqual(["filesystem_read_file"], tool_names)
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-resume-content",
+                                name="filesystem_read_file",
+                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content=f"读取到文件内容：\n{read_payload}")
+
+        read_calls = []
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto", offset: int = 0, limit: int = 200):
+            read_calls.append({"path": path, "encoding": encoding, "offset": offset, "limit": limit})
+            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": read_payload}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.path_exists",
+                    description="检查用户指定的本地路径是否存在。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=lambda _session, *, path: {"tool_name": "filesystem.path_exists", "ok": True, "result": {"exists": True}},
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_stat", "filesystem_operation"})),
+                ),
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取用户指定的本地文件内容。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "encoding": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                ),
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="读取内容"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertIn("姓名：刘汉卿", result.state.final_response)
+        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("filesystem.read_file", tool_log.tool_name)
+
+    def test_tool_choice_loop_treats_casual_read_followup_as_file_tool_request(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_calls = []
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if "姓名：刘汉卿" in combined:
+                    return LLMChatCompletion(content="读取到文件内容：姓名：刘汉卿")
+                if tools:
+                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-casual-read-followup",
+                                name="filesystem_read_file",
+                                arguments={"path": resume_path, "encoding": "utf-8"},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="我不能直接读取本地文件。")
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto"):
+            read_calls.append({"path": path, "encoding": encoding})
+            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": "姓名：刘汉卿"}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取用户指定的本地文件内容。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                )
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeLLM(self)
+            dependencies = self._dependencies(session, llm_client=fake_llm).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="那么你现在读一下里面的内容"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual(1, len(tool_logs))
+        tool_log = tool_logs[0]
+        self.assertEqual([{"path": resume_path, "encoding": "utf-8"}], read_calls)
+        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertNotIn("textual_tool_call_recovery", result.state.context_metadata)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("filesystem.read_file", tool_log.tool_name)
+
+    def test_tool_choice_loop_reuses_recent_file_path_for_pronoun_open_followup(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and len(self.calls) == 1:
+                    self._test_case.assertIn(resume_path, combined)
+                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-open-resume-pronoun",
+                                name="filesystem_read_file",
+                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
+                            )
+                        ],
+                    )
+                if tools is None and len(self.calls) == 1:  # pragma: no cover - regression guard.
+                    raise AssertionError("contextual file follow-up should enter the tool choice loop")
+                return LLMChatCompletion(content=f"读取到文件内容：\n{read_payload}")
+
+        read_calls = []
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto", offset: int = 0, limit: int = 200):
+            read_calls.append({"path": path, "encoding": encoding, "offset": offset, "limit": limit})
+            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": read_payload}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取用户指定的本地文件内容。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "encoding": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                ),
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="打开它"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+
+    def test_tool_choice_loop_completes_missing_file_path_before_execution(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools and len(self.calls) == 1:
+                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-with-missing-path",
+                                name="filesystem_read_file",
+                                arguments={"encoding": "utf-8", "limit": 500},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content=f"读取到文件内容：\n{read_payload}")
+
+        read_calls = []
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto", offset: int = 0, limit: int = 200):
+            read_calls.append({"path": path, "encoding": encoding, "offset": offset, "limit": limit})
+            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": read_payload}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取用户指定的本地文件内容。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "encoding": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                ),
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="读取内容"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual({"encoding": "utf-8", "limit": 500, "path": resume_path}, tool_log.input_payload)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+
+    def test_tool_choice_loop_preserves_completed_input_for_high_risk_confirmation(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent平台简历.tex"
+
+        class FakeLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                if tools:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-replace-missing-path",
+                                name="filesystem_replace_text",
+                                arguments={"old_text": "刘汉卿", "new_text": "王爷"},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="should not run")
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.replace_text",
+                    description="精确替换用户指定文件中的文本。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path", "old_text", "new_text"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                            "encoding": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=lambda _session, **arguments: {"tool_name": "filesystem.replace_text", "ok": True, "result": arguments},
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_replace", "filesystem_write", "filesystem_operation"})),
+                ),
+            ]
+        )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM()).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"这是简历路径：{resume_path}",
+                    visible_content_text=f"这是简历路径：{resume_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="把简历名字改为王爷，其他不要动"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.scalars(select(ApprovalRequest)).one()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual([], tool_logs)
+        self.assertEqual(
+            {"old_text": "刘汉卿", "new_text": "王爷", "path": resume_path},
+            approval.payload["tool_input"],
+        )
+
+    def test_tool_choice_loop_reuses_recent_company_context_for_pronoun_public_lookup(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and "Canonical 是 Ubuntu 背后的公司" not in combined:
+                    self._test_case.assertIn("Canonical Ltd.", combined)
+                    self._test_case.assertEqual(["external_web_search"], [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-pronoun-company-public-info",
+                                name="external_web_search",
+                                arguments={"query": "Canonical Ltd. 主要业务", "max_results": 3},
+                            )
+                        ],
+                    )
+                if tools is None and len(self.calls) == 1:  # pragma: no cover - regression guard.
+                    raise AssertionError("contextual public lookup should enter the tool choice loop")
+                return LLMChatCompletion(content="Canonical Ltd. 主要做 Ubuntu、企业 Linux 和云基础设施。")
+
+        search_calls = []
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            search_calls.append({"query": query, "max_results": max_results})
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {
+                    "query": query,
+                    "answer": "Canonical 是 Ubuntu 背后的公司，主要做企业 Linux 和云基础设施。",
+                    "sources": [{"title": "Canonical", "url": "https://canonical.com/"}],
+                },
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self))
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web through an external agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text="我想了解 Canonical Ltd. 这个公司",
+                    visible_content_text="我想了解 Canonical Ltd. 这个公司",
+                    token_estimate=10,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="查一下它主要业务"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"query": "Canonical Ltd. 主要业务", "max_results": 3}], search_calls)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
+
     def test_native_tool_loop_can_execute_multiple_tool_steps_before_final_answer(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
@@ -3725,6 +4460,74 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertIn("claude-sdk-agent", content)
         self.assertIn("停在最终提交前", content)
 
+    def test_tool_summary_rejects_company_overview_when_user_asked_specific_company(self) -> None:
+        from app.agent_runtime.graph_factory import tool_result_summary_response
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL
+
+        state = AgentState(
+            session_id="session-company-specific-summary",
+            workflow_run_id="workflow-company-specific-summary",
+            agent_run_id="agent-run-company-specific-summary",
+            user_message="你给我看一下数据库中关于京东这个公司的信息有什么",
+            current_step="maybe_tool",
+            requested_tool_name=LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+            llm_messages=[
+                {
+                    "role": "assistant",
+                    "content": "Tool result: local.company_database_overview succeeded",
+                    "metadata": {
+                        "content_json": {
+                            "tool_name": LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+                            "status": "succeeded",
+                            "result": {
+                                "tool_name": LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
+                                "ok": True,
+                                "result": {
+                                    "company_count": 2,
+                                    "job_count": 3,
+                                    "job_lead_count": 71,
+                                    "job_lead_company_count": 71,
+                                    "recruiting_signal_count": 11,
+                                    "recruiting_signal_company_count": 10,
+                                    "sample_companies": ["Canonical Ltd.", "腾讯"],
+                                    "sample_lead_companies": ["3PEAK", "deeproute.ai"],
+                                    "sample_signal_companies": ["中国平安", "基恩士"],
+                                    "company_rows": [
+                                        {
+                                            "tier": "正式企业",
+                                            "company_name": "Canonical Ltd.",
+                                            "known_info": "企业档案、正式岗位",
+                                            "quantity": "2 条岗位",
+                                            "status": "可用于推荐",
+                                        },
+                                        {
+                                            "tier": "正式企业",
+                                            "company_name": "腾讯",
+                                            "known_info": "企业档案、正式岗位",
+                                            "quantity": "1 条岗位",
+                                            "status": "可用于推荐",
+                                        },
+                                    ],
+                                },
+                            },
+                        }
+                    },
+                }
+            ],
+        )
+
+        response = tool_result_summary_response(state)
+
+        self.assertIsNotNone(response)
+        content, mode = response
+        self.assertEqual("tool_result_summary_insufficient", mode)
+        self.assertIn("京东", content)
+        self.assertIn("不能把全库概览当成答案", content)
+        self.assertNotIn("我先按公司档次列出来", content)
+        self.assertNotIn("Canonical Ltd.", content)
+        self.assertNotIn("腾讯", content)
+
     def test_agent_run_uses_llm_client_for_final_response(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
 
@@ -3755,36 +4558,81 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("user", fake_llm.messages[-1]["role"])
         self.assertEqual("我想找 Java 后端秋招", fake_llm.messages[-1]["content"])
 
-    def test_agent_run_sanitizes_internal_tool_protocol_from_final_response(self) -> None:
+    def test_agent_run_recovers_mixed_textual_tool_call_instead_of_sanitizing_it_as_answer(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import FILESYSTEM_READ_FILE_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        read_calls = []
+
+        def fake_read_file(_session, *, path: str, encoding: str = "auto"):
+            read_calls.append({"path": path, "encoding": encoding})
+            return {"tool_name": FILESYSTEM_READ_FILE_TOOL, "ok": True, "result": {"content": "姓名：刘汉卿"}}
 
         class FakeLLMClient:
+            def __init__(self) -> None:
+                self.complete_calls = 0
+
             def complete(self, *, messages):
                 from app.infrastructure.llm.chat_client import LLMChatCompletion
 
+                self.complete_calls += 1
+                if self.complete_calls > 1:
+                    return LLMChatCompletion(content="工具执行后重新总结：读取到姓名：刘汉卿。")
                 return LLMChatCompletion(
                     content=(
-                        'Tool call: external.web_search{"query":"Canonical Ltd. 主要业务"}\n\n'
-                        "Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。"
+                        "Tool call: filesystem.read_file\n"
+                        "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", \"encoding\": \"utf-8\"}\n\n"
+                        "我准备先读取文件，然后再回答。"
                     ),
                     usage={"total_tokens": 42},
                 )
 
         with self.Session() as session:
             session_id = self._session_id(session)
+            fake_llm = FakeLLMClient()
+            dependencies = self._dependencies(session, llm_client=fake_llm)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != FILESYSTEM_READ_FILE_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=FILESYSTEM_READ_FILE_TOOL,
+                    description="Read a local file.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat", "filesystem"}),
+                )
+            )
             result = run_agent_workflow(
                 AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
-                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+                dependencies=dependencies.with_registry(registry),
             )
             session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
 
-        self.assertEqual("Canonical Ltd. 主要做 Ubuntu、企业 Linux、云基础设施和安全支持。", result.state.final_response)
-        self.assertEqual("llm", result.state.response_mode)
-        self.assertTrue(result.state.context_metadata["output_sanitizer"]["removed_internal_protocol"])
-        self.assertFalse(result.state.context_metadata["output_sanitizer"]["needs_regeneration"])
+        self.assertNotIn("Tool call:", result.state.final_response)
+        self.assertNotIn("我准备先读取文件", result.state.final_response)
+        self.assertEqual("工具执行后重新总结：读取到姓名：刘汉卿。", result.state.final_response)
+        self.assertEqual("llm_textual_tool_call_recovery", result.state.response_mode)
+        self.assertEqual(2, fake_llm.complete_calls)
+        self.assertEqual([{"path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex", "encoding": "utf-8"}], read_calls)
+        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, tool_log.tool_name)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
 
-    def test_agent_run_uses_safe_fallback_when_final_response_is_only_internal_protocol(self) -> None:
+    def test_agent_run_recovers_textual_web_search_call_before_fallback(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
 
         class FakeLLMClient:
             def complete(self, *, messages):
@@ -3799,12 +4647,187 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
             )
             session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
 
         self.assertNotIn("Tool call:", result.state.final_response)
-        self.assertIn("最终回答需要重新整理", result.state.final_response)
-        self.assertEqual("sanitized_empty_fallback", result.state.response_mode)
-        self.assertTrue(result.state.context_metadata["output_sanitizer"]["removed_internal_protocol"])
-        self.assertTrue(result.state.context_metadata["output_sanitizer"]["needs_regeneration"])
+        self.assertIn("联网搜索失败", result.state.final_response)
+        self.assertEqual("tool_result_summary_textual_tool_call_recovery", result.state.response_mode)
+        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
+        self.assertEqual(ToolCallStatus.FAILED, tool_log.status)
+        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
+
+    def test_agent_run_recovers_textual_low_risk_tool_call_into_real_execution(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import (
+            FILESYSTEM_READ_FILE_TOOL,
+            AgentToolDefinition,
+            AgentToolRegistry,
+        )
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        calls = []
+
+        def fake_read_file(_session, **arguments):
+            calls.append(dict(arguments))
+            return {
+                "tool_name": FILESYSTEM_READ_FILE_TOOL,
+                "ok": True,
+                "result": {
+                    "path": arguments["path"],
+                    "content": "姓名：刘汉卿\n方向：AI Agent 平台后端开发",
+                },
+            }
+
+        class FakeLLMClient:
+            def __init__(self) -> None:
+                self.complete_calls = 0
+
+            def complete(self, *, messages):
+                self.complete_calls += 1
+                if self.complete_calls == 1:
+                    return LLMChatCompletion(
+                        content=(
+                            "Tool call: filesystem.read_file\n"
+                            "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", \"encoding\": \"utf-8\"}"
+                        )
+                    )
+                return LLMChatCompletion(content="已读取到简历内容：姓名：刘汉卿。")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeLLMClient()
+            dependencies = self._dependencies(session, llm_client=fake_llm)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != FILESYSTEM_READ_FILE_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=FILESYSTEM_READ_FILE_TOOL,
+                    description="Read a local file.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat", "filesystem"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="读取这个简历文件内容"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual([{"path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex", "encoding": "utf-8"}], calls)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, tool_log.tool_name)
+        self.assertEqual([tool_log.id], result.state.tool_call_ids)
+        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, result.state.requested_tool_name)
+        self.assertEqual("llm_textual_tool_call_recovery", result.state.response_mode)
+        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
+        self.assertNotIn("Tool call:", result.state.final_response)
+        self.assertIn("已读取到简历内容", result.state.final_response)
+
+    def test_agent_run_converts_textual_high_risk_tool_call_into_confirmation(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import FILESYSTEM_REPLACE_TEXT_TOOL
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, WorkflowRun, WorkflowRunStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                return LLMChatCompletion(
+                    content=(
+                        "Tool call: filesystem.replace_text\n"
+                        "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", "
+                        "\"old_text\": \"刘汉卿\", \"new_text\": \"王爷\"}"
+                    )
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="把这个简历里的名字换成王爷，其他不要动"),
+                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, result.workflow_run_id)
+            approval = session.scalars(select(ApprovalRequest)).one()
+            tool_logs = session.scalars(select(ToolCallLog)).all()
+
+        self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
+        self.assertEqual("wait_confirmation", workflow.current_step)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(approval.id, result.state.approval_request_id)
+        self.assertEqual(FILESYSTEM_REPLACE_TEXT_TOOL, approval.action_type)
+        self.assertEqual(FILESYSTEM_REPLACE_TEXT_TOOL, approval.payload["requested_tool_name"])
+        self.assertEqual("王爷", approval.payload["tool_input"]["new_text"])
+        self.assertEqual([], tool_logs)
+        recovery = result.state.context_metadata["textual_tool_call_recovery"]
+        self.assertFalse(recovery["recovered"])
+        self.assertEqual("wait_confirmation", recovery["next_action"])
+
+    def test_agent_run_waits_for_user_when_recovered_textual_tool_call_is_missing_required_input(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.automation.models import ToolCallLog, WorkflowRun, WorkflowRunStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                return LLMChatCompletion(content="Tool call: filesystem.read_file")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="读取内容"),
+                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, result.workflow_run_id)
+            tool_logs = session.scalars(select(ToolCallLog)).all()
+
+        self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
+        self.assertEqual("wait_user_input", workflow.current_step)
+        self.assertEqual("wait_user_input", result.state.current_step)
+        self.assertEqual("tool_input_ask_user", result.state.response_mode)
+        self.assertIn("缺少 path", result.state.final_response)
+        self.assertEqual([], tool_logs)
+        completion = result.state.context_metadata["tool_input_completion"]
+        self.assertEqual(["path"], completion["missing_required_fields"])
+        recovery = result.state.context_metadata["textual_tool_call_recovery"]
+        self.assertFalse(recovery["recovered"])
+        self.assertEqual("wait_user_input", recovery["next_action"])
+
+    def test_agent_run_rewrites_false_tool_execution_claim_when_no_tool_ran(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+                return LLMChatCompletion(content="我已经调用联网搜索，查到了 Canonical 的主要业务。")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
+                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
+            )
+            session.commit()
+
+        self.assertNotIn("我已经调用联网搜索", result.state.final_response)
+        self.assertIn("本轮没有真实工具执行记录", result.state.final_response)
+        self.assertEqual("false_tool_claim_fallback", result.state.response_mode)
+        self.assertTrue(result.state.context_metadata["output_sanitizer"]["removed_false_tool_claim"])
 
     def test_agent_run_auto_compacts_when_context_exceeds_budget_before_llm_call(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow

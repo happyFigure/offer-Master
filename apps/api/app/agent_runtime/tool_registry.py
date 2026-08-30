@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
 from typing import Any
 from uuid import uuid4
 
@@ -92,8 +96,24 @@ class AgentToolRegistry:
 
 APPLICATION_FIND_APPLY_ENTRY_TOOL = "applications.find_apply_entry"
 EXTERNAL_WEB_SEARCH_TOOL = "external.web_search"
+FILESYSTEM_LIST_DIR_TOOL = "filesystem.list_dir"
+FILESYSTEM_PATH_EXISTS_TOOL = "filesystem.path_exists"
+FILESYSTEM_PATH_STAT_TOOL = "filesystem.path_stat"
+FILESYSTEM_READ_FILE_TOOL = "filesystem.read_file"
+FILESYSTEM_WRITE_TEXT_TOOL = "filesystem.write_text"
+FILESYSTEM_REPLACE_TEXT_TOOL = "filesystem.replace_text"
+FILESYSTEM_COPY_FILE_TOOL = "filesystem.copy_file"
+FILESYSTEM_MOVE_FILE_TOOL = "filesystem.move_file"
+FILESYSTEM_DELETE_PATH_TOOL = "filesystem.delete_path"
+FILESYSTEM_MAKE_DIR_TOOL = "filesystem.make_dir"
 LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL = "local.company_database_overview"
 LOCAL_JOB_SOURCE_OVERVIEW_TOOL = "local.job_source_overview"
+DATABASE_COMPANY_SEARCH_TOOL = "database.company_search"
+DATABASE_COMPANY_PROFILE_TOOL = "database.company_profile"
+DATABASE_JOB_SEARCH_TOOL = "database.job_search"
+DATABASE_SOURCE_SEARCH_TOOL = "database.source_search"
+DATABASE_COMPANY_UPDATE_TOOL = "database.company_update"
+DATABASE_JOB_LEAD_DELETE_TOOL = "database.job_lead_delete"
 OFFERIO_COMPANY_JOBS_TOOL = "offerio.sync_company_jobs"
 OFFERIO_COMPANY_JOBS_SOURCE_NAME = "OfferIO 公司聚合岗位库"
 OFFERIO_COMPANY_JOBS_LEGACY_SOURCE_NAMES = (OFFERIO_COMPANY_JOBS_SOURCE_NAME, "OfferIO company jobs")
@@ -110,8 +130,10 @@ def create_default_agent_tool_registry(
     registry = AgentToolRegistry()
     registry.register_many(create_application_agent_tool_definitions(external_task_dispatcher=external_task_dispatcher))
     registry.register_many(create_external_web_search_agent_tool_definitions(external_web_search_executor=external_web_search_executor))
+    registry.register_many(create_database_agent_tool_definitions())
     registry.register_many(create_local_company_database_agent_tool_definitions())
     registry.register_many(create_local_job_source_agent_tool_definitions(offerio_provider_factory=offerio_provider_factory))
+    registry.register_many(create_filesystem_agent_tool_definitions())
     registry.register_many(_memory_tool_definitions())
     registry.register_many(create_job_source_agent_tool_definitions(offerio_provider_factory=offerio_provider_factory))
     registry.register_many(create_content_source_agent_tool_definitions(content_source_client))
@@ -283,6 +305,394 @@ def create_local_job_source_agent_tool_definitions(
                 examples=("岗位来源库现在有多少条，给我20个", "岗位展览里有哪些来源？"),
             ),
         )
+    ]
+
+
+def create_database_agent_tool_definitions() -> list[AgentToolDefinition]:
+    standard_output = {"type": "object", "required": ["tool_name", "ok", "result"]}
+    read_source_types = frozenset({"agent_chat", "job_discovery"})
+    return [
+        AgentToolDefinition(
+            name=DATABASE_COMPANY_SEARCH_TOOL,
+            description="Search local company records, formal jobs, job leads, and recruiting signals by company name.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "company_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                    },
+                    "keyword": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_company_search(session, **arguments),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=read_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"local_company_search"}),
+                keywords=frozenset({"数据库", "公司", "企业", "查公司", "公司搜索", "公司列表"}),
+                examples=("查数据库里腾讯和京东有没有记录",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=DATABASE_COMPANY_PROFILE_TOOL,
+            description="Read a joined local company profile with its formal jobs, job leads, and recruiting signals.",
+            input_schema={
+                "type": "object",
+                "required": ["company_name"],
+                "properties": {
+                    "company_name": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_company_profile(session, **arguments),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=read_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"local_company_profile"}),
+                keywords=frozenset({"公司详情", "企业详情", "公司信息", "企业档案", "关于公司"}),
+                examples=("看一下数据库中关于京东这个公司的详细信息",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=DATABASE_JOB_SEARCH_TOOL,
+            description="Search formal local jobs using company, title, city, type, status, or keyword filters.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": ["string", "null"]},
+                    "company_name": {"type": ["string", "null"]},
+                    "title": {"type": ["string", "null"]},
+                    "city": {"type": ["string", "null"]},
+                    "job_type": {"type": ["string", "null"]},
+                    "status": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_job_search(session, **arguments),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=read_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"local_job_search"}),
+                keywords=frozenset({"数据库岗位", "本地岗位", "岗位搜索", "岗位列表", "正式岗位"}),
+                examples=("查数据库里腾讯的 Python 后端岗位",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=DATABASE_SOURCE_SEARCH_TOOL,
+            description="Search local job sources and return their type, trust, enabled state, and record counts.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": ["string", "null"]},
+                    "source_type": {"type": ["string", "null"]},
+                    "enabled": {"type": ["boolean", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_source_search(session, **arguments),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=read_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"local_source_search"}),
+                keywords=frozenset({"来源搜索", "来源详情", "岗位来源", "来源列表", "招聘来源"}),
+                examples=("查一下本地岗位来源库里有哪些官方来源",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=DATABASE_COMPANY_UPDATE_TOOL,
+            description="Update a fixed set of local company profile fields after explicit user confirmation.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "company_id": {"type": ["string", "null"]},
+                    "company_name": {"type": ["string", "null"]},
+                    "name": {"type": ["string", "null"]},
+                    "website_url": {"type": ["string", "null"]},
+                    "industry": {"type": ["string", "null"]},
+                    "city": {"type": ["string", "null"]},
+                    "country": {"type": ["string", "null"]},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_company_update(session, **arguments),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=frozenset({"agent_chat", "job_discovery"}),
+        ),
+        AgentToolDefinition(
+            name=DATABASE_JOB_LEAD_DELETE_TOOL,
+            description="Mark a local job lead invalid while preserving its audit record after explicit user confirmation.",
+            input_schema={
+                "type": "object",
+                "required": ["lead_id"],
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "reason": {"type": ["string", "null"]},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_job_lead_delete(session, **arguments),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=frozenset({"agent_chat", "job_discovery"}),
+        ),
+    ]
+
+
+def create_filesystem_agent_tool_definitions(*, script_root: str | Path | None = None) -> list[AgentToolDefinition]:
+    common_source_types = frozenset({"agent_chat", "filesystem"})
+    standard_output = {"type": "object", "required": ["tool_name", "ok", "result"]}
+    path_property = {"type": "string", "description": "Absolute local file or directory path."}
+    return [
+        AgentToolDefinition(
+            name=FILESYSTEM_LIST_DIR_TOOL,
+            description="List files and folders under a user-provided local directory path.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": path_property},
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_LIST_DIR_TOOL, "list_dir.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_list", "filesystem_operation"}),
+                keywords=frozenset({"列目录", "查看目录", "文件夹", "有哪些文件", "list dir"}),
+                examples=("列出 F:/pythonProject/OfferMaster 下面有哪些文件",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_PATH_EXISTS_TOOL,
+            description="Check whether a user-provided local path exists.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": path_property},
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_PATH_EXISTS_TOOL, "path_exists.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_stat", "filesystem_operation"}),
+                keywords=frozenset({"路径存在", "文件存在", "目录存在", "有没有这个文件"}),
+                examples=("帮我确认这个本地简历文件是否存在",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_PATH_STAT_TOOL,
+            description="Read size, type, and modified-time metadata for a user-provided local path.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": path_property},
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_PATH_STAT_TOOL, "path_stat.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_stat", "filesystem_operation"}),
+                keywords=frozenset({"文件大小", "修改时间", "文件信息", "path stat"}),
+                examples=("看一下这个 tex 文件大小和更新时间",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_READ_FILE_TOOL,
+            description="Read a bounded slice of a user-provided local text file.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": path_property,
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
+                    "encoding": {"type": "string", "default": "auto"},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_READ_FILE_TOOL, "read_file.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_read", "filesystem_operation"}),
+                keywords=frozenset({"读取文件", "读文件", "打开文件", "查看文件", "read file", "tex", "简历文件"}),
+                examples=("读取 C:/Users/phoenix/Documents/Obsidian Vault/简历/简历.tex",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_WRITE_TEXT_TOOL,
+            description="Write text to a user-provided local file path; overwrites only when explicitly requested and confirmed.",
+            input_schema={
+                "type": "object",
+                "required": ["path", "text"],
+                "properties": {
+                    "path": path_property,
+                    "text": {"type": "string"},
+                    "encoding": {"type": "string", "default": "utf-8"},
+                    "overwrite": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_WRITE_TEXT_TOOL, "write_text.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_write", "filesystem_operation"}),
+                keywords=frozenset({"写文件", "保存文件", "修改文件", "覆盖文件", "write file", "改成"}),
+                examples=("把修改后的简历写回 tex 文件",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_REPLACE_TEXT_TOOL,
+            description="Replace exact text inside a user-provided local text file while preserving all other content.",
+            input_schema={
+                "type": "object",
+                "required": ["path", "old_text", "new_text"],
+                "properties": {
+                    "path": path_property,
+                    "old_text": {"type": "string", "description": "Exact text to replace."},
+                    "new_text": {"type": "string", "description": "Replacement text."},
+                    "encoding": {"type": "string", "default": "utf-8"},
+                    "count": {"type": "integer", "minimum": 0, "default": 0, "description": "0 means replace all occurrences."},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_REPLACE_TEXT_TOOL, "replace_text.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_replace", "filesystem_write", "filesystem_operation"}),
+                keywords=frozenset({"替换文本", "换成", "换为", "改成", "改为", "replace text", "只改名字"}),
+                examples=("把这个 tex 简历里的刘汉卿替换为王爷，其他不要动",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_COPY_FILE_TOOL,
+            description="Copy a user-provided local file or directory to another local path after confirmation.",
+            input_schema={
+                "type": "object",
+                "required": ["src", "dst"],
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                    "overwrite": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_COPY_FILE_TOOL, "copy_file.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_copy", "filesystem_operation"}),
+                keywords=frozenset({"复制文件", "复制目录", "备份文件", "copy file"}),
+                examples=("先复制一份简历作为备份",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_MOVE_FILE_TOOL,
+            description="Move or rename a user-provided local file or directory after confirmation.",
+            input_schema={
+                "type": "object",
+                "required": ["src", "dst"],
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                    "overwrite": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_MOVE_FILE_TOOL, "move_file.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_move", "filesystem_operation"}),
+                keywords=frozenset({"移动文件", "重命名文件", "移动目录", "move file", "rename"}),
+                examples=("把这个简历文件重命名",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_DELETE_PATH_TOOL,
+            description="Delete a user-provided local file or directory after explicit confirmation.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": path_property,
+                    "recursive": {"type": "boolean", "default": False},
+                    "force": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_DELETE_PATH_TOOL, "delete_path.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_delete", "filesystem_operation"}),
+                keywords=frozenset({"删除文件", "删除目录", "delete file", "remove file"}),
+                examples=("删除这个临时文件",),
+            ),
+        ),
+        AgentToolDefinition(
+            name=FILESYSTEM_MAKE_DIR_TOOL,
+            description="Create a user-provided local directory after confirmation.",
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": path_property,
+                    "exist_ok": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=_filesystem_script_handler(FILESYSTEM_MAKE_DIR_TOOL, "make_dir.py", script_root=script_root),
+            risk_level=AgentToolRiskLevel.HIGH,
+            requires_confirmation=True,
+            allowed_source_types=common_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"filesystem_make_dir", "filesystem_operation"}),
+                keywords=frozenset({"创建目录", "新建文件夹", "make dir", "mkdir"}),
+                examples=("创建一个简历备份目录",),
+            ),
+        ),
     ]
 
 
@@ -764,6 +1174,574 @@ def _local_company_database_overview(
     }
 
 
+def _database_company_search(
+    session: Any,
+    *,
+    company_names: Any = None,
+    keyword: Any = None,
+    limit: int | str | None = 10,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_COMPANY_SEARCH_TOOL)
+
+    from sqlalchemy import or_, select
+
+    from app.domains.jobs.models import Company, Job, JobLead, RecruitingSignal
+
+    result_limit = _bounded_int(limit, default=10, minimum=1, maximum=50)
+    queries = _database_query_names(company_names, keyword)
+    if not queries:
+        return _database_input_error(
+            DATABASE_COMPANY_SEARCH_TOOL,
+            "company_names 或 keyword 至少提供一个非空查询条件。",
+        )
+
+    companies: list[dict[str, Any]] = []
+    for query_name in queries[:20]:
+        pattern = f"%{query_name}%"
+        formal_companies = list(
+            session.scalars(
+                select(Company)
+                .where(
+                    or_(
+                        Company.name.ilike(pattern),
+                        Company.normalized_name.ilike(pattern),
+                    )
+                )
+                .order_by(Company.name.asc())
+                .limit(result_limit)
+            ).all()
+        )
+        jobs = list(
+            session.scalars(
+                select(Job)
+                .join(Job.company)
+                .where(
+                    or_(
+                        Company.name.ilike(pattern),
+                        Company.normalized_name.ilike(pattern),
+                    )
+                )
+                .order_by(Job.updated_at.desc(), Job.created_at.desc())
+                .limit(result_limit)
+            ).all()
+        )
+        job_leads = list(
+            session.scalars(
+                select(JobLead)
+                .where(JobLead.company_name.ilike(pattern))
+                .order_by(JobLead.updated_at.desc(), JobLead.created_at.desc())
+                .limit(result_limit)
+            ).all()
+        )
+        recruiting_signals = list(
+            session.scalars(
+                select(RecruitingSignal)
+                .where(
+                    or_(
+                        RecruitingSignal.company_name.ilike(pattern),
+                        RecruitingSignal.normalized_company_name.ilike(pattern),
+                    )
+                )
+                .order_by(RecruitingSignal.updated_at.desc(), RecruitingSignal.created_at.desc())
+                .limit(result_limit)
+            ).all()
+        )
+
+        evidence: list[dict[str, Any]] = []
+        if formal_companies:
+            evidence.append(
+                {
+                    "source": "正式企业表",
+                    "count": len(formal_companies),
+                    "record_ids": [company.id for company in formal_companies],
+                }
+            )
+        if jobs:
+            evidence.append(
+                {
+                    "source": "正式岗位表",
+                    "count": len(jobs),
+                    "record_ids": [job.id for job in jobs],
+                }
+            )
+        if job_leads:
+            evidence.append(
+                {
+                    "source": "岗位线索表",
+                    "count": len(job_leads),
+                    "record_ids": [lead.id for lead in job_leads],
+                }
+            )
+        if recruiting_signals:
+            evidence.append(
+                {
+                    "source": "招聘信号表",
+                    "count": len(recruiting_signals),
+                    "record_ids": [signal.id for signal in recruiting_signals],
+                }
+            )
+
+        companies.append(
+            {
+                "query_name": query_name,
+                "exists": bool(formal_companies or jobs or job_leads or recruiting_signals),
+                "formal_company_count": len(formal_companies),
+                "job_count": len(jobs),
+                "job_lead_count": len(job_leads),
+                "recruiting_signal_count": len(recruiting_signals),
+                "formal_companies": [_database_company_summary(company) for company in formal_companies],
+                "evidence": evidence,
+            }
+        )
+
+    return {
+        "tool_name": DATABASE_COMPANY_SEARCH_TOOL,
+        "ok": True,
+        "result": {
+            "queries": queries,
+            "companies": companies,
+            "matched_count": sum(1 for company in companies if company["exists"]),
+        },
+    }
+
+
+def _database_company_profile(
+    session: Any,
+    *,
+    company_name: str,
+    limit: int | str | None = 10,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_COMPANY_PROFILE_TOOL)
+
+    from sqlalchemy import or_, select
+
+    from app.domains.jobs.models import Company, Job, JobLead, RecruitingSignal
+
+    query_name = _non_empty_str(company_name)
+    if not query_name:
+        return _database_input_error(DATABASE_COMPANY_PROFILE_TOOL, "company_name 不能为空。")
+    result_limit = _bounded_int(limit, default=10, minimum=1, maximum=50)
+    pattern = f"%{query_name}%"
+    formal_companies = list(
+        session.scalars(
+            select(Company)
+            .where(
+                or_(
+                    Company.name.ilike(pattern),
+                    Company.normalized_name.ilike(pattern),
+                )
+            )
+            .order_by(Company.name.asc())
+            .limit(result_limit)
+        ).all()
+    )
+    jobs = list(
+        session.scalars(
+            select(Job)
+            .join(Job.company)
+            .where(
+                or_(
+                    Company.name.ilike(pattern),
+                    Company.normalized_name.ilike(pattern),
+                )
+            )
+            .order_by(Job.updated_at.desc(), Job.created_at.desc())
+            .limit(result_limit)
+        ).all()
+    )
+    job_leads = list(
+        session.scalars(
+            select(JobLead)
+            .where(JobLead.company_name.ilike(pattern))
+            .order_by(JobLead.updated_at.desc(), JobLead.created_at.desc())
+            .limit(result_limit)
+        ).all()
+    )
+    recruiting_signals = list(
+        session.scalars(
+            select(RecruitingSignal)
+            .where(
+                or_(
+                    RecruitingSignal.company_name.ilike(pattern),
+                    RecruitingSignal.normalized_company_name.ilike(pattern),
+                )
+            )
+            .order_by(RecruitingSignal.updated_at.desc(), RecruitingSignal.created_at.desc())
+            .limit(result_limit)
+        ).all()
+    )
+    return {
+        "tool_name": DATABASE_COMPANY_PROFILE_TOOL,
+        "ok": True,
+        "result": {
+            "company_name": query_name,
+            "exists": bool(formal_companies or jobs or job_leads or recruiting_signals),
+            "formal_companies": [_database_company_summary(company) for company in formal_companies],
+            "jobs": [_database_job_summary(job) for job in jobs],
+            "job_leads": [_database_job_lead_summary(lead) for lead in job_leads],
+            "recruiting_signals": [_database_recruiting_signal_summary(signal) for signal in recruiting_signals],
+        },
+    }
+
+
+def _database_job_search(
+    session: Any,
+    *,
+    keyword: Any = None,
+    company_name: Any = None,
+    title: Any = None,
+    city: Any = None,
+    job_type: Any = None,
+    status: Any = None,
+    limit: int | str | None = 20,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_JOB_SEARCH_TOOL)
+
+    from sqlalchemy import or_, select
+
+    from app.domains.jobs.models import Company, Job
+
+    result_limit = _bounded_int(limit, default=20, minimum=1, maximum=100)
+    statement = select(Job).join(Job.company).order_by(Job.updated_at.desc(), Job.created_at.desc())
+    filters = []
+    for field, value in (
+        (Company.name, company_name),
+        (Job.title, title),
+        (Job.city, city),
+        (Job.job_type, job_type),
+    ):
+        text = _non_empty_str(value)
+        if text:
+            filters.append(field.ilike(f"%{text}%"))
+    keyword_text = _non_empty_str(keyword)
+    if keyword_text:
+        pattern = f"%{keyword_text}%"
+        filters.append(
+            or_(
+                Company.name.ilike(pattern),
+                Job.title.ilike(pattern),
+                Job.jd_text.ilike(pattern),
+                Job.job_type.ilike(pattern),
+            )
+        )
+    status_text = _non_empty_str(status)
+    if status_text:
+        filters.append(Job.status == status_text)
+    if filters:
+        statement = statement.where(*filters)
+    jobs = list(session.scalars(statement.limit(result_limit)).all())
+    return {
+        "tool_name": DATABASE_JOB_SEARCH_TOOL,
+        "ok": True,
+        "result": {
+            "count": len(jobs),
+            "jobs": [_database_job_summary(job) for job in jobs],
+        },
+    }
+
+
+def _database_source_search(
+    session: Any,
+    *,
+    keyword: Any = None,
+    source_type: Any = None,
+    enabled: bool | str | None = None,
+    limit: int | str | None = 20,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_SOURCE_SEARCH_TOOL)
+
+    from sqlalchemy import func, or_, select
+
+    from app.domains.jobs.models import JobLead, JobSource, RecruitingSignal
+
+    result_limit = _bounded_int(limit, default=20, minimum=1, maximum=100)
+    statement = select(JobSource).order_by(JobSource.updated_at.desc(), JobSource.created_at.desc())
+    filters = []
+    keyword_text = _non_empty_str(keyword)
+    if keyword_text:
+        pattern = f"%{keyword_text}%"
+        filters.append(or_(JobSource.name.ilike(pattern), JobSource.notes.ilike(pattern), JobSource.entry_url.ilike(pattern)))
+    source_type_text = _non_empty_str(source_type)
+    if source_type_text:
+        filters.append(JobSource.source_type == source_type_text)
+    enabled_value = _optional_bool(enabled)
+    if enabled_value is not None:
+        filters.append(JobSource.enabled.is_(enabled_value))
+    if filters:
+        statement = statement.where(*filters)
+    sources = list(session.scalars(statement.limit(result_limit)).all())
+    rows = []
+    for source in sources:
+        rows.append(
+            {
+                "id": source.id,
+                "name": source.name,
+                "source_type": _value(source.source_type),
+                "entry_url": source.entry_url,
+                "enabled": bool(source.enabled),
+                "trust_level": _value(source.trust_level),
+                "fetch_mode": _value(source.fetch_mode),
+                "notes": source.notes,
+                "job_lead_count": int(session.scalar(select(func.count(JobLead.id)).where(JobLead.source_id == source.id)) or 0),
+                "recruiting_signal_count": int(
+                    session.scalar(select(func.count(RecruitingSignal.id)).where(RecruitingSignal.source_id == source.id)) or 0
+                ),
+            }
+        )
+    return {
+        "tool_name": DATABASE_SOURCE_SEARCH_TOOL,
+        "ok": True,
+        "result": {"count": len(rows), "sources": rows},
+    }
+
+
+def _database_company_update(
+    session: Any,
+    *,
+    company_id: Any = None,
+    company_name: Any = None,
+    name: Any = None,
+    website_url: Any = None,
+    industry: Any = None,
+    city: Any = None,
+    country: Any = None,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_COMPANY_UPDATE_TOOL)
+
+    from sqlalchemy import select
+
+    from app.domains.jobs.models import Company
+
+    company = session.get(Company, _non_empty_str(company_id)) if _non_empty_str(company_id) else None
+    if company is None:
+        lookup_name = _non_empty_str(company_name)
+        if lookup_name:
+            company = session.scalar(
+                select(Company).where(
+                    (Company.name == lookup_name) | (Company.normalized_name == _database_normalize_name(lookup_name))
+                )
+            )
+    if company is None:
+        return _database_input_error(DATABASE_COMPANY_UPDATE_TOOL, "找不到要更新的公司，请提供有效的 company_id 或 company_name。")
+
+    updates: dict[str, str] = {}
+    for field_name, value in (
+        ("website_url", website_url),
+        ("industry", industry),
+        ("city", city),
+        ("country", country),
+    ):
+        text = _optional_text(value)
+        if text is not None:
+            updates[field_name] = text
+
+    new_name = _optional_text(name)
+    if new_name is not None:
+        normalized_name = _database_normalize_name(new_name)
+        duplicate = session.scalar(
+            select(Company).where(
+                Company.normalized_name == normalized_name,
+                Company.id != company.id,
+            )
+        )
+        if duplicate is not None:
+            return _database_input_error(DATABASE_COMPANY_UPDATE_TOOL, "更新后的公司名称已存在，未修改任何数据。")
+        updates["name"] = new_name
+        updates["normalized_name"] = normalized_name
+
+    if not updates:
+        return _database_input_error(DATABASE_COMPANY_UPDATE_TOOL, "至少提供一个要修改的公司字段。")
+    for field_name, value in updates.items():
+        setattr(company, field_name, value)
+    session.flush()
+    return {
+        "tool_name": DATABASE_COMPANY_UPDATE_TOOL,
+        "ok": True,
+        "result": {
+            "company": _database_company_summary(company),
+            "updated_fields": [field_name for field_name in updates if field_name != "normalized_name"],
+        },
+    }
+
+
+def _database_job_lead_delete(
+    session: Any,
+    *,
+    lead_id: str,
+    reason: Any = None,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_JOB_LEAD_DELETE_TOOL)
+
+    from app.domains.jobs.models import JobLead, JobLeadStatus, utc_now
+
+    resolved_lead_id = _non_empty_str(lead_id)
+    if not resolved_lead_id:
+        return _database_input_error(DATABASE_JOB_LEAD_DELETE_TOOL, "lead_id 不能为空。")
+    lead = session.get(JobLead, resolved_lead_id)
+    if lead is None:
+        return _database_input_error(DATABASE_JOB_LEAD_DELETE_TOOL, "找不到要删除的岗位线索。")
+    if _value(lead.verification_status) != JobLeadStatus.INVALID.value:
+        reason_text = _optional_text(reason) or "用户确认将该岗位线索标记为无效。"
+        audit_note = f"[database.job_lead_delete] {reason_text}"
+        lead.verification_status = JobLeadStatus.INVALID
+        lead.verification_notes = (
+            f"{lead.verification_notes}\n{audit_note}".strip()
+            if lead.verification_notes
+            else audit_note
+        )
+        lead.updated_at = utc_now()
+        session.flush()
+        changed = True
+    else:
+        changed = False
+    return {
+        "tool_name": DATABASE_JOB_LEAD_DELETE_TOOL,
+        "ok": True,
+        "result": {
+            "lead_id": lead.id,
+            "company_name": lead.company_name,
+            "title": lead.title,
+            "deleted": True,
+            "deletion_mode": "soft",
+            "changed": changed,
+            "verification_status": _value(lead.verification_status),
+        },
+    }
+
+
+def _database_session_error(tool_name: str) -> dict[str, Any]:
+    return {
+        "tool_name": tool_name,
+        "ok": False,
+        "error": "DATABASE_SESSION_UNAVAILABLE",
+        "result": {"message": "Database session is unavailable."},
+    }
+
+
+def _database_input_error(tool_name: str, message: str) -> dict[str, Any]:
+    return {
+        "tool_name": tool_name,
+        "ok": False,
+        "error": "DATABASE_INPUT_INVALID",
+        "result": {"message": message},
+    }
+
+
+def _database_query_names(company_names: Any, keyword: Any) -> list[str]:
+    values: list[Any] = []
+    if isinstance(company_names, (list, tuple, set)):
+        values.extend(company_names)
+    elif company_names is not None:
+        values.append(company_names)
+    if not values:
+        values.append(keyword)
+    return list(dict.fromkeys(text for value in values if (text := _non_empty_str(value))))
+
+
+def _database_normalize_name(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _database_company_summary(company: Any) -> dict[str, Any]:
+    return {
+        "id": company.id,
+        "name": company.name,
+        "normalized_name": company.normalized_name,
+        "website_url": company.website_url,
+        "industry": company.industry,
+        "city": company.city,
+        "country": company.country,
+    }
+
+
+def _database_job_summary(job: Any) -> dict[str, Any]:
+    company = getattr(job, "company", None)
+    return {
+        "id": job.id,
+        "company_id": job.company_id,
+        "company_name": company.name if company is not None else None,
+        "title": job.title,
+        "city": job.city,
+        "source": job.source,
+        "source_job_id": job.source_job_id,
+        "source_url": job.source_url,
+        "job_type": job.job_type,
+        "salary_text": job.salary_text,
+        "skills": list(job.skills or []),
+        "date_posted": _database_iso_value(job.date_posted),
+        "status": _value(job.status),
+    }
+
+
+def _database_job_lead_summary(lead: Any) -> dict[str, Any]:
+    source = getattr(lead, "source", None)
+    return {
+        "id": lead.id,
+        "company_name": lead.company_name,
+        "title": lead.title,
+        "city": lead.city,
+        "job_direction": lead.job_direction,
+        "graduation_year": lead.graduation_year,
+        "source_url": lead.source_url,
+        "apply_url": lead.apply_url,
+        "job_type": lead.job_type,
+        "skills": list(lead.skills or []),
+        "deadline": _database_iso_value(lead.deadline),
+        "verification_status": _value(lead.verification_status),
+        "trust_level": _value(lead.trust_level),
+        "source_id": lead.source_id,
+        "source_name": source.name if source is not None else None,
+    }
+
+
+def _database_recruiting_signal_summary(signal: Any) -> dict[str, Any]:
+    source = getattr(signal, "source", None)
+    return {
+        "id": signal.id,
+        "company_name": signal.company_name,
+        "normalized_company_name": signal.normalized_company_name,
+        "signal_type": _value(signal.signal_type),
+        "graduation_year": signal.graduation_year,
+        "source_url": signal.source_url,
+        "original_source": signal.original_source,
+        "confidence_score": _database_iso_value(signal.confidence_score),
+        "trust_level": _value(signal.trust_level),
+        "status": _value(signal.status),
+        "source_id": signal.source_id,
+        "source_name": source.name if source is not None else None,
+    }
+
+
+def _database_iso_value(value: Any) -> Any:
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    return None
+
+
 def _local_company_overview_rows(session: Any, Company: Any, Job: Any, JobLead: Any, RecruitingSignal: Any, limit: int) -> list[dict[str, str]]:
     from sqlalchemy import func, select
 
@@ -1007,6 +1985,267 @@ def _normalize_offerio_company_jobs_entry_url(entry_url: str) -> str:
 
 def _offerio_company_jobs_page_size(total_limit: int) -> int:
     return 50
+
+
+def _filesystem_script_handler(
+    tool_name: str,
+    script_name: str,
+    *,
+    script_root: str | Path | None = None,
+) -> Callable[..., dict[str, Any]]:
+    def handler(session: Any, **arguments: Any) -> dict[str, Any]:
+        return _run_filesystem_skill_script(
+            session,
+            tool_name=tool_name,
+            script_name=script_name,
+            script_root=script_root,
+            arguments=arguments,
+        )
+
+    return handler
+
+
+def _run_filesystem_skill_script(
+    session: Any,
+    *,
+    tool_name: str,
+    script_name: str,
+    script_root: str | Path | None,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    root = _resolve_filesystem_skill_root(session, explicit_root=script_root)
+    if root is None:
+        return _filesystem_tool_failure(
+            tool_name,
+            "FILESYSTEM_SKILL_NOT_INSTALLED",
+            result={"message": "filesystem Skill package is not installed."},
+        )
+    script_file = root / "scripts" / script_name
+    if not script_file.is_file():
+        return _filesystem_tool_failure(
+            tool_name,
+            "FILESYSTEM_SCRIPT_NOT_FOUND",
+            result={"script_path": str(script_file)},
+        )
+
+    try:
+        command_args = _filesystem_command_arguments(tool_name, arguments)
+    except ValueError as exc:
+        return _filesystem_tool_failure(tool_name, "FILESYSTEM_INPUT_INVALID", result={"message": str(exc)})
+
+    env = dict(os.environ)
+    env.setdefault("MY_AGENTS_DEFAULT_FILE_OUTPUT_DIR", str(_filesystem_default_output_root()))
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PYTHONUTF8", "1")
+    timeout_seconds = _bounded_int(arguments.get("timeout_seconds"), default=30, minimum=1, maximum=120)
+    completed = subprocess.run(
+        [sys.executable, str(script_file), *command_args],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds,
+        env=env,
+        shell=False,
+    )
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    error = _filesystem_error_message(stdout, stderr, completed.returncode)
+    result = _filesystem_result_payload(
+        tool_name,
+        stdout=stdout,
+        stderr=stderr,
+        return_code=completed.returncode,
+        root=root,
+        script_file=script_file,
+    )
+    return {
+        "tool_name": tool_name,
+        "ok": error is None,
+        "error": error,
+        "result": result,
+    }
+
+
+def _filesystem_command_arguments(tool_name: str, arguments: dict[str, Any]) -> list[str]:
+    if tool_name in {FILESYSTEM_LIST_DIR_TOOL, FILESYSTEM_PATH_EXISTS_TOOL, FILESYSTEM_PATH_STAT_TOOL}:
+        return ["--path", _required_str(arguments.get("path"), "path")]
+    if tool_name == FILESYSTEM_READ_FILE_TOOL:
+        return [
+            "--path",
+            _required_str(arguments.get("path"), "path"),
+            "--offset",
+            str(_bounded_int(arguments.get("offset"), default=0, minimum=0, maximum=100_000)),
+            "--limit",
+            str(_bounded_int(arguments.get("limit"), default=200, minimum=1, maximum=500)),
+            "--encoding",
+            _non_empty_str(arguments.get("encoding")) or "auto",
+        ]
+    if tool_name == FILESYSTEM_WRITE_TEXT_TOOL:
+        command = [
+            "--path",
+            _required_str(arguments.get("path"), "path"),
+            "--text",
+            _required_str(arguments.get("text"), "text"),
+            "--encoding",
+            _non_empty_str(arguments.get("encoding")) or "utf-8",
+        ]
+        if bool(arguments.get("overwrite")):
+            command.append("--overwrite")
+        return command
+    if tool_name == FILESYSTEM_REPLACE_TEXT_TOOL:
+        command = [
+            "--path",
+            _required_str(arguments.get("path"), "path"),
+            "--old-text",
+            _required_str(arguments.get("old_text"), "old_text"),
+            "--new-text",
+            _required_str(arguments.get("new_text"), "new_text"),
+            "--encoding",
+            _non_empty_str(arguments.get("encoding")) or "utf-8",
+            "--count",
+            str(_bounded_int(arguments.get("count"), default=0, minimum=0, maximum=100_000)),
+        ]
+        return command
+    if tool_name in {FILESYSTEM_COPY_FILE_TOOL, FILESYSTEM_MOVE_FILE_TOOL}:
+        command = ["--src", _required_str(arguments.get("src"), "src"), "--dst", _required_str(arguments.get("dst"), "dst")]
+        if bool(arguments.get("overwrite")):
+            command.append("--overwrite")
+        return command
+    if tool_name == FILESYSTEM_DELETE_PATH_TOOL:
+        command = ["--path", _required_str(arguments.get("path"), "path")]
+        if bool(arguments.get("recursive")):
+            command.append("--recursive")
+        if bool(arguments.get("force")):
+            command.append("--force")
+        else:
+            command.append("--force-file")
+        return command
+    if tool_name == FILESYSTEM_MAKE_DIR_TOOL:
+        command = ["--path", _required_str(arguments.get("path"), "path")]
+        if bool(arguments.get("exist_ok", True)):
+            command.append("--exist-ok")
+        return command
+    raise ValueError(f"unsupported filesystem tool: {tool_name}")
+
+
+def _resolve_filesystem_skill_root(session: Any, *, explicit_root: str | Path | None = None) -> Path | None:
+    if explicit_root is not None:
+        root = Path(explicit_root).expanduser().resolve()
+        return root if (root / "scripts").is_dir() else None
+
+    db_root = _filesystem_skill_root_from_db(session)
+    if db_root is not None:
+        return db_root
+
+    return _filesystem_skill_root_from_files()
+
+
+def _filesystem_skill_root_from_db(session: Any) -> Path | None:
+    if session is None:
+        return None
+    try:
+        from sqlalchemy import select
+
+        from app.domains.agent_memory.models import AgentSkill, AgentSkillStatus
+
+        skill = session.scalar(
+            select(AgentSkill)
+            .where(AgentSkill.name == "filesystem")
+            .where(AgentSkill.status == AgentSkillStatus.ACTIVE)
+            .order_by(AgentSkill.updated_at.desc(), AgentSkill.created_at.desc())
+        )
+    except Exception:
+        return None
+    if skill is None or not skill.file_path:
+        return None
+    root = Path(str(skill.file_path)).expanduser().resolve().parent
+    return root if (root / "scripts").is_dir() else None
+
+
+def _filesystem_skill_root_from_files() -> Path | None:
+    root = Path(__file__).resolve().parents[4] / "docs" / "agent-skills"
+    if not root.is_dir():
+        return None
+    for skill_file in root.glob("*/SKILL.md"):
+        try:
+            content = skill_file.read_text(encoding="utf-8")[:512]
+        except OSError:
+            continue
+        if re.search(r"(?m)^name:\s*filesystem\s*$", content) and (skill_file.parent / "scripts").is_dir():
+            return skill_file.parent.resolve()
+    return None
+
+
+def _filesystem_result_payload(
+    tool_name: str,
+    *,
+    stdout: str,
+    stderr: str,
+    return_code: int,
+    root: Path,
+    script_file: Path,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "stdout": stdout,
+        "stderr": stderr,
+        "return_code": return_code,
+        "script_path": str(script_file),
+        "skill_root": str(root),
+    }
+    stripped = stdout.strip()
+    if tool_name == FILESYSTEM_READ_FILE_TOOL:
+        result["content"] = stdout
+    elif tool_name == FILESYSTEM_LIST_DIR_TOOL:
+        result["entries"] = _filesystem_list_entries(stdout)
+    elif tool_name == FILESYSTEM_PATH_EXISTS_TOOL:
+        result["exists"] = stripped.startswith("EXISTS:")
+    elif tool_name == FILESYSTEM_PATH_STAT_TOOL:
+        result["stat"] = _filesystem_stat_payload(stdout)
+    return result
+
+
+def _filesystem_error_message(stdout: str, stderr: str, return_code: int) -> str | None:
+    for line in stdout.splitlines():
+        if line.strip().startswith("ERROR:"):
+            return line.strip()
+    if return_code != 0:
+        return stderr.strip() or f"filesystem script exited with code {return_code}"
+    return None
+
+
+def _filesystem_tool_failure(tool_name: str, error: str, *, result: dict[str, Any]) -> dict[str, Any]:
+    return {"tool_name": tool_name, "ok": False, "error": error, "result": result}
+
+
+def _filesystem_list_entries(stdout: str) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for line in stdout.splitlines():
+        if "\t" not in line:
+            continue
+        kind, name = line.split("\t", 1)
+        if kind in {"dir", "file"} and name:
+            entries.append({"type": kind, "name": name})
+    return entries
+
+
+def _filesystem_stat_payload(stdout: str) -> dict[str, Any]:
+    stat: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower()
+        cleaned_value = value.strip()
+        stat[normalized_key] = int(cleaned_value) if normalized_key == "size" and cleaned_value.isdigit() else cleaned_value
+    return stat
+
+
+def _filesystem_default_output_root() -> Path:
+    root = Path(__file__).resolve().parents[4] / "runtime" / "filesystem-tool-output"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _bounded_int(value: int | str | None, *, default: int, minimum: int, maximum: int) -> int:

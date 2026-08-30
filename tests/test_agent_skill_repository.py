@@ -326,10 +326,11 @@ class AgentSkillRepositoryTest(unittest.TestCase):
 
         self.assertEqual(200, list_response.status_code)
         listed_names = {item["name"] for item in list_response.json()["items"]}
-        self.assertEqual(3, len(listed_names))
+        self.assertEqual(4, len(listed_names))
         self.assertIn("api-sync", listed_names)
         self.assertIn("wechat-article-content-fetch", listed_names)
         self.assertIn("xiaohongshu-content-fetch", listed_names)
+        self.assertIn("database-operations", listed_names)
         self.assertEqual(200, get_response.status_code)
         self.assertEqual("markdown_file", get_response.json()["skill"]["storage_type"])
         self.assertTrue(get_response.json()["content"].startswith("# "))
@@ -376,10 +377,11 @@ class AgentSkillRepositoryTest(unittest.TestCase):
         self.assertEqual(["wechat_article", "wechat_account"], import_response.json()["metadata_json"]["source_types"])
         self.assertEqual(200, list_response.status_code)
         listed_names = {item["name"] for item in list_response.json()["items"]}
-        self.assertEqual(3, len(listed_names))
+        self.assertEqual(4, len(listed_names))
         self.assertIn("wechat-recruiting-articles", listed_names)
         self.assertIn("wechat-article-content-fetch", listed_names)
         self.assertIn("xiaohongshu-content-fetch", listed_names)
+        self.assertIn("database-operations", listed_names)
 
     def test_skill_api_bootstraps_builtin_content_source_skills_on_list(self) -> None:
         app = self._app()
@@ -401,7 +403,31 @@ class AgentSkillRepositoryTest(unittest.TestCase):
         self.assertIn("wechat-article-content-fetch", first_names)
         self.assertIn("xiaohongshu-content-fetch", first_names)
         self.assertEqual(len(second_names), len(set(second_names)))
-        self.assertEqual(2, len(second_names))
+        self.assertEqual(3, len(second_names))
+        self.assertIn("database-operations", second_names)
+
+    def test_skill_api_bootstraps_builtin_database_operations_skill_on_list(self) -> None:
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.get("/api/v1/agent-skills")
+                return response
+
+        response = run(call_api())
+
+        self.assertEqual(200, response.status_code)
+        database_skill = next(
+            item
+            for item in response.json()["items"]
+            if item["name"] == "database-operations"
+        )
+        metadata = database_skill["metadata_json"]
+        self.assertEqual("available", metadata["availability_state"])
+        self.assertIn("database.company_search", metadata["required_tools"])
+        self.assertIn("database.company_update", metadata["ask_tools"])
+        self.assertIn("database.job_lead_delete", metadata["ask_tools"])
 
     def test_skill_api_decorates_dependency_status_from_single_agent_tool_registry(self) -> None:
         source_dir = PROJECT_ROOT / ".tmp-agent-skill-tests" / self._testMethodName / "downloaded" / "memory-skill"

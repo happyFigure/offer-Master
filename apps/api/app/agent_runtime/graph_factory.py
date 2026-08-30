@@ -6,6 +6,7 @@ import warnings
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime
 from typing import Any, Callable
+from urllib.parse import urlparse
 from uuid import uuid4
 
 try:  # Keep LangGraph's upstream pending-deprecation noise out of targeted runtime tests.
@@ -45,14 +46,21 @@ from app.agent_runtime.memory.context_builder import ContextBuildConfig, MemoryC
 from app.agent_runtime.memory.skill_repository import AgentSkillRepository
 from app.agent_runtime.planning.schemas import ExecutionPlan, ExecutionPlannerAction
 from app.agent_runtime.reflection.capability_evaluator import CapabilityResultEvaluationRequest, CapabilityResultEvaluator
-from app.agent_runtime.output_sanitizer import sanitize_agent_final_answer
+from app.agent_runtime.output_sanitizer import (
+    contains_false_tool_execution_claim,
+    false_tool_execution_claim_fallback_response,
+    sanitize_agent_final_answer,
+)
 from app.agent_runtime.routing.result_envelope import build_result_envelope
 from app.agent_runtime.routing.runtime_guard import validate_route_decision
 from app.agent_runtime.routing.schemas import RouteDecision
 from app.agent_runtime.state import AgentState
 from app.agent_runtime.tool_candidate_selector import ToolCandidateSelection, ToolCandidateSelector
+from app.agent_runtime.tool_input_completion import ToolInputCompletionResult, complete_tool_input
 from app.agent_runtime.tool_input import requested_sample_limit_from_text
 from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
+from app.agent_runtime.textual_tool_call_recovery import TextualToolCall, recover_textual_tool_call
+from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 from app.agent_runtime.tool_registry import (
     APPLICATION_FIND_APPLY_ENTRY_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
@@ -68,6 +76,7 @@ from app.agent_runtime.understanding.schemas import IntentFrame
 from app.domains.automation.models import ApprovalRequest, ToolCallStatus, WorkflowRun, WorkflowRunStatus, utc_now
 from app.domains.automation.schemas import ApprovalRequestCreate, ToolCallLogCreate, WorkflowRunCreate
 from app.domains.automation.service import AutomationService
+from app.domains.agent_memory.repository import AgentMemoryRepository
 from app.domains.conversations.models import AgentMessageRole
 from app.domains.conversations.schemas import AgentMessageCreate
 from app.domains.conversations.service import ConversationService
@@ -75,6 +84,7 @@ from sqlalchemy.orm import Session
 
 
 AGENT_GRAPH_NODE_ORDER = ["build_context", "plan_or_reply", "maybe_tool", "wait_confirmation", "final_response"]
+LOOP_RUNNER_STAGE_CONTEXT_METADATA_KEY = "loop_runner_stage_context"
 
 # Semantic quality retry is different from transient API/network retry.
 # Keep it bounded because repeated bad search rewrites can drift away from the user's intent.
@@ -99,6 +109,7 @@ class AgentGraphDependencies:
     conversation_service: ConversationService
     registry: AgentToolRegistry
     guard: AgentToolRuntimeGuard
+    memory_repository: AgentMemoryRepository | None = None
     skill_repository: AgentSkillRepository | None = None
     db_session: Session | None = None
     llm_client: Any | None = None
@@ -171,14 +182,37 @@ def create_agent_graph() -> AgentRuntimeGraph:
     return AgentRuntimeGraph(node_order=AGENT_GRAPH_NODE_ORDER.copy(), compiled_graph=compiled_graph)
 
 
-def run_agent_workflow(command: AgentRunCommand, *, dependencies: AgentGraphDependencies) -> AgentWorkflowResult:
-    prepared = prepare_agent_workflow_response(command, dependencies=dependencies)
-    if prepared.state.current_step == "wait_confirmation":
+def _state_is_waiting_for_user(state: AgentState) -> bool:
+    return state.current_step in {"wait_confirmation", "wait_user_input"}
+
+
+def run_agent_workflow(
+    command: AgentRunCommand,
+    *,
+    dependencies: AgentGraphDependencies,
+    on_workflow_started: Callable[[WorkflowRun, AgentState], AgentState | None] | None = None,
+) -> AgentWorkflowResult:
+    prepared = prepare_agent_workflow_response(
+        command,
+        dependencies=dependencies,
+        on_workflow_started=on_workflow_started,
+    )
+    if _state_is_waiting_for_user(prepared.state):
         return AgentWorkflowResult(workflow_run_id=prepared.workflow_run_id, state=prepared.state)
 
     final_response, response_mode = _generate_final_response(prepared.state, dependencies=dependencies)
-    return finalize_agent_workflow_response(
+    prepared_state, final_response, response_mode = _maybe_recover_textual_tool_call_from_final_response(
         prepared.state,
+        command=command,
+        workflow=prepared.workflow,
+        final_response=final_response,
+        response_mode=response_mode,
+        dependencies=dependencies,
+    )
+    if _state_is_waiting_for_user(prepared_state):
+        return AgentWorkflowResult(workflow_run_id=prepared.workflow_run_id, state=prepared_state)
+    return finalize_agent_workflow_response(
+        prepared_state,
         final_response=final_response,
         response_mode=response_mode,
         dependencies=dependencies,
@@ -189,7 +223,7 @@ def prepare_agent_workflow_response(
     command: AgentRunCommand,
     *,
     dependencies: AgentGraphDependencies,
-    on_workflow_started: Callable[[WorkflowRun, AgentState], None] | None = None,
+    on_workflow_started: Callable[[WorkflowRun, AgentState], AgentState | None] | None = None,
 ) -> AgentPreparedResponse:
     workflow = dependencies.automation_service.start_workflow(
         WorkflowRunCreate(
@@ -229,10 +263,32 @@ def finalize_agent_workflow_response(
     if workflow is None:
         raise ValueError(f"Workflow run not found: {state.workflow_run_id}")
 
+    state, final_response, response_mode = _maybe_recover_textual_tool_call_from_final_response(
+        state,
+        command=AgentRunCommand(
+            session_id=state.session_id,
+            user_message=state.user_message,
+            requested_tool_name=state.requested_tool_name,
+            source_type=state.source_type,
+            tool_input={},
+        ),
+        workflow=workflow,
+        final_response=final_response,
+        response_mode=response_mode,
+        dependencies=dependencies,
+    )
+    if _state_is_waiting_for_user(state):
+        state = state.with_updates(final_response=final_response, response_mode=response_mode)
+        workflow.status = WorkflowRunStatus.WAITING_USER
+        workflow.current_step = state.current_step
+        _save_step(workflow, state, dependencies)
+        return AgentWorkflowResult(workflow_run_id=workflow.id, state=state)
+
     state, final_response, response_mode = _sanitize_final_response_for_user(
         state,
         final_response=final_response,
         response_mode=response_mode,
+        dependencies=dependencies,
     )
     state = state.with_updates(
         current_step="final_response",
@@ -251,10 +307,11 @@ def _sanitize_final_response_for_user(
     *,
     final_response: str,
     response_mode: str,
+    dependencies: AgentGraphDependencies,
 ) -> tuple[AgentState, str, str]:
     sanitized = sanitize_agent_final_answer(final_response)
     if not sanitized.removed_internal_protocol:
-        return state, final_response, response_mode
+        return _sanitize_false_tool_execution_claim_for_user(state, final_response=final_response, response_mode=response_mode)
 
     metadata = {
         **state.context_metadata,
@@ -266,13 +323,218 @@ def _sanitize_final_response_for_user(
     }
     state = state.with_updates(context_metadata=metadata)
     if sanitized.content:
-        return state, sanitized.content, response_mode
+        return _sanitize_false_tool_execution_claim_for_user(state, final_response=sanitized.content, response_mode=response_mode)
 
-    tool_response = tool_result_summary_response(state)
+    tool_response = tool_result_summary_response(state, dependencies=dependencies)
     if tool_response is not None:
         fallback_content, fallback_mode = tool_response
         return state, fallback_content, fallback_mode
     return state, "我已完成处理，但最终回答需要重新整理。请重新发送问题或换一种问法。", "sanitized_empty_fallback"
+
+
+def _sanitize_false_tool_execution_claim_for_user(
+    state: AgentState,
+    *,
+    final_response: str,
+    response_mode: str,
+) -> tuple[AgentState, str, str]:
+    if state.tool_call_ids or not contains_false_tool_execution_claim(final_response):
+        return state, final_response, response_mode
+    existing_sanitizer = state.context_metadata.get("output_sanitizer") if isinstance(state.context_metadata, dict) else None
+    metadata = {
+        **state.context_metadata,
+        "output_sanitizer": {
+            **(dict(existing_sanitizer) if isinstance(existing_sanitizer, dict) else {}),
+            "removed_false_tool_claim": True,
+            "needs_regeneration": True,
+        },
+    }
+    return state.with_updates(context_metadata=metadata), false_tool_execution_claim_fallback_response(), "false_tool_claim_fallback"
+
+
+def _maybe_recover_textual_tool_call_from_final_response(
+    state: AgentState,
+    *,
+    command: AgentRunCommand,
+    workflow: WorkflowRun,
+    final_response: str,
+    response_mode: str,
+    dependencies: AgentGraphDependencies,
+) -> tuple[AgentState, str, str]:
+    if state.tool_call_ids or state.current_step == "wait_confirmation":
+        return state, final_response, response_mode
+    textual_call = recover_textual_tool_call(final_response, registry=dependencies.registry)
+    if textual_call is None:
+        return state, final_response, response_mode
+    sanitized = sanitize_agent_final_answer(final_response)
+    mixed_text_discarded = bool(sanitized.content and not _final_response_is_only_textual_tool_call(final_response, textual_call))
+
+    recovered_command = AgentRunCommand(
+        session_id=state.session_id,
+        user_message=command.user_message,
+        requested_tool_name=textual_call.tool_name,
+        source_type="agent_chat",
+        user_confirmed=False,
+        tool_input=dict(textual_call.tool_input),
+    )
+    definition = dependencies.registry.get(textual_call.tool_name)
+    recovered_command, completed_tool_input, _completion = _complete_runtime_tool_command(
+        recovered_command,
+        state=state,
+        definition=definition,
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "textual_tool_call_recovered",
+        state=state,
+        command=recovered_command,
+        tool_input=completed_tool_input,
+        status="running",
+        summary="模型把工具调用写成了普通文字，运行时已转换为真实工具调用流程。",
+    )
+    next_state = _execute_recovered_textual_tool_call(
+        state,
+        command=recovered_command,
+        textual_call=textual_call,
+        dependencies=dependencies,
+    )
+    if next_state.current_step == "wait_confirmation":
+        approval = dependencies.automation_service.request_user_approval(
+            ApprovalRequestCreate(
+                workflow_run_id=workflow.id,
+                action_type=textual_call.tool_name,
+                prompt=f"Confirm before running tool: {textual_call.tool_name}",
+                payload={
+                    "agent_run_id": next_state.agent_run_id,
+                    "source_type": "agent_chat",
+                    "requested_tool_name": textual_call.tool_name,
+                    "tool_input": _pending_runtime_tool_input(next_state) or recovered_command.tool_input,
+                    "guard_result": next_state.guard_result,
+                    "textual_tool_call_recovery": _textual_tool_call_recovery_metadata(
+                        textual_call,
+                        recovered=False,
+                        mixed_text_discarded=mixed_text_discarded,
+                    ),
+                },
+            )
+        ).approval
+        workflow.current_step = "wait_confirmation"
+        next_state = next_state.with_updates(
+            approval_request_id=approval.id,
+            context_metadata=_with_textual_tool_call_recovery_metadata(
+                next_state.context_metadata,
+                textual_call,
+                recovered=False,
+                next_action="wait_confirmation",
+                mixed_text_discarded=mixed_text_discarded,
+            ),
+        )
+        _save_step(workflow, next_state, dependencies)
+        return next_state, final_response, "textual_tool_call_wait_confirmation"
+
+    if next_state.current_step == "wait_user_input":
+        workflow.status = WorkflowRunStatus.WAITING_USER
+        workflow.current_step = "wait_user_input"
+        next_state = next_state.with_updates(
+            context_metadata=_with_textual_tool_call_recovery_metadata(
+                next_state.context_metadata,
+                textual_call,
+                recovered=False,
+                next_action="wait_user_input",
+                mixed_text_discarded=mixed_text_discarded,
+            ),
+        )
+        _save_step(workflow, next_state, dependencies)
+        return next_state, next_state.final_response or final_response, next_state.response_mode
+
+    if not next_state.tool_call_ids:
+        return next_state, final_response, response_mode
+
+    next_state = next_state.with_updates(
+        context_metadata=_with_textual_tool_call_recovery_metadata(
+            next_state.context_metadata,
+            textual_call,
+            recovered=True,
+            next_action="executed",
+            mixed_text_discarded=mixed_text_discarded,
+        )
+    )
+    next_response, next_mode = _generate_final_response(next_state, dependencies=dependencies)
+    return next_state, next_response, _textual_tool_call_recovery_response_mode(next_mode)
+
+
+def _execute_recovered_textual_tool_call(
+    state: AgentState,
+    *,
+    command: AgentRunCommand,
+    textual_call: TextualToolCall,
+    dependencies: AgentGraphDependencies,
+) -> AgentState:
+    return _maybe_tool_node(
+        state.with_updates(requested_tool_name=textual_call.tool_name, source_type="agent_chat"),
+        command=AgentRunCommand(
+            session_id=state.session_id,
+            user_message=command.user_message,
+            requested_tool_name=textual_call.tool_name,
+            source_type="agent_chat",
+            user_confirmed=False,
+            tool_input=dict(command.tool_input),
+        ),
+        dependencies=dependencies,
+    )
+
+
+def _with_textual_tool_call_recovery_metadata(
+    metadata: dict[str, Any],
+    textual_call: TextualToolCall,
+    *,
+    recovered: bool,
+    next_action: str,
+    mixed_text_discarded: bool = False,
+) -> dict[str, Any]:
+    return {
+        **metadata,
+        "textual_tool_call_recovery": _textual_tool_call_recovery_metadata(
+            textual_call,
+            recovered=recovered,
+            next_action=next_action,
+            mixed_text_discarded=mixed_text_discarded,
+        ),
+    }
+
+
+def _textual_tool_call_recovery_metadata(
+    textual_call: TextualToolCall,
+    *,
+    recovered: bool,
+    next_action: str | None = None,
+    mixed_text_discarded: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "recovered": recovered,
+        "tool_name": textual_call.tool_name,
+        "raw_tool_name": textual_call.raw_tool_name,
+        "tool_input_keys": sorted(str(key) for key in textual_call.tool_input.keys()),
+        "mixed_text_discarded": mixed_text_discarded,
+    }
+    if next_action is not None:
+        payload["next_action"] = next_action
+    return payload
+
+
+def _textual_tool_call_recovery_response_mode(response_mode: str) -> str:
+    if response_mode == "llm":
+        return "llm_textual_tool_call_recovery"
+    if response_mode.endswith("_textual_tool_call_recovery"):
+        return response_mode
+    return f"{response_mode}_textual_tool_call_recovery"
+
+
+def _final_response_is_only_textual_tool_call(content: str, textual_call: TextualToolCall) -> bool:
+    normalized = str(content or "").replace("\\_", "_").strip()
+    remaining = normalized.replace(textual_call.raw_content, "", 1).strip()
+    remaining_lines = [line.strip() for line in remaining.splitlines() if line.strip()]
+    return not remaining_lines or all(re.fullmatch(r"(?:\*\*)?OfferMaster\s+AI(?:\*\*)?[:：]?", line, re.IGNORECASE) for line in remaining_lines)
 
 
 def resume_agent_workflow(workflow_run_id: str, *, dependencies: AgentGraphDependencies) -> AgentWorkflowResult:
@@ -369,13 +631,15 @@ def _run_until_response_ready(
     command: AgentRunCommand,
     workflow: WorkflowRun,
     dependencies: AgentGraphDependencies,
-    on_workflow_started: Callable[[WorkflowRun, AgentState], None] | None = None,
+    on_workflow_started: Callable[[WorkflowRun, AgentState], AgentState | None] | None = None,
 ) -> AgentPreparedResponse:
     state = _build_context_node(state, dependencies=dependencies)
     _record_durable_context_snapshots(state, dependencies=dependencies)
     _save_step(workflow, state, dependencies)
     if on_workflow_started is not None:
-        on_workflow_started(workflow, state)
+        next_state = on_workflow_started(workflow, state)
+        if next_state is not None:
+            state = next_state
 
     route_decision: RouteDecision | None = None
     command = _auto_select_tool_command(command, state=state, registry=dependencies.registry)
@@ -404,6 +668,11 @@ def _run_until_response_ready(
             ).approval
             workflow.current_step = "wait_confirmation"
             state = state.with_updates(approval_request_id=approval.id)
+            _save_step(workflow, state, dependencies)
+            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
+        if state.current_step == "wait_user_input":
+            workflow.status = WorkflowRunStatus.WAITING_USER
+            workflow.current_step = "wait_user_input"
             _save_step(workflow, state, dependencies)
             return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
         if state.final_response and _has_prepared_final_response(state):
@@ -513,7 +782,7 @@ def _run_until_response_ready(
                         "agent_run_id": state.agent_run_id,
                         "source_type": command.source_type,
                         "requested_tool_name": command.requested_tool_name,
-                        "tool_input": command.tool_input,
+                        "tool_input": _pending_runtime_tool_input(state) or command.tool_input,
                         "guard_result": state.guard_result,
                     },
                 )
@@ -533,6 +802,11 @@ def _run_until_response_ready(
                     "guard_result": state.guard_result,
                 },
             )
+            _save_step(workflow, state, dependencies)
+            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
+        if state.current_step == "wait_user_input":
+            workflow.status = WorkflowRunStatus.WAITING_USER
+            workflow.current_step = "wait_user_input"
             _save_step(workflow, state, dependencies)
             return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
         _save_step(workflow, state, dependencies)
@@ -648,6 +922,14 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                 requires_user_action=True,
                 metadata={"guard_result": next_state.guard_result, "tool_input": tool_input},
             )
+        if next_state.current_step == "wait_user_input":
+            guard_result = next_state.guard_result if isinstance(next_state.guard_result, dict) else {}
+            return LoopAgentObservation(
+                status="waiting_user",
+                summary=str(guard_result.get("user_message") or guard_result.get("reason") or "工具参数还不完整，请补充后继续。"),
+                requires_user_action=True,
+                metadata={"guard_result": guard_result, "tool_input": tool_input},
+            )
         if len(next_state.tool_call_ids) <= before_tool_call_count:
             guard_result = next_state.guard_result if isinstance(next_state.guard_result, dict) else {}
             return LoopAgentObservation(
@@ -695,6 +977,7 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
         )
 
     try:
+        stage_context = _loop_runner_stage_context_from_state(state)
         result = ToolChoiceLoopRunner(
             registry=runtime_dependencies.registry,
             llm_client=runtime_dependencies.llm_client,
@@ -708,9 +991,11 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                 context={
                     "mode": "model_selected_tool",
                     "candidate_selection": selection.to_metadata_dict(),
+                    **_tool_choice_loop_context_hints(state),
                 },
+                stage_context=stage_context,
             ),
-            max_steps=2,
+            max_steps=_tool_choice_loop_max_steps(stage_context),
             session_id=state.session_id,
             task_id=state.workflow_run_id,
             run_id=state.agent_run_id,
@@ -738,6 +1023,22 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
             context_metadata=metadata,
         )
     return state.with_updates(context_metadata=metadata)
+
+
+def _loop_runner_stage_context_from_state(state: AgentState) -> dict[str, Any] | None:
+    if not isinstance(state.context_metadata, dict):
+        return None
+    value = state.context_metadata.get(LOOP_RUNNER_STAGE_CONTEXT_METADATA_KEY)
+    return dict(value) if isinstance(value, dict) and value else None
+
+
+def _tool_choice_loop_max_steps(stage_context: dict[str, Any] | None) -> int:
+    if not isinstance(stage_context, dict) or not stage_context:
+        return 2
+    stage_plan = stage_context.get("stage_plan")
+    if not isinstance(stage_plan, list) or not stage_plan:
+        return 2
+    return max(2, min(6, len(stage_plan) + 1))
 
 
 def _emit_tool_choice_candidate_event(
@@ -821,6 +1122,16 @@ def format_runtime_capability_name(capability: str | None) -> str:
         LOCAL_JOB_SOURCE_OVERVIEW_TOOL: "岗位来源概览",
         OFFERIO_COMPANY_JOBS_TOOL: "OfferIO 岗位同步",
         APPLICATION_FIND_APPLY_ENTRY_TOOL: "申请入口发现",
+        "filesystem.list_dir": "查看目录",
+        "filesystem.path_exists": "检查路径是否存在",
+        "filesystem.path_stat": "查看文件信息",
+        "filesystem.read_file": "读取文件",
+        "filesystem.write_text": "写入文件",
+        "filesystem.replace_text": "精确替换文本",
+        "filesystem.copy_file": "复制文件",
+        "filesystem.move_file": "移动/重命名文件",
+        "filesystem.delete_path": "删除文件",
+        "filesystem.make_dir": "创建目录",
         "memory_search": "会话记忆检索",
         "agent_loop": "主 agent 循环",
     }.get(str(capability or ""), str(capability or "候选能力"))
@@ -849,7 +1160,138 @@ def _tool_choice_loop_candidate_selection(
         tool_registry=dependencies.registry,
         executor_id_by_capability=dependencies.capability_executor_ids,
     )
-    return ToolCandidateSelector(capability_registry).select(state.user_message, source_type="agent_chat")
+    selection_text = _tool_choice_loop_selection_text(state)
+    return ToolCandidateSelector(capability_registry).select(
+        selection_text,
+        source_type="agent_chat",
+        auto_executable_only=False,
+    )
+
+
+_LOCAL_FILE_REFERENCE_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\r\n`\"<>]*?\.(?:tex|md|txt|pdf|docx|json|csv|yaml|yml)",
+    re.IGNORECASE,
+)
+
+
+def _tool_choice_loop_selection_text(state: AgentState) -> str:
+    user_message = str(state.user_message or "")
+    if _extract_local_file_references(user_message) or not _should_reuse_recent_context_for_tool_choice(user_message):
+        return user_message
+    recent_context = _recent_user_context_for_tool_choice(state)
+    if not recent_context:
+        return user_message
+    return f"{user_message}\n\n上文用户消息：\n{recent_context}"
+
+
+def _tool_choice_loop_context_hints(state: AgentState) -> dict[str, Any]:
+    if not _should_reuse_recent_context_for_tool_choice(str(state.user_message or "")):
+        return {}
+    recent_context = _recent_user_context_for_tool_choice(state)
+    recent_paths = _extract_local_file_references(recent_context)
+    if not recent_context and not recent_paths:
+        return {}
+    hints = {
+        "recent_user_context": recent_context,
+        "context_usage_hint": "如果当前用户用这个、它、刚才、继续等省略说法，要先复用最近用户消息里的对象、路径和约束，再判断是否调用工具。",
+    }
+    if recent_paths:
+        hints["recent_file_paths"] = recent_paths
+    return hints
+
+
+def _recent_user_context_for_tool_choice(state: AgentState, *, limit: int = 4, max_chars: int = 1600) -> str:
+    messages: list[str] = []
+    for message in reversed(state.llm_messages or []):
+        if str(message.get("role") or "") != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content or content == state.user_message:
+            continue
+        messages.append(content)
+        if len(messages) >= limit:
+            break
+    context = "\n".join(reversed(messages))
+    if len(context) <= max_chars:
+        return context
+    return context[-max_chars:]
+
+
+def _extract_local_file_references(text: str) -> list[str]:
+    if not text:
+        return []
+    return _dedupe_tool_choice_strings(match.group(0).strip() for match in _LOCAL_FILE_REFERENCE_RE.finditer(text))
+
+
+def _dedupe_tool_choice_strings(values) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
+def _should_reuse_recent_context_for_tool_choice(text: str) -> bool:
+    return _looks_like_contextual_file_operation(text) or _looks_like_contextual_entity_tool_followup(text)
+
+
+def _looks_like_contextual_entity_tool_followup(text: str) -> bool:
+    if not text:
+        return False
+    reference_markers = ("它", "他们", "它们", "这个", "这个公司", "这个岗位", "该公司", "上面", "刚才", "继续")
+    action_markers = (
+        "查",
+        "搜",
+        "搜索",
+        "看一下",
+        "了解",
+        "介绍",
+        "主要业务",
+        "主营业务",
+        "是什么",
+        "做什么",
+        "读取",
+        "打开",
+        "处理",
+        "修改",
+        "替换",
+        "换成",
+        "改成",
+    )
+    return any(marker in text for marker in reference_markers) and any(marker in text for marker in action_markers)
+
+
+def _looks_like_contextual_file_operation(text: str) -> bool:
+    if not text:
+        return False
+    file_markers = ("文件", "内容", "简历", "resume", "tex", "md", "这个", "这份", "它", "上面", "刚才")
+    action_markers = (
+        "读取",
+        "读一下",
+        "读到",
+        "打开",
+        "看一下",
+        "看看",
+        "查看",
+        "处理",
+        "继续",
+        "修改",
+        "替换",
+        "换成",
+        "换为",
+        "换了",
+        "改成",
+        "改为",
+        "写入",
+        "保存",
+        "其他不要动",
+        "其他的啥都不要动",
+    )
+    return any(marker in text for marker in file_markers) and any(marker in text for marker in action_markers)
 
 
 def _dependencies_with_declared_agent_capability_tools(dependencies: AgentGraphDependencies) -> AgentGraphDependencies:
@@ -1228,6 +1670,13 @@ def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                     },
                 )
             )
+            _emit_loop_observation_events(
+                dependencies,
+                state=state,
+                requested_tool_name=requested_tool_name,
+                tool_input=tool_input,
+                trace_entry=trace_entry,
+            )
 
             retry_input = _loop_agent_reflection_retry_input(
                 trace_entry,
@@ -1307,6 +1756,13 @@ def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                             "reflection_retry_count": reflection_retry_count,
                         },
                     )
+                )
+                _emit_loop_observation_events(
+                    dependencies,
+                    state=state,
+                    requested_tool_name=requested_tool_name,
+                    tool_input=retry_input,
+                    trace_entry=retry_trace_entry,
                 )
                 retry_input = _loop_agent_reflection_retry_input(
                     retry_trace_entry,
@@ -1640,7 +2096,13 @@ def _loop_agent_trace_entry(
         dependencies=dependencies,
         attempt_index=iteration,
     )
-    metadata: dict[str, Any] = {"tool_input_keys": sorted(tool_input.keys())}
+    metadata: dict[str, Any] = {
+        "tool_input_keys": sorted(tool_input.keys()),
+        "tool_input": _public_tool_input_preview(tool_input),
+    }
+    result_observation = _runtime_result_summary_metadata(payload)
+    if result_observation:
+        metadata["result_observation"] = result_observation
     if reflection is not None:
         metadata["reflection"] = reflection
     return LoopAgentTraceEntry(
@@ -1703,7 +2165,7 @@ def _expected_company_names_from_state(state: AgentState) -> list[str]:
 
 
 def _loop_agent_observation_status(payload: dict[str, Any] | None, state: AgentState) -> str:
-    if state.current_step == "wait_confirmation":
+    if _state_is_waiting_for_user(state):
         return "waiting_user"
     if isinstance(payload, dict):
         return str(payload.get("status") or "unknown")
@@ -1717,6 +2179,9 @@ def _loop_agent_observation_summary(
 ) -> str:
     if state.current_step == "wait_confirmation":
         return "Tool step paused because runtime requires user confirmation."
+    if state.current_step == "wait_user_input":
+        guard_result = state.guard_result if isinstance(state.guard_result, dict) else {}
+        return str(guard_result.get("user_message") or guard_result.get("reason") or "工具参数还不完整，请补充后继续。")
     if not isinstance(payload, dict):
         return "Tool step completed without a structured observation payload."
     tool_result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
@@ -1768,9 +2233,22 @@ def _pending_execution_planner_tool_input(state: AgentState) -> dict[str, Any]:
 
 def _pending_native_tool_input(state: AgentState) -> dict[str, Any]:
     tool_loop = state.context_metadata.get("tool_calling_loop") if isinstance(state.context_metadata, dict) else None
-    if not isinstance(tool_loop, dict):
+    if isinstance(tool_loop, dict):
+        tool_input = tool_loop.get("pending_tool_input")
+        if isinstance(tool_input, dict):
+            return dict(tool_input)
+    completion = state.context_metadata.get("tool_input_completion") if isinstance(state.context_metadata, dict) else None
+    if isinstance(completion, dict):
+        tool_input = completion.get("tool_input")
+        if isinstance(tool_input, dict) and tool_input:
+            return dict(tool_input)
+    tool_choice_loop = state.context_metadata.get("tool_choice_loop") if isinstance(state.context_metadata, dict) else None
+    if not isinstance(tool_choice_loop, dict):
         return {}
-    tool_input = tool_loop.get("pending_tool_input")
+    pending_decision = tool_choice_loop.get("pending_decision")
+    if not isinstance(pending_decision, dict):
+        return {}
+    tool_input = pending_decision.get("tool_input")
     return dict(tool_input) if isinstance(tool_input, dict) else {}
 
 
@@ -1784,6 +2262,7 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
         dependencies.skill_repository.ensure_builtin_content_source_skills()
     built = MemoryContextBuilder(
         dependencies.conversation_service,
+        memory_repository=dependencies.memory_repository,
         skill_repository=dependencies.skill_repository,
     ).build(
         state.session_id,
@@ -1803,6 +2282,7 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
             )
             built = MemoryContextBuilder(
                 dependencies.conversation_service,
+                memory_repository=dependencies.memory_repository,
                 skill_repository=dependencies.skill_repository,
             ).build(
                 state.session_id,
@@ -1876,12 +2356,86 @@ def _prepend_context_pack_message(messages: list[dict[str, Any]], context_pack: 
     return [{"role": "system", "content": content, "metadata": {"source": "context_pack"}}, *messages]
 
 
+def _complete_runtime_tool_command(
+    command: AgentRunCommand,
+    *,
+    state: AgentState,
+    definition: AgentToolDefinition | None,
+) -> tuple[AgentRunCommand, dict[str, Any], ToolInputCompletionResult]:
+    resolved_input = _resolved_tool_input(command, state)
+    completion = complete_tool_input(
+        tool_name=command.requested_tool_name or "",
+        tool_input=resolved_input,
+        input_schema=definition.input_schema if definition is not None else {},
+        user_message=state.user_message,
+        recent_user_context=_recent_user_context_for_tool_choice(state),
+        context={"recent_file_paths": _extract_local_file_references(_recent_user_context_for_tool_choice(state))},
+    )
+    return replace(command, tool_input=completion.tool_input), completion.tool_input, completion
+
+
+def _with_tool_input_completion_metadata(
+    metadata: dict[str, Any],
+    command: AgentRunCommand,
+    completion: ToolInputCompletionResult,
+) -> dict[str, Any]:
+    if not completion.filled_fields and not completion.missing_required_fields:
+        return {key: value for key, value in metadata.items() if key != "tool_input_completion"}
+    return {
+        **metadata,
+        "tool_input_completion": {
+            "tool_name": command.requested_tool_name,
+            "tool_input": dict(completion.tool_input),
+            **completion.to_metadata_dict(),
+        },
+    }
+
+
+def _tool_input_validation_guard_payload(
+    command: AgentRunCommand,
+    *,
+    validation_error: str,
+    completion: ToolInputCompletionResult,
+) -> dict[str, Any]:
+    missing_text = "、".join(completion.missing_required_fields)
+    user_message = f"工具参数还不完整：缺少 {missing_text}。" if missing_text else "工具参数不符合要求。"
+    return {
+        "ok": False,
+        "error_code": "TOOL_INPUT_INVALID",
+        "reason": validation_error,
+        "user_message": user_message,
+        "next_action": "wait_user_input",
+        "retryable": True,
+        "error_details": {
+            "requested_tool_name": command.requested_tool_name,
+            "tool_input": dict(completion.tool_input),
+            "missing_required_fields": list(completion.missing_required_fields),
+            "completion": completion.to_metadata_dict(),
+        },
+        "cost": {},
+        "artifacts": {},
+    }
+
+
 def _maybe_tool_node(
     state: AgentState,
     *,
     command: AgentRunCommand,
     dependencies: AgentGraphDependencies,
 ) -> AgentState:
+    definition = dependencies.registry.get(command.requested_tool_name or "")
+    command, tool_input, completion = _complete_runtime_tool_command(command, state=state, definition=definition)
+    state = state.with_updates(context_metadata=_with_tool_input_completion_metadata(state.context_metadata, command, completion))
+    validation_error = _validate_native_tool_input(definition.input_schema, tool_input) if definition is not None else None
+    if validation_error is not None:
+        guard_payload = _tool_input_validation_guard_payload(command, validation_error=validation_error, completion=completion)
+        return state.with_updates(
+            current_step="wait_user_input",
+            guard_result=guard_payload,
+            final_response=guard_payload["user_message"],
+            response_mode="tool_input_ask_user",
+        )
+
     skill_permission_policy = _skill_permission_policy_from_state(state)
     guard_result = dependencies.guard.pre_check(
         AgentToolCallContext(
@@ -1912,10 +2466,28 @@ def _maybe_tool_node(
     if not guard_result.ok:
         return state.with_updates(current_step="maybe_tool", guard_result=guard_payload)
 
-    definition = dependencies.registry.get(command.requested_tool_name or "")
-    tool_input = _resolved_tool_input(command, state)
     agent_runtime_executor_id = _agent_runtime_executor_id(command, dependencies=dependencies)
     direct_agent_registered = agent_runtime_executor_id != TOOL_REGISTRY_EXECUTOR_ID and agent_runtime_executor_id in dependencies.agent_executors
+    input_preview = _public_tool_input_preview(tool_input)
+    _emit_runtime_tool_event(
+        dependencies,
+        "reasoning_summary",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        status="thinking",
+        summary=_runtime_reasoning_summary(command.requested_tool_name or "unknown_tool", tool_input=tool_input, user_message=state.user_message),
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "tool_input_preview",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        status="running",
+        summary=_runtime_input_preview_summary(input_preview),
+        input_preview=input_preview,
+    )
     _emit_runtime_tool_event(
         dependencies,
         "tool_started",
@@ -1932,6 +2504,17 @@ def _maybe_tool_node(
         tool_input=tool_input,
     )
     if definition is None or dependencies.db_session is None or (definition.handler is None and not direct_agent_registered):
+        failure_error = "Agent tool handler or database session is unavailable."
+        failure_payload = _tool_failure_result_payload(
+            command.requested_tool_name or "",
+            error=failure_error,
+            error_code="TOOL_HANDLER_UNAVAILABLE" if definition is not None else "TOOL_NOT_REGISTERED",
+            retryable=False,
+            next_action=AgentToolNextAction.SELECT_ALTERNATIVE_TOOL.value,
+            state=state,
+            definition=definition,
+            result={"message": failure_error, "execution": "handler_unavailable"},
+        )
         tool_call = dependencies.automation_service.record_tool_call(
             ToolCallLogCreate(
                 workflow_run_id=state.workflow_run_id,
@@ -1939,8 +2522,8 @@ def _maybe_tool_node(
                 tool_group="agent",
                 status=ToolCallStatus.FAILED,
                 input_payload=tool_input,
-                output_payload={"guard_result": guard_payload, "execution": "handler_unavailable"},
-                error="Agent tool handler or database session is unavailable.",
+                output_payload={"guard_result": guard_payload, "execution": "handler_unavailable", "result": failure_payload},
+                error=failure_error,
             )
         )
         _mark_durable_tool_step_failed(
@@ -1953,6 +2536,7 @@ def _maybe_tool_node(
             output_payload={
                 "guard_result": guard_payload,
                 "execution": "handler_unavailable",
+                "result": failure_payload,
                 "error": tool_call.error,
             },
         )
@@ -1963,7 +2547,7 @@ def _maybe_tool_node(
             tool_name=command.requested_tool_name or "",
             tool_input=tool_input,
             status="failed",
-            result=None,
+            result=failure_payload,
             error=tool_call.error,
         )
         _record_confirmed_skill_approval(state, command=command, dependencies=dependencies)
@@ -1989,6 +2573,17 @@ def _maybe_tool_node(
             tool_call_id=tool_call.id,
             status="failed",
             summary=tool_call.error or f"工具执行失败：{command.requested_tool_name or 'unknown_tool'}。",
+        )
+        _emit_runtime_tool_event(
+            dependencies,
+            "tool_result_summary",
+            state=state,
+            command=command,
+            tool_input=tool_input,
+            tool_call_id=tool_call.id,
+            status="failed",
+            summary=tool_call.error or "工具执行失败，暂无可用结果摘要。",
+            result_summary={},
         )
         return state.with_updates(
             current_step="maybe_tool",
@@ -2081,7 +2676,29 @@ def _maybe_tool_node(
                 error=tool_error,
             ),
         )
+        result_summary = _runtime_result_summary_metadata(result_payload)
+        _emit_runtime_tool_event(
+            dependencies,
+            "tool_result_summary",
+            state=state,
+            command=command,
+            tool_input=tool_input,
+            tool_call_id=tool_call.id,
+            status="succeeded" if tool_ok else "failed",
+            summary=_runtime_result_summary_text(result_summary),
+            result_summary=result_summary,
+        )
     except Exception as exc:  # pragma: no cover - exercised through workflow-level error tests later.
+        failure_payload = _tool_failure_result_payload(
+            command.requested_tool_name or "",
+            error=str(exc),
+            error_code="TOOL_EXECUTION_EXCEPTION",
+            retryable=False,
+            next_action=AgentToolNextAction.SELECT_ALTERNATIVE_TOOL.value,
+            state=state,
+            definition=definition,
+            result={"message": str(exc), "error_type": exc.__class__.__name__},
+        )
         tool_call = dependencies.automation_service.record_tool_call(
             ToolCallLogCreate(
                 workflow_run_id=state.workflow_run_id,
@@ -2093,6 +2710,7 @@ def _maybe_tool_node(
                     "guard_result": guard_payload,
                     "execution": "agent_runtime",
                     "error_type": exc.__class__.__name__,
+                    "result": failure_payload,
                 },
                 error=str(exc),
             )
@@ -2108,6 +2726,7 @@ def _maybe_tool_node(
                 "guard_result": guard_payload,
                 "execution": "agent_runtime",
                 "error_type": exc.__class__.__name__,
+                "result": failure_payload,
                 "error": str(exc),
             },
         )
@@ -2118,7 +2737,7 @@ def _maybe_tool_node(
             tool_name=command.requested_tool_name or "",
             tool_input=tool_input,
             status="failed",
-            result=None,
+            result=failure_payload,
             error=str(exc),
         )
         _record_confirmed_skill_approval(state, command=command, dependencies=dependencies)
@@ -2144,6 +2763,17 @@ def _maybe_tool_node(
             tool_call_id=tool_call.id,
             status="failed",
             summary=str(exc),
+        )
+        _emit_runtime_tool_event(
+            dependencies,
+            "tool_result_summary",
+            state=state,
+            command=command,
+            tool_input=tool_input,
+            tool_call_id=tool_call.id,
+            status="failed",
+            summary=str(exc) or "工具执行失败，暂无可用结果摘要。",
+            result_summary={},
         )
     return state.with_updates(
         current_step="maybe_tool",
@@ -2207,6 +2837,10 @@ def _emit_runtime_tool_event(
     tool_call_id: str | None = None,
     reflection: dict[str, Any] | None = None,
     suggested_input_patch: dict[str, Any] | None = None,
+    input_preview: dict[str, Any] | None = None,
+    result_summary: dict[str, Any] | None = None,
+    evidence: list[dict[str, Any]] | None = None,
+    step_index: int | None = None,
 ) -> None:
     if dependencies.event_sink is None:
         return
@@ -2217,7 +2851,7 @@ def _emit_runtime_tool_event(
         "session_id": state.session_id,
         "workflow_run_id": state.workflow_run_id,
         "agent_run_id": state.agent_run_id,
-        "step_index": len(state.tool_call_ids) + 1,
+        "step_index": step_index or len(state.tool_call_ids) + 1,
         "tool_name": tool_name,
         "tool_call_id": tool_call_id,
         "status": status,
@@ -2228,15 +2862,147 @@ def _emit_runtime_tool_event(
         payload["reflection"] = dict(reflection)
     if suggested_input_patch is not None:
         payload["suggested_input_patch"] = dict(suggested_input_patch)
+    if input_preview is not None:
+        payload["input_preview"] = dict(input_preview)
+    if result_summary is not None:
+        payload["result_summary"] = dict(result_summary)
+    if evidence is not None:
+        payload["evidence"] = [dict(item) for item in evidence]
     dependencies.event_sink(payload)
 
 
 def _runtime_tool_event_label(event_type: str) -> str:
     return {
+        "reasoning_summary": "思考摘要",
+        "tool_input_preview": "工具输入",
         "tool_started": "工具开始",
         "tool_finished": "工具完成",
+        "tool_result_summary": "结果摘要",
+        "reflection_evaluation": "反思判断",
         "tool_reflection_retry": "准备重试",
+        "evidence_selected": "证据选择",
+        "textual_tool_call_recovered": "自动纠偏执行",
     }.get(event_type, event_type)
+
+
+def _runtime_reasoning_summary(tool_name: str, *, tool_input: dict[str, Any], user_message: str) -> str:
+    if tool_name == EXTERNAL_WEB_SEARCH_TOOL:
+        query = str(tool_input.get("query") or user_message).strip()
+        return f"当前问题需要公开信息核对，主 agent 准备通过网页搜索确认：{query}。"
+    if tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
+        return "当前问题可以先查本地企业库，主 agent 会优先使用本地只读工具。"
+    if tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
+        return "当前问题涉及岗位来源概览，主 agent 会读取本地岗位来源统计。"
+    return f"模型选择了能力 {tool_name}，运行时会先校验权限和输入再执行。"
+
+
+def _public_tool_input_preview(tool_input: dict[str, Any]) -> dict[str, Any]:
+    preview: dict[str, Any] = {}
+    for key, value in tool_input.items():
+        if isinstance(value, str):
+            preview[str(key)] = value[:240]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            preview[str(key)] = value
+    return preview
+
+
+def _runtime_input_preview_summary(input_preview: dict[str, Any]) -> str:
+    query = str(input_preview.get("query") or "").strip()
+    if query:
+        return f"准备使用关键词：{query}。"
+    keys = "、".join(str(key) for key in input_preview.keys())
+    return f"准备使用工具输入字段：{keys}。" if keys else "准备调用工具。"
+
+
+def _runtime_result_summary_metadata(result_payload: Any) -> dict[str, Any]:
+    if not isinstance(result_payload, dict):
+        return {}
+    nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    deeper = nested.get("result") if isinstance(nested.get("result"), dict) else {}
+    envelope = result_payload.get("result_envelope") if isinstance(result_payload.get("result_envelope"), dict) else None
+    if envelope is None and isinstance(nested.get("result_envelope"), dict):
+        envelope = nested.get("result_envelope")
+    if envelope is None and isinstance(deeper.get("result_envelope"), dict):
+        envelope = deeper.get("result_envelope")
+
+    result_items = _first_list(deeper.get("results"), nested.get("results"), result_payload.get("results"))
+    source_items = _first_list(deeper.get("sources"), nested.get("sources"), result_payload.get("sources"))
+    artifact_items = _first_list(
+        envelope.get("artifacts") if isinstance(envelope, dict) else None,
+        deeper.get("artifacts"),
+        nested.get("artifacts"),
+        result_payload.get("artifacts"),
+    )
+    evidence = _runtime_evidence_items(artifact_items or source_items)
+    domains = _runtime_source_domains(evidence, source_items)
+    summary: dict[str, Any] = {}
+    if result_items:
+        summary["result_count"] = len(result_items)
+    elif source_items:
+        summary["result_count"] = len(source_items)
+    if evidence:
+        summary["source_count"] = len(evidence)
+    elif source_items:
+        summary["source_count"] = len(source_items)
+    if domains:
+        summary["source_domains"] = domains[:8]
+    return summary
+
+
+def _first_list(*values: Any) -> list[Any]:
+    for value in values:
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _runtime_evidence_items(items: list[Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            url = item.strip()
+            title = "证据来源"
+        elif isinstance(item, dict):
+            url = str(item.get("url") or item.get("href") or "").strip()
+            title = str(item.get("title") or item.get("name") or item.get("source") or "证据来源").strip()
+        else:
+            continue
+        if not url and not title:
+            continue
+        payload: dict[str, Any] = {"title": title or "证据来源"}
+        if url:
+            payload["url"] = url
+        evidence.append(payload)
+    return evidence
+
+
+def _runtime_source_domains(evidence: list[dict[str, Any]], source_items: list[Any]) -> list[str]:
+    domains: list[str] = []
+    for item in evidence:
+        url = str(item.get("url") or "").strip()
+        domain = urlparse(url).netloc.lower().removeprefix("www.") if url else ""
+        if domain and domain not in domains:
+            domains.append(domain)
+    for item in source_items:
+        if isinstance(item, dict):
+            domain = str(item.get("domain") or item.get("source_domain") or "").strip().lower()
+            if domain and domain not in domains:
+                domains.append(domain)
+    return domains
+
+
+def _runtime_result_summary_text(result_summary: dict[str, Any]) -> str:
+    parts: list[str] = []
+    result_count = result_summary.get("result_count")
+    source_count = result_summary.get("source_count")
+    domains = result_summary.get("source_domains") if isinstance(result_summary.get("source_domains"), list) else []
+    if isinstance(result_count, int):
+        parts.append(f"找到 {result_count} 条结果")
+    if isinstance(source_count, int):
+        parts.append(f"整理出 {source_count} 条来源")
+    if domains:
+        parts.append("来源包括 " + "、".join(str(domain) for domain in domains[:3]))
+    return "，".join(parts) + "。" if parts else "工具结果已完成，暂无可展示的来源摘要。"
 
 
 def _realtime_tool_finished_summary(
@@ -2286,7 +3052,73 @@ def _emit_loop_reflection_retry_event(
         summary=summary,
         reflection=reflection,
         suggested_input_patch=retry_input,
+        step_index=trace_entry.iteration,
     )
+
+
+def _emit_loop_observation_events(
+    dependencies: AgentGraphDependencies,
+    *,
+    state: AgentState,
+    requested_tool_name: str,
+    tool_input: dict[str, Any],
+    trace_entry: LoopAgentTraceEntry,
+) -> None:
+    metadata = trace_entry.metadata if isinstance(trace_entry.metadata, dict) else {}
+    reflection = metadata.get("reflection") if isinstance(metadata.get("reflection"), dict) else None
+    if isinstance(reflection, dict):
+        _emit_runtime_tool_event(
+            dependencies,
+            "reflection_evaluation",
+            state=state,
+            command=AgentRunCommand(
+                session_id=state.session_id,
+                user_message=state.user_message,
+                requested_tool_name=requested_tool_name,
+                source_type="agent_chat",
+                tool_input=tool_input,
+            ),
+            tool_input=tool_input,
+            tool_call_id=trace_entry.tool_call_id,
+            status=str(reflection.get("next_action") or "observed"),
+            summary=str(reflection.get("reason") or "主 agent 已评估这次工具结果。"),
+            reflection=reflection,
+            step_index=trace_entry.iteration,
+        )
+    result_summary = metadata.get("result_observation") if isinstance(metadata.get("result_observation"), dict) else None
+    evidence = _runtime_evidence_from_result_summary(result_summary)
+    if evidence:
+        _emit_runtime_tool_event(
+            dependencies,
+            "evidence_selected",
+            state=state,
+            command=AgentRunCommand(
+                session_id=state.session_id,
+                user_message=state.user_message,
+                requested_tool_name=requested_tool_name,
+                source_type="agent_chat",
+                tool_input=tool_input,
+            ),
+            tool_input=tool_input,
+            tool_call_id=trace_entry.tool_call_id,
+            status="succeeded",
+            summary=_runtime_evidence_summary(evidence),
+            evidence=evidence,
+            step_index=trace_entry.iteration,
+        )
+
+
+def _runtime_evidence_from_result_summary(result_summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    evidence = result_summary.get("evidence") if isinstance(result_summary, dict) else None
+    if not isinstance(evidence, list):
+        return []
+    return [dict(item) for item in evidence if isinstance(item, dict)]
+
+
+def _runtime_evidence_summary(evidence: list[dict[str, Any]]) -> str:
+    titles = [str(item.get("title") or "证据来源").strip() for item in evidence[:3]]
+    titles = [title for title in titles if title]
+    return f"已选择 {len(evidence)} 条证据：" + "、".join(titles) + "。" if titles else f"已选择 {len(evidence)} 条证据。"
 
 
 def _agent_runtime_result_metadata(result: StandardAgentResult, *, executor_id: str) -> dict[str, Any]:
@@ -2903,6 +3735,49 @@ def _tool_result_error(result_payload: Any) -> str:
     return "Agent tool returned ok=false without a detailed error."
 
 
+def _tool_failure_result_payload(
+    tool_name: str,
+    *,
+    error: str,
+    error_code: str,
+    retryable: bool,
+    next_action: str,
+    state: AgentState,
+    definition: AgentToolDefinition | None,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "ok": False,
+        "error": error,
+        "error_code": error_code,
+        "retryable": retryable,
+        "next_action": next_action,
+        "result": dict(result or {}),
+    }
+    envelope = build_tool_result_envelope(
+        capability=tool_name,
+        status="failed",
+        executor=TOOL_REGISTRY_EXECUTOR_ID,
+        risk_level=_tool_result_risk_level(state=state, definition=definition),
+        result_payload=payload,
+        source_type=state.source_type,
+    )
+    return {**payload, "result_envelope": envelope.to_dict()}
+
+
+def _tool_result_risk_level(*, state: AgentState, definition: AgentToolDefinition | None) -> str:
+    if definition is not None:
+        risk_level = getattr(definition, "risk_level", None)
+        risk_value = getattr(risk_level, "value", risk_level)
+        if risk_value:
+            return str(risk_value)
+    context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
+    if isinstance(context_pack, dict) and context_pack.get("risk_level"):
+        return str(context_pack["risk_level"])
+    return "low"
+
+
 def _with_result_envelope(tool_name: str, result_payload: Any, *, state: AgentState) -> Any:
     if not isinstance(result_payload, dict) or "result_envelope" in result_payload:
         return result_payload
@@ -2933,7 +3808,7 @@ def _generate_final_response(state: AgentState, *, dependencies: AgentGraphDepen
             return completion.content, "llm_tool_result_summary"
         except Exception:
             pass
-    tool_response = tool_result_summary_response(state)
+    tool_response = tool_result_summary_response(state, dependencies=dependencies)
     if tool_response is not None:
         return tool_response
     if dependencies.llm_client is None:
@@ -2942,11 +3817,21 @@ def _generate_final_response(state: AgentState, *, dependencies: AgentGraphDepen
     return completion.content, "llm"
 
 
-def tool_result_summary_response(state: AgentState) -> tuple[str, str] | None:
+def tool_result_summary_response(
+    state: AgentState,
+    *,
+    dependencies: AgentGraphDependencies | None = None,
+) -> tuple[str, str] | None:
     if state.requested_tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         payload = _latest_tool_result_payload(state, LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL)
         if payload is None:
             return None
+        fallback_response = _company_database_specific_query_fallback_response(state, payload, dependencies=dependencies)
+        if fallback_response is not None:
+            return fallback_response, "tool_result_summary_fallback"
+        insufficient_response = _company_database_specific_query_insufficient_response(state, payload)
+        if insufficient_response is not None:
+            return insufficient_response, "tool_result_summary_insufficient"
         return _company_database_overview_summary_response(payload), "tool_result_summary"
     if state.requested_tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
         payload = _latest_tool_result_payload(state, LOCAL_JOB_SOURCE_OVERVIEW_TOOL)
@@ -3190,6 +4075,321 @@ def _company_database_overview_summary_response(payload: dict[str, Any]) -> str:
         response += f" 样例：{samples}。"
     response += " 后续分析和推荐可以基于这些本地企业、岗位线索和校招来源继续做。"
     return response
+
+
+def _company_database_specific_query_fallback_response(
+    state: AgentState,
+    payload: dict[str, Any],
+    *,
+    dependencies: AgentGraphDependencies | None,
+) -> str | None:
+    targets = _specific_company_query_names_from_state(state)
+    if not targets or dependencies is None or dependencies.db_session is None:
+        return None
+    details = _local_company_specific_details(dependencies.db_session, targets)
+    if not details.get("has_any_detail"):
+        return None
+    return _company_specific_details_response(targets, details)
+
+
+def _local_company_specific_details(session: Session, targets: list[str]) -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from app.domains.jobs.models import Company, Job, JobLead, RecruitingSignal
+
+    exact_details = _local_company_specific_details_with_match_mode(
+        session,
+        targets,
+        Company=Company,
+        Job=Job,
+        JobLead=JobLead,
+        RecruitingSignal=RecruitingSignal,
+        select=select,
+        exact=True,
+    )
+    if exact_details.get("has_any_detail"):
+        return exact_details
+    return _local_company_specific_details_with_match_mode(
+        session,
+        targets,
+        Company=Company,
+        Job=Job,
+        JobLead=JobLead,
+        RecruitingSignal=RecruitingSignal,
+        select=select,
+        exact=False,
+    )
+
+
+def _local_company_specific_details_with_match_mode(
+    session: Session,
+    targets: list[str],
+    *,
+    Company: Any,
+    Job: Any,
+    JobLead: Any,
+    RecruitingSignal: Any,
+    select: Any,
+    exact: bool,
+) -> dict[str, Any]:
+    company_filter = _company_target_filter(Company.name, targets, exact=exact)
+    lead_filter = _company_target_filter(JobLead.company_name, targets, exact=exact)
+    signal_filter = _company_target_filter(RecruitingSignal.company_name, targets, exact=exact)
+
+    companies = list(session.scalars(select(Company).where(company_filter).order_by(Company.name.asc()).limit(5)))
+    jobs = list(
+        session.scalars(
+            select(Job)
+            .join(Company, Job.company_id == Company.id)
+            .where(company_filter)
+            .order_by(Job.updated_at.desc())
+            .limit(5)
+        )
+    )
+    leads = list(session.scalars(select(JobLead).where(lead_filter).order_by(JobLead.updated_at.desc()).limit(5)))
+    signals = list(
+        session.scalars(
+            select(RecruitingSignal).where(signal_filter).order_by(RecruitingSignal.updated_at.desc()).limit(5)
+        )
+    )
+    return {
+        "companies": companies,
+        "jobs": jobs,
+        "leads": leads,
+        "signals": signals,
+        "has_any_detail": bool(companies or jobs or leads or signals),
+    }
+
+
+def _company_target_filter(column: Any, targets: list[str], *, exact: bool) -> Any:
+    from sqlalchemy import or_
+
+    conditions = []
+    for target in targets:
+        cleaned = str(target or "").strip()
+        if cleaned:
+            conditions.append(column.ilike(cleaned if exact else f"%{cleaned}%"))
+    return or_(*conditions) if conditions else column == "__no_company_target__"
+
+
+def _company_specific_details_response(targets: list[str], details: dict[str, Any]) -> str:
+    target_text = "、".join(targets)
+    companies = details.get("companies") if isinstance(details.get("companies"), list) else []
+    jobs = details.get("jobs") if isinstance(details.get("jobs"), list) else []
+    leads = details.get("leads") if isinstance(details.get("leads"), list) else []
+    signals = details.get("signals") if isinstance(details.get("signals"), list) else []
+
+    lines = [f"我查了本地已有来源中关于 {target_text} 的信息："]
+    lines.append(_formal_company_profile_line(companies))
+    lines.append(_formal_jobs_line(jobs))
+    lines.append(_job_leads_line(leads))
+    lines.append(_recruiting_signals_line(signals))
+    lines.append("说明：这些是本地已有记录，不等于完整企业档案；如果要补齐公司业务、官网岗位和最新进展，还需要继续联网核对。")
+    return "\n".join(line for line in lines if line)
+
+
+def _formal_company_profile_line(companies: list[Any]) -> str:
+    if not companies:
+        return "- 正式企业档案：未找到。"
+    samples = []
+    for company in companies[:3]:
+        parts = [_object_text(company, "name")]
+        industry = _object_text(company, "industry")
+        city = _object_text(company, "city")
+        website = _object_text(company, "website_url")
+        if industry:
+            parts.append(f"行业：{industry}")
+        if city:
+            parts.append(f"城市：{city}")
+        if website:
+            parts.append(f"官网：{website}")
+        samples.append("；".join(part for part in parts if part))
+    return f"- 正式企业档案：找到 {len(companies)} 条，" + "；".join(samples) + "。"
+
+
+def _formal_jobs_line(jobs: list[Any]) -> str:
+    if not jobs:
+        return "- 正式岗位：未找到。"
+    samples = []
+    for job in jobs[:3]:
+        title = _object_text(job, "title") or "未命名岗位"
+        city = _object_text(job, "city")
+        job_type = _object_text(job, "job_type")
+        source_url = _object_text(job, "source_url")
+        parts = [title]
+        if job_type:
+            parts.append(job_type)
+        if city:
+            parts.append(f"城市：{city}")
+        if source_url:
+            parts.append(f"链接：{source_url}")
+        samples.append("（" + "；".join(parts[1:]) + "）" if len(parts) > 1 else title)
+        if len(parts) > 1:
+            samples[-1] = f"{title}{samples[-1]}"
+    return f"- 正式岗位 {len(jobs)} 条：" + "；".join(samples) + "。"
+
+
+def _job_leads_line(leads: list[Any]) -> str:
+    if not leads:
+        return "- 岗位线索：未找到。"
+    samples = []
+    for lead in leads[:3]:
+        title = _object_text(lead, "title") or "未命名线索"
+        parts = []
+        for label, attr in (("类型", "job_type"), ("届别", "graduation_year"), ("城市", "city"), ("方向", "job_direction")):
+            value = _object_text(lead, attr)
+            if value:
+                parts.append(f"{label}：{value}")
+        status = _object_value_text(getattr(lead, "verification_status", None))
+        if status:
+            parts.append(f"状态：{status}")
+        source_name = _object_text(getattr(lead, "source", None), "name")
+        if source_name:
+            parts.append(f"来源：{_job_source_display_name(source_name)}")
+        source_url = _object_text(lead, "source_url") or _object_text(lead, "apply_url") or _object_text(lead, "verified_url")
+        if source_url:
+            parts.append(f"链接：{source_url}")
+        samples.append(f"{title}（" + "；".join(parts) + "）" if parts else title)
+    return f"- 岗位线索 {len(leads)} 条：" + "；".join(samples) + "。"
+
+
+def _recruiting_signals_line(signals: list[Any]) -> str:
+    if not signals:
+        return "- 校招来源：未找到。"
+    samples = []
+    for signal in signals[:3]:
+        signal_type = _object_value_text(getattr(signal, "signal_type", None)) or "招聘信号"
+        parts = []
+        graduation_year = _object_text(signal, "graduation_year")
+        if graduation_year:
+            parts.append(f"届别：{graduation_year}")
+        original_source = _object_text(signal, "original_source")
+        if original_source:
+            parts.append(f"原始来源：{original_source}")
+        trust_level = _object_value_text(getattr(signal, "trust_level", None))
+        if trust_level:
+            parts.append(f"可信度：{trust_level}")
+        status = _object_value_text(getattr(signal, "status", None))
+        if status:
+            parts.append(f"状态：{status}")
+        source_url = _object_text(signal, "source_url")
+        if source_url:
+            parts.append(f"链接：{source_url}")
+        samples.append(f"{signal_type}（" + "；".join(parts) + "）" if parts else signal_type)
+    return f"- 校招来源 {len(signals)} 条：" + "；".join(samples) + "。"
+
+
+def _object_text(obj: Any, attr: str) -> str:
+    if obj is None:
+        return ""
+    return str(getattr(obj, attr, "") or "").strip()
+
+
+def _object_value_text(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip()
+
+
+def _company_database_specific_query_insufficient_response(state: AgentState, payload: dict[str, Any]) -> str | None:
+    targets = _specific_company_query_names_from_state(state)
+    if not targets:
+        return None
+    matched_names = _matching_company_overview_names(payload, targets)
+    target_text = "、".join(targets)
+    if matched_names:
+        matched_text = "、".join(matched_names)
+        return (
+            f"我理解你要查的是 {target_text} 这家公司，不是全库概览。"
+            f"当前这次工具只返回了企业库概览，只能确认概览数据里出现了 {matched_text}，"
+            "但没有提供它的专属企业档案、岗位详情或来源明细，所以我不能把全库概览当成答案。"
+            "需要继续查岗位线索、校招来源或公开信息后，再给你汇总。"
+        )
+    return (
+        f"我理解你要查的是 {target_text} 这家公司，不是全库概览。"
+        "当前这次工具只返回了企业库概览，没有提供目标公司的专属信息，"
+        "所以我不能把全库概览当成答案。需要继续查其他本地来源或公开信息后，再给你汇总。"
+    )
+
+
+def _specific_company_query_names_from_state(state: AgentState) -> list[str]:
+    names = _expected_company_names_from_state(state)
+    names.extend(_specific_company_query_names_from_user_message(state.user_message))
+    return _dedupe_company_names(names)
+
+
+def _specific_company_query_names_from_user_message(message: str) -> list[str]:
+    text = str(message or "").strip()
+    if not text:
+        return []
+    patterns = (
+        r"关于(?P<name>[\w\u4e00-\u9fff·.&（）()\- ]{1,40}?)(?:这个|这家)?(?:公司|企业)",
+        r"(?:查一下|看一下|看看|了解一下|检索)(?P<name>[\w\u4e00-\u9fff·.&（）()\- ]{1,40}?)(?:这个|这家)?(?:公司|企业)",
+        r"(?P<name>[\w\u4e00-\u9fff·.&（）()\- ]{1,40}?)(?:这个|这家)?(?:公司|企业)(?:的信息|资料|有什么|有哪些)",
+    )
+    names: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            name = _clean_specific_company_query_name(match.group("name"))
+            if name:
+                names.append(name)
+    return _dedupe_company_names(names)
+
+
+def _clean_specific_company_query_name(name: Any) -> str:
+    cleaned = str(name or "").strip(" ：:，,。！？?！ 的")
+    cleaned = re.sub(r"^(?:你给我|帮我|请|一下|看一下|查一下|看看|了解一下)", "", cleaned).strip()
+    cleaned = re.sub(r"^(?:数据库中|数据库里|本地数据库中|本地数据库里|本地库中|本地库里|公司库中|企业库中|关于)", "", cleaned).strip()
+    cleaned = cleaned.strip(" ：:，,。！？?！ 的")
+    if not cleaned:
+        return ""
+    generic_terms = {"数据库", "本地数据库", "公司库", "企业库", "公司", "企业", "哪些", "多少", "信息"}
+    return "" if cleaned in generic_terms else cleaned
+
+
+def _dedupe_company_names(names: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        cleaned = _clean_specific_company_query_name(name)
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            deduped.append(cleaned)
+            seen.add(key)
+    return deduped
+
+
+def _matching_company_overview_names(payload: dict[str, Any], targets: list[str]) -> list[str]:
+    target_keys = [target.casefold() for target in targets if target]
+    if not target_keys:
+        return []
+    result = _company_database_payload_result(payload)
+    candidate_names: list[str] = []
+    for key in ("sample_companies", "sample_lead_companies", "sample_signal_companies"):
+        values = result.get(key)
+        if isinstance(values, list):
+            candidate_names.extend(str(value).strip() for value in values if str(value).strip())
+    rows = result.get("company_rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                name = str(row.get("company_name") or "").strip()
+                if name:
+                    candidate_names.append(name)
+    matches: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidate_names:
+        candidate_key = candidate.casefold()
+        if any(target_key in candidate_key or candidate_key in target_key for target_key in target_keys):
+            if candidate_key not in seen:
+                matches.append(candidate)
+                seen.add(candidate_key)
+    return matches
+
+
+def _company_database_payload_result(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    result = tool_result.get("result") if isinstance(tool_result.get("result"), dict) else {}
+    return result if isinstance(result, dict) else {}
 
 
 def _company_database_rows_markdown_table(result: dict[str, Any]) -> str:

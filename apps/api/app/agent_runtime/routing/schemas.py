@@ -47,6 +47,13 @@ class ResultEnvelope:
     requires_user_action: bool = False
     risk_level: str = "low"
     raw_result: dict[str, Any] = field(default_factory=dict)
+    error_code: str | None = None
+    retryable: bool | None = None
+    next_action: str | None = None
+    business_refs: list[dict[str, Any]] = field(default_factory=list)
+    source_type: str | None = None
+    tool_call_log_id: str | None = None
+    step_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,4 +66,11 @@ class ResultEnvelope:
             "requires_user_action": self.requires_user_action,
             "risk_level": self.risk_level,
             "raw_result": dict(self.raw_result),
+            "error_code": self.error_code,
+            "retryable": self.retryable,
+            "next_action": self.next_action,
+            "business_refs": [dict(item) for item in self.business_refs],
+            "source_type": self.source_type,
+            "tool_call_log_id": self.tool_call_log_id,
+            "step_id": self.step_id,
         }

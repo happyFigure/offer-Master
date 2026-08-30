@@ -17,6 +17,27 @@ _PROTOCOL_LINE_RE = re.compile(
 _ASSISTANT_LABEL_RE = re.compile(r"^\s*(?:\*\*)?OfferMaster\s+AI(?:\*\*)?\s*[:：]?$", re.IGNORECASE)
 _INTERNAL_TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _REMOVED_MARKER = "__OFFERMASTER_INTERNAL_PROTOCOL_REMOVED__"
+_FALSE_TOOL_EXECUTION_CLAIM_RE = re.compile(
+    r"(?i)(?:我|本轮|这轮|系统|主\s*agent|agent)?\s*"
+    r"(?:已经|已)\s*(?:调用|使用|执行|运行)(?:了)?\s*"
+    r"(?:联网搜索|网页搜索|公开搜索|工具|能力|external\.web_search|filesystem\.[a-z0-9_]+|[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)"
+)
+_FALSE_TOOL_EXECUTION_CLAIM_PREFIXES = (
+    "我已",
+    "我已经",
+    "本轮已",
+    "本轮已经",
+    "这轮已",
+    "这轮已经",
+    "系统已",
+    "系统已经",
+    "主agent已",
+    "主agent已经",
+    "agent已",
+    "agent已经",
+    "已经",
+    "已",
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +95,21 @@ def sanitize_agent_final_answer(content: str) -> SanitizedOutput:
         needs_regeneration=removed_internal_protocol and not final_content,
         removed_fragments=tuple(fragment for fragment in removed if fragment),
     )
+
+
+def contains_false_tool_execution_claim(content: str) -> bool:
+    return _FALSE_TOOL_EXECUTION_CLAIM_RE.search(str(content or "")) is not None
+
+
+def could_be_false_tool_execution_claim_prefix(content: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(content or "").replace("\r\n", "\n").lstrip()).lower()
+    if not normalized:
+        return True
+    return any(prefix.lower().startswith(normalized) for prefix in _FALSE_TOOL_EXECUTION_CLAIM_PREFIXES)
+
+
+def false_tool_execution_claim_fallback_response() -> str:
+    return "本轮没有真实工具执行记录，所以不能声称已经调用了工具。请重新发送问题，我会重新进入工具链真实执行。"
 
 
 def _looks_like_internal_protocol_line(line: str) -> bool:

@@ -11,7 +11,23 @@ class AgentToolRegistryTest(TestCase):
         self.assertEqual(
             [
                 "applications.find_apply_entry",
+                "database.company_profile",
+                "database.company_search",
+                "database.company_update",
+                "database.job_lead_delete",
+                "database.job_search",
+                "database.source_search",
                 "external.web_search",
+                "filesystem.copy_file",
+                "filesystem.delete_path",
+                "filesystem.list_dir",
+                "filesystem.make_dir",
+                "filesystem.move_file",
+                "filesystem.path_exists",
+                "filesystem.path_stat",
+                "filesystem.read_file",
+                "filesystem.replace_text",
+                "filesystem.write_text",
                 "local.company_database_overview",
                 "local.job_source_overview",
                 "memory_get",
@@ -27,7 +43,12 @@ class AgentToolRegistryTest(TestCase):
         )
         self.assertTrue(all(definition.input_schema for definition in definitions))
         self.assertTrue(all(definition.output_schema for definition in definitions))
-        self.assertTrue(all(not definition.requires_confirmation for definition in definitions))
+        self.assertFalse(registry.get("database.company_search").requires_confirmation)
+        self.assertFalse(registry.get("database.company_profile").requires_confirmation)
+        self.assertFalse(registry.get("database.job_search").requires_confirmation)
+        self.assertFalse(registry.get("database.source_search").requires_confirmation)
+        self.assertTrue(registry.get("database.company_update").requires_confirmation)
+        self.assertTrue(registry.get("database.job_lead_delete").requires_confirmation)
 
     def test_external_web_search_normalizes_cristiano_ronaldo_alias_before_executor(self) -> None:
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, create_external_web_search_agent_tool_definitions
@@ -203,6 +224,334 @@ class AgentToolRegistryTest(TestCase):
             ],
             result["result"]["company_rows"],
         )
+
+    def test_database_company_search_tool_checks_multiple_local_tables(self) -> None:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_SEARCH_TOOL, create_database_agent_tool_definitions
+        from app.db.base import Base
+        import app.domains.agent_memory.models  # noqa: F401
+        import app.domains.applications.models  # noqa: F401
+        import app.domains.automation.models  # noqa: F401
+        import app.domains.conversations.models  # noqa: F401
+        from app.domains.jobs.models import (
+            Company,
+            Job,
+            JobLead,
+            JobLeadStatus,
+            JobSource,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+            RecruitingSignal,
+            RecruitingSignalType,
+        )
+
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+        try:
+            with Session() as session:
+                source = JobSource(
+                    name="本地校招来源",
+                    source_type=JobSourceType.OFFICIAL_API,
+                    entry_url="https://example.com/jobs",
+                    trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                    fetch_mode=JobSourceFetchMode.OFFICIAL_API,
+                )
+                tencent = Company(name="腾讯", normalized_name="tencent", website_url="https://careers.tencent.com")
+                session.add_all(
+                    [
+                        source,
+                        tencent,
+                        Job(
+                            company=tencent,
+                            title="AI Agent 平台后端开发",
+                            source="manual",
+                            source_job_id="job-db-search-1",
+                            source_url="https://careers.tencent.com/job/1",
+                            skills=["Python", "FastAPI"],
+                        ),
+                        JobLead(
+                            source=source,
+                            lead_hash="lead-db-search-1",
+                            company_name="京东",
+                            title="京东 2027 校招岗位聚合",
+                            source_url="https://campus.jd.com",
+                            skills=["Java"],
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                            verification_status=JobLeadStatus.VERIFIED,
+                        ),
+                        RecruitingSignal(
+                            source=source,
+                            signal_hash="signal-db-search-1",
+                            company_name="字节跳动",
+                            normalized_company_name="bytedance",
+                            signal_type=RecruitingSignalType.CAMPUS_RECRUITMENT_OPEN,
+                            source_url="https://jobs.bytedance.com/campus",
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                        ),
+                    ]
+                )
+                session.commit()
+
+                definitions = {definition.name: definition for definition in create_database_agent_tool_definitions()}
+                result = definitions[DATABASE_COMPANY_SEARCH_TOOL].handler(
+                    session,
+                    company_names=["腾讯", "京东", "字节", "美团"],
+                    limit=5,
+                )
+        finally:
+            engine.dispose()
+
+        self.assertTrue(result["ok"])
+        rows = {item["query_name"]: item for item in result["result"]["companies"]}
+        self.assertTrue(rows["腾讯"]["exists"])
+        self.assertTrue(rows["京东"]["exists"])
+        self.assertTrue(rows["字节"]["exists"])
+        self.assertFalse(rows["美团"]["exists"])
+        self.assertEqual(1, rows["腾讯"]["formal_company_count"])
+        self.assertEqual(1, rows["腾讯"]["job_count"])
+        self.assertEqual(1, rows["京东"]["job_lead_count"])
+        self.assertEqual(1, rows["字节"]["recruiting_signal_count"])
+        self.assertIn("正式企业表", {item["source"] for item in rows["腾讯"]["evidence"]})
+        self.assertIn("岗位线索表", {item["source"] for item in rows["京东"]["evidence"]})
+        self.assertIn("招聘信号表", {item["source"] for item in rows["字节"]["evidence"]})
+
+    def test_database_company_profile_tool_returns_joined_company_context(self) -> None:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_PROFILE_TOOL, create_database_agent_tool_definitions
+        from app.db.base import Base
+        import app.domains.agent_memory.models  # noqa: F401
+        import app.domains.applications.models  # noqa: F401
+        import app.domains.automation.models  # noqa: F401
+        import app.domains.conversations.models  # noqa: F401
+        from app.domains.jobs.models import (
+            JobLead,
+            JobLeadStatus,
+            JobSource,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+            RecruitingSignal,
+            RecruitingSignalStatus,
+            RecruitingSignalType,
+        )
+
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+        try:
+            with Session() as session:
+                source = JobSource(
+                    name="OfferIO 公司聚合岗位库",
+                    source_type=JobSourceType.OFFICIAL_API,
+                    entry_url="https://offerio.work/jobs",
+                    trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                    fetch_mode=JobSourceFetchMode.OFFICIAL_API,
+                )
+                session.add_all(
+                    [
+                        source,
+                        JobLead(
+                            source=source,
+                            lead_hash="lead-db-profile-1",
+                            company_name="京东",
+                            title="京东 2027 校招岗位聚合",
+                            source_url="https://campus.jd.com",
+                            skills=["Java", "后端"],
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                            verification_status=JobLeadStatus.VERIFIED,
+                        ),
+                        RecruitingSignal(
+                            source=source,
+                            signal_hash="signal-db-profile-1",
+                            company_name="京东",
+                            normalized_company_name="jd",
+                            signal_type=RecruitingSignalType.CAMPUS_RECRUITMENT_OPEN,
+                            graduation_year="2027",
+                            source_url="https://campus.jd.com",
+                            status=RecruitingSignalStatus.NEEDS_JOB_ENRICHMENT,
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                        ),
+                    ]
+                )
+                session.commit()
+
+                definitions = {definition.name: definition for definition in create_database_agent_tool_definitions()}
+                result = definitions[DATABASE_COMPANY_PROFILE_TOOL].handler(session, company_name="京东", limit=5)
+        finally:
+            engine.dispose()
+
+        self.assertTrue(result["ok"])
+        profile = result["result"]
+        self.assertEqual("京东", profile["company_name"])
+        self.assertTrue(profile["exists"])
+        self.assertEqual(0, len(profile["formal_companies"]))
+        self.assertEqual("京东 2027 校招岗位聚合", profile["job_leads"][0]["title"])
+        self.assertEqual("OfferIO 公司聚合岗位库", profile["job_leads"][0]["source_name"])
+        self.assertEqual("2027", profile["recruiting_signals"][0]["graduation_year"])
+
+    def test_database_job_and_source_search_tools_return_filtered_rows(self) -> None:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.agent_runtime.tool_registry import (
+            DATABASE_JOB_SEARCH_TOOL,
+            DATABASE_SOURCE_SEARCH_TOOL,
+            create_database_agent_tool_definitions,
+        )
+        from app.db.base import Base
+        import app.domains.agent_memory.models  # noqa: F401
+        import app.domains.applications.models  # noqa: F401
+        import app.domains.automation.models  # noqa: F401
+        import app.domains.conversations.models  # noqa: F401
+        from app.domains.jobs.models import Company, Job, JobSource, JobSourceFetchMode, JobSourceTrustLevel, JobSourceType
+
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+        try:
+            with Session() as session:
+                source = JobSource(
+                    name="腾讯官方招聘",
+                    source_type=JobSourceType.OFFICIAL_CAREER_SITE,
+                    entry_url="https://careers.tencent.com",
+                    trust_level=JobSourceTrustLevel.HIGH,
+                    fetch_mode=JobSourceFetchMode.PUBLIC_HTML,
+                )
+                company = Company(name="腾讯", normalized_name="tencent")
+                session.add_all(
+                    [
+                        source,
+                        company,
+                        Job(
+                            company=company,
+                            title="Python 后端开发",
+                            city="深圳",
+                            source="manual",
+                            source_job_id="job-db-search-2",
+                            job_type="校招",
+                            skills=["Python"],
+                        ),
+                        Job(
+                            company=company,
+                            title="Java 后端开发",
+                            city="杭州",
+                            source="manual",
+                            source_job_id="job-db-search-3",
+                            job_type="社招",
+                            skills=["Java"],
+                        ),
+                    ]
+                )
+                session.commit()
+
+                definitions = {definition.name: definition for definition in create_database_agent_tool_definitions()}
+                job_result = definitions[DATABASE_JOB_SEARCH_TOOL].handler(
+                    session,
+                    company_name="腾讯",
+                    keyword="Python",
+                    city="深圳",
+                    limit=5,
+                )
+                source_result = definitions[DATABASE_SOURCE_SEARCH_TOOL].handler(
+                    session,
+                    keyword="腾讯",
+                    enabled=True,
+                    limit=5,
+                )
+        finally:
+            engine.dispose()
+
+        self.assertTrue(job_result["ok"])
+        self.assertEqual(1, job_result["result"]["count"])
+        self.assertEqual("Python 后端开发", job_result["result"]["jobs"][0]["title"])
+        self.assertTrue(source_result["ok"])
+        self.assertEqual(1, source_result["result"]["count"])
+        self.assertEqual("腾讯官方招聘", source_result["result"]["sources"][0]["name"])
+        self.assertEqual(0, source_result["result"]["sources"][0]["job_lead_count"])
+
+    def test_database_mutation_tools_update_company_and_soft_delete_lead(self) -> None:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.agent_runtime.tool_registry import (
+            DATABASE_COMPANY_UPDATE_TOOL,
+            DATABASE_JOB_LEAD_DELETE_TOOL,
+            create_database_agent_tool_definitions,
+        )
+        from app.db.base import Base
+        import app.domains.agent_memory.models  # noqa: F401
+        import app.domains.applications.models  # noqa: F401
+        import app.domains.automation.models  # noqa: F401
+        import app.domains.conversations.models  # noqa: F401
+        from app.domains.jobs.models import (
+            Company,
+            JobLead,
+            JobLeadStatus,
+            JobSource,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+        )
+
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+        try:
+            with Session() as session:
+                source = JobSource(
+                    name="待处理来源",
+                    source_type=JobSourceType.MANUAL_CLIP,
+                    trust_level=JobSourceTrustLevel.MEDIUM,
+                    fetch_mode=JobSourceFetchMode.MANUAL_CLIP,
+                )
+                company = Company(name="旧公司名", normalized_name="old-company")
+                lead = JobLead(
+                    source=source,
+                    lead_hash="lead-db-mutation-1",
+                    company_name="旧公司名",
+                    title="待确认岗位",
+                    trust_level=JobSourceTrustLevel.MEDIUM,
+                    verification_status=JobLeadStatus.UNVERIFIED,
+                )
+                session.add_all([source, company, lead])
+                session.commit()
+
+                definitions = {definition.name: definition for definition in create_database_agent_tool_definitions()}
+                update_result = definitions[DATABASE_COMPANY_UPDATE_TOOL].handler(
+                    session,
+                    company_name="旧公司名",
+                    name="新公司名",
+                    industry="人工智能",
+                )
+                delete_result = definitions[DATABASE_JOB_LEAD_DELETE_TOOL].handler(
+                    session,
+                    lead_id=lead.id,
+                    reason="来源已失效",
+                )
+                session.commit()
+                session.refresh(company)
+                session.refresh(lead)
+        finally:
+            engine.dispose()
+
+        self.assertTrue(update_result["ok"])
+        self.assertEqual("新公司名", update_result["result"]["company"]["name"])
+        self.assertEqual({"name", "industry"}, set(update_result["result"]["updated_fields"]))
+        self.assertTrue(delete_result["ok"])
+        self.assertTrue(delete_result["result"]["deleted"])
+        self.assertEqual("soft", delete_result["result"]["deletion_mode"])
+        self.assertEqual(JobLeadStatus.INVALID.value, delete_result["result"]["verification_status"])
+        self.assertIn("来源已失效", lead.verification_notes)
 
     def test_local_company_database_summary_renders_company_rows_as_markdown_table(self) -> None:
         from app.agent_runtime.graph_factory import _company_database_overview_summary_response
@@ -413,7 +762,7 @@ class AgentToolRegistryTest(TestCase):
                 }
                 result = definitions[APPLICATION_FIND_APPLY_ENTRY_TOOL].handler(
                     session,
-                    task_id="task-dispatch-from-tool-1",
+                    task_id="job-dispatch-from-tool-1",
                     trace_id="trace-dispatch-from-tool-1",
                     job_id="job-lead-1",
                     company_name="Tencent",
@@ -425,7 +774,7 @@ class AgentToolRegistryTest(TestCase):
         finally:
             engine.dispose()
 
-        self.assertEqual(["task-dispatch-from-tool-1"], dispatched)
+        self.assertEqual(["job-dispatch-from-tool-1"], dispatched)
         self.assertEqual("external_agent_completed", result["result"]["next_action"])
         self.assertEqual("claude-sdk-agent", result["result"]["dispatch"]["executor_name"])
         self.assertEqual("https://careers.tencent.com/apply/1", result["result"]["dispatch"]["apply_url"])

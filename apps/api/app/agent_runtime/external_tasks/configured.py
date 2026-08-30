@@ -8,13 +8,18 @@ from sqlalchemy.orm import Session
 from app.agent_runtime.agent_as_tool import AbilityAgent, build_agent_runtime_bundle
 from app.agent_runtime.external_tasks.dispatcher import ExternalTaskDispatcher
 from app.agent_runtime.external_tasks.executors import (
+    BailianWebSearchExecutor,
     ClaudeSdkAgentExecutor,
     ClaudeSdkHttpExecutorAdapter,
     ClaudeSdkHttpExecutorConfig,
+    OpenAISdkAgentConfig,
+    OpenAISdkAgentExecutor,
+    OpenAISdkResumeClientAdapter,
     _run_http_web_search,
 )
 from app.agent_runtime.external_tasks.repository import SqlAlchemyExternalAgentTaskRepository
 from app.core.config import Settings
+from app.infrastructure.llm.client import build_llm_runtime_config
 
 
 ExternalTaskDispatcherCallback = Callable[[Session, str], dict[str, Any]]
@@ -43,6 +48,15 @@ def build_external_task_dispatcher_callback(settings: Settings) -> ExternalTaskD
 def build_external_web_search_callback(settings: Settings) -> ExternalWebSearchCallback | None:
     if not settings.external_agent_auto_dispatch:
         return None
+    provider = str(getattr(settings, "external_web_search_provider", "auto") or "auto").strip().lower()
+    if provider == "bailian":
+        adapter = BailianWebSearchExecutor(config=build_llm_runtime_config(settings))
+
+        def search_with_bailian(query: str, max_results: int = 5) -> dict[str, Any]:
+            return adapter.execute_web_search(query, max_results=max_results)
+
+        return search_with_bailian
+
     base_url = str(settings.claude_sdk_agent_base_url or "").strip()
     if base_url:
         config = _build_claude_sdk_http_executor_config(settings, base_url=base_url)
@@ -62,12 +76,27 @@ def build_external_web_search_callback(settings: Settings) -> ExternalWebSearchC
 def build_agent_runtime_executor_bundle(settings: Settings) -> tuple[dict[str, AbilityAgent], dict[str, str]]:
     if not settings.external_agent_auto_dispatch:
         return {}, {}
-    base_url = str(settings.claude_sdk_agent_base_url or "").strip()
-    if not base_url:
+    agents: list[Any] = []
+
+    openai_api_key = _openai_sdk_agent_api_key(settings)
+    if settings.openai_sdk_agent_enabled and openai_api_key:
+        agents.append(
+            OpenAISdkAgentExecutor(
+                OpenAISdkResumeClientAdapter(config=_build_openai_sdk_agent_config(settings))
+            )
+        )
+
+    provider = str(getattr(settings, "external_web_search_provider", "auto") or "auto").strip().lower()
+    if provider != "bailian":
+        base_url = str(settings.claude_sdk_agent_base_url or "").strip()
+        if base_url:
+            config = _build_claude_sdk_http_executor_config(settings, base_url=base_url)
+            agents.append(ClaudeSdkAgentExecutor(ClaudeSdkHttpExecutorAdapter(config=config)))
+
+    if not agents:
         return {}, {}
 
-    config = _build_claude_sdk_http_executor_config(settings, base_url=base_url)
-    bundle = build_agent_runtime_bundle([ClaudeSdkAgentExecutor(ClaudeSdkHttpExecutorAdapter(config=config))])
+    bundle = build_agent_runtime_bundle(agents)
     return bundle.executors, bundle.capability_executor_ids
 
 
@@ -86,6 +115,26 @@ def _build_claude_sdk_http_executor_config(settings: Settings, *, base_url: str)
         provider_base_url=_anthropic_messages_base_url(settings.llm_base_url),
         provider_api_key=provider_api_key,
     )
+
+
+def _build_openai_sdk_agent_config(settings: Settings) -> OpenAISdkAgentConfig:
+    return OpenAISdkAgentConfig(
+        base_url=str(settings.openai_sdk_agent_base_url or settings.llm_base_url or "").strip().rstrip("/") or None,
+        model=str(settings.openai_sdk_agent_model or settings.llm_model or "").strip(),
+        api_key=_openai_sdk_agent_api_key(settings) or None,
+        timeout_seconds=settings.openai_sdk_agent_timeout_seconds,
+    )
+
+
+def _openai_sdk_agent_api_key(settings: Settings) -> str:
+    dedicated_key = (
+        settings.openai_sdk_agent_api_key.get_secret_value().strip()
+        if settings.openai_sdk_agent_api_key is not None
+        else ""
+    )
+    if dedicated_key:
+        return dedicated_key
+    return settings.llm_api_key.get_secret_value().strip() if settings.llm_api_key is not None else ""
 
 
 def _anthropic_messages_base_url(base_url: str) -> str | None:

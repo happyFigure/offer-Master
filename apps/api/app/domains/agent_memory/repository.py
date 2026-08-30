@@ -11,6 +11,7 @@ from app.domains.agent_memory.models import (
     AgentLearningCandidate,
     AgentLearningCandidateStatus,
     AgentMemory,
+    AgentMemoryStatus,
     AgentSkill,
     AgentSkillStatus,
     AgentSkillUsage,
@@ -25,6 +26,45 @@ class AgentMemoryRepository:
         return self._session.get(AgentMemory, memory_id)
 
     def add_memory(self, memory: AgentMemory) -> AgentMemory:
+        self._session.add(memory)
+        self._session.flush()
+        return memory
+
+    def list_memories(
+        self,
+        *,
+        scope: str | None = None,
+        status: AgentMemoryStatus | None = None,
+        limit: int = 100,
+    ) -> list[AgentMemory]:
+        statement = select(AgentMemory).order_by(
+            AgentMemory.importance.desc(),
+            AgentMemory.updated_at.desc(),
+            AgentMemory.id.desc(),
+        )
+        if scope is not None:
+            statement = statement.where(AgentMemory.scope == scope)
+        if status is not None:
+            statement = statement.where(AgentMemory.status == status)
+        return list(self._session.scalars(statement.limit(limit)).all())
+
+    def find_active_memory_by_key(self, normalized_key: str) -> AgentMemory | None:
+        for memory in self.list_memories(status=AgentMemoryStatus.ACTIVE, limit=1000):
+            metadata_key = (memory.metadata_json or {}).get("normalized_key")
+            if metadata_key == normalized_key:
+                return memory
+            fallback_key = ":".join(
+                [
+                    _normalize_key_part(memory.memory_type),
+                    _normalize_key_part(memory.scope),
+                    _normalize_key_part(memory.title).rstrip("。.!！?？"),
+                ]
+            )
+            if fallback_key == normalized_key:
+                return memory
+        return None
+
+    def update_memory(self, memory: AgentMemory) -> AgentMemory:
         self._session.add(memory)
         self._session.flush()
         return memory
@@ -131,3 +171,7 @@ class AgentMemoryRepository:
 
     def flush(self) -> None:
         self._session.flush()
+
+
+def _normalize_key_part(value: str) -> str:
+    return " ".join(str(value).split()).casefold()

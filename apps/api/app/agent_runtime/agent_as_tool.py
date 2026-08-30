@@ -6,10 +6,18 @@ import time
 from typing import Any, Protocol
 
 from app.agent_runtime.reflection.schemas import CapabilityResultEvaluationSpec, result_evaluation_spec_for_capability
+from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 
 
 TOOL_REGISTRY_EXECUTOR_ID = "agent_tool_registry"
 CLAUDE_SDK_AGENT_EXECUTOR_ID = "claude-sdk-agent"
+OPENAI_SDK_AGENT_EXECUTOR_ID = "openai-sdk-agent"
+
+
+_SPECIALIZED_RESULT_ENVELOPE_CAPABILITIES = {
+    "external.web_search",
+    "applications.find_apply_entry",
+}
 
 
 DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY: dict[str, tuple[str, ...]] = {
@@ -18,6 +26,7 @@ DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY: dict[str, tuple[str, ...]] = {
     "local.job_source_overview": ("local_job_source_overview",),
     "offerio.sync_company_jobs": ("offerio_company_jobs_sync",),
     "applications.find_apply_entry": ("application_entry_discovery",),
+    "resume.tailor": ("resume_tailoring",),
     "memory_search": ("memory_lookup",),
     "sessions_search": ("memory_lookup",),
     "sessions_history": ("memory_lookup",),
@@ -753,18 +762,18 @@ def _result_envelope_from_standard_result(
     specialized = _specialized_result_envelope(result, definition=definition, raw_payload=raw_payload)
     if specialized is not None:
         return specialized
-    observations = [result.observation] if result.observation else []
-    return {
-        "status": result.status,
-        "capability": definition.capability_id,
-        "executor": definition.executor_id,
-        "summary": result.summary,
-        "artifacts": [dict(item) for item in result.evidence if isinstance(item, dict)],
-        "observations": observations,
-        "requires_user_action": result.requires_user_action,
-        "risk_level": definition.risk_level,
-        "raw_result": raw_payload,
-    }
+    return build_tool_result_envelope(
+        capability=definition.capability_id,
+        status=result.status,
+        executor=definition.executor_id,
+        risk_level=definition.risk_level,
+        result_payload=raw_payload,
+        summary=result.summary,
+        artifacts=[dict(item) for item in result.evidence if isinstance(item, dict)],
+        observations=[result.observation] if result.observation else [],
+        requires_user_action=result.requires_user_action,
+        raw_result=raw_payload,
+    ).to_dict()
 
 
 def _specialized_result_envelope(
@@ -773,6 +782,8 @@ def _specialized_result_envelope(
     definition: AgentCapabilityDefinition,
     raw_payload: dict[str, Any],
 ) -> dict[str, Any] | None:
+    if definition.capability_id not in _SPECIALIZED_RESULT_ENVELOPE_CAPABILITIES:
+        return None
     try:
         from app.agent_runtime.routing.result_envelope import build_result_envelope
 
@@ -867,6 +878,7 @@ __all__ = [
     "CLAUDE_SDK_AGENT_EXECUTOR_ID",
     "CapabilityDeclaringAgent",
     "DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY",
+    "OPENAI_SDK_AGENT_EXECUTOR_ID",
     "StandardAgentResult",
     "TOOL_REGISTRY_EXECUTOR_ID",
     "ToolRegistryAgentExecutor",

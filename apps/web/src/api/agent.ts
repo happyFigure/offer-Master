@@ -10,6 +10,7 @@ import type {
   AgentSessionUpdateInput,
   AgentStreamOuterSessionEvent,
   AgentStreamToolEvent,
+  AgentTaskPlan,
   AgentUserMessageInput,
 } from "../types/agent";
 
@@ -70,10 +71,15 @@ export async function sendAgentMessage(sessionId: string, input: AgentUserMessag
   });
 }
 
+export async function getAgentTaskPlan(taskId: string): Promise<AgentTaskPlan> {
+  return apiRequest<AgentTaskPlan>(`/api/v1/agent/tasks/${taskId}/plan`);
+}
+
 export async function approveAgentApproval(approvalRequestId: string, input: AgentApprovalDecisionInput = {}): Promise<AgentApprovalDecisionResponse> {
   return apiRequest<AgentApprovalDecisionResponse>(`/api/v1/agent/approvals/${approvalRequestId}/approve`, {
     method: "POST",
     body: JSON.stringify(input),
+    timeoutMs: 120_000,
   });
 }
 
@@ -81,6 +87,7 @@ export async function rejectAgentApproval(approvalRequestId: string, input: Agen
   return apiRequest<AgentApprovalDecisionResponse>(`/api/v1/agent/approvals/${approvalRequestId}/reject`, {
     method: "POST",
     body: JSON.stringify(input),
+    timeoutMs: 120_000,
   });
 }
 

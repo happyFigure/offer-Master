@@ -124,9 +124,20 @@ class AgentSkillRepository:
         return self._repository.list_skills(status=status, limit=limit)
 
     def ensure_builtin_content_source_skills(self) -> list[AgentSkill]:
+        return self._ensure_builtin_skill_paths(_builtin_content_source_skill_paths())
+
+    def ensure_builtin_skills(self) -> list[AgentSkill]:
+        return self._ensure_builtin_skill_paths(
+            [
+                *_builtin_content_source_skill_paths(),
+                *_builtin_database_skill_paths(),
+            ]
+        )
+
+    def _ensure_builtin_skill_paths(self, source_paths: list[Path]) -> list[AgentSkill]:
         imported: list[AgentSkill] = []
         parser = SkillPackageParser()
-        for source_path in _builtin_content_source_skill_paths():
+        for source_path in source_paths:
             if not source_path.is_dir():
                 continue
             package = parser.parse(source_path)
@@ -296,6 +307,10 @@ def _builtin_content_source_skill_paths() -> list[Path]:
         root / "wechat-article-content-fetch",
         root / "xiaohongshu-content-fetch",
     ]
+
+
+def _builtin_database_skill_paths() -> list[Path]:
+    return [_default_skill_root() / "builtin-database" / "database-operations"]
 
 
 def _resolve_skill_file(source_path: Path) -> Path:

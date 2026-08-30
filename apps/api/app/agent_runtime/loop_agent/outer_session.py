@@ -205,6 +205,8 @@ class OuterSessionLoopController:
         current = self._store.get(session_id)
         if current is not None and current.status == OuterSessionStatus.WAITING_USER:
             return current
+        if current is not None and _non_empty(task_id) and current.active_task_id == _non_empty(task_id):
+            return current
         return OuterSessionState(
             session_id=session_id,
             active_task_id=_non_empty(task_id) or f"outer-task-{uuid4()}",

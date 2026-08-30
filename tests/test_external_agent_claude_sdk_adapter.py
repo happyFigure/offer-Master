@@ -280,6 +280,67 @@ class ClaudeSdkHttpExecutorAdapterTest(unittest.TestCase):
         self.assertEqual([("Cristiano Ronaldo last match", 3)], fallback_calls)
         self.assertEqual("http-web-search-fallback", result["executor_name"])
 
+    def test_bailian_web_search_executor_uses_dashscope_search_info_sources(self):
+        from app.agent_runtime.external_tasks.executors import BailianWebSearchExecutor
+        from app.infrastructure.llm.client import LLMRuntimeConfig
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["headers"] = dict(request.headers)
+            captured["payload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "output": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "梅西最近一场比赛来自搜索结果[ref_1]。",
+                                }
+                            }
+                        ],
+                        "search_info": {
+                            "search_results": [
+                                {
+                                    "index": 1,
+                                    "site_name": "ESPN",
+                                    "title": "Lionel Messi Match Log",
+                                    "url": "https://example.com/messi-match",
+                                }
+                            ]
+                        },
+                    }
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = LLMRuntimeConfig(
+            provider="bailian",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key="sk-bailian",
+            model="qwen-plus",
+            timeout_seconds=5.0,
+            max_retries=0,
+        )
+
+        result = BailianWebSearchExecutor(config=config, client=client).execute_web_search("梅西最近比赛", max_results=4)
+
+        self.assertEqual("https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation", captured["url"])
+        self.assertEqual("Bearer sk-bailian", captured["headers"].get("authorization"))
+        self.assertTrue(captured["payload"]["parameters"]["enable_search"])
+        self.assertTrue(captured["payload"]["parameters"]["search_options"]["forced_search"])
+        self.assertTrue(captured["payload"]["parameters"]["search_options"]["enable_source"])
+        self.assertEqual("qwen-plus", captured["payload"]["model"])
+        self.assertEqual("bailian-enable-search", result["executor_name"])
+        self.assertEqual(["https://example.com/messi-match"], result["sources"])
+        self.assertEqual(
+            [{"type": "url", "title": "ESPN - Lionel Messi Match Log", "url": "https://example.com/messi-match"}],
+            result["artifacts"],
+        )
+
     def test_bing_search_parser_extracts_result_cards(self):
         from app.agent_runtime.external_tasks.executors import _parse_bing_results
 

@@ -40,12 +40,15 @@ class LLMChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMChatCompletion:
         payload = {
             "model": self._config.model,
             "temperature": 0.2,
             "messages": _normalize_messages(messages),
         }
+        if extra_body:
+            payload.update(extra_body)
         if tools:
             payload["tools"] = tools
         if tool_choice is not None:

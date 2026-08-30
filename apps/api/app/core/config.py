@@ -75,6 +75,10 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="JOBPILOT_EXTERNAL_AGENT_AUTO_DISPATCH",
     )
+    external_web_search_provider: str = Field(
+        default="auto",
+        validation_alias="JOBPILOT_EXTERNAL_WEB_SEARCH_PROVIDER",
+    )
     claude_sdk_agent_base_url: str | None = Field(
         default=None,
         validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_BASE_URL",
@@ -90,6 +94,26 @@ class Settings(BaseSettings):
     claude_sdk_agent_timeout_seconds: float = Field(
         default=300.0,
         validation_alias="JOBPILOT_CLAUDE_SDK_AGENT_TIMEOUT_SECONDS",
+    )
+    openai_sdk_agent_enabled: bool = Field(
+        default=False,
+        validation_alias="JOBPILOT_OPENAI_SDK_AGENT_ENABLED",
+    )
+    openai_sdk_agent_base_url: str | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_OPENAI_SDK_AGENT_BASE_URL",
+    )
+    openai_sdk_agent_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_OPENAI_SDK_AGENT_API_KEY",
+    )
+    openai_sdk_agent_model: str | None = Field(
+        default=None,
+        validation_alias="JOBPILOT_OPENAI_SDK_AGENT_MODEL",
+    )
+    openai_sdk_agent_timeout_seconds: float = Field(
+        default=120.0,
+        validation_alias="JOBPILOT_OPENAI_SDK_AGENT_TIMEOUT_SECONDS",
     )
     speech_provider: str = Field(
         default="web_speech",
@@ -156,6 +180,7 @@ class Settings(BaseSettings):
         "intent_llm_base_url",
         "xiaohongshu_mcp_base_url",
         "claude_sdk_agent_base_url",
+        "openai_sdk_agent_base_url",
         mode="after",
     )
     @classmethod

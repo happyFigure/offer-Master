@@ -232,6 +232,101 @@ class AgentToolPermissionPolicyTest(TestCase):
                 self.assertEqual("allow_low_risk_runtime_capability", result.artifacts["skill_permission_decision"])
                 self.assertEqual("skill-wechat", result.artifacts["skill_id"])
 
+    def test_database_mutation_tools_require_explicit_confirmation(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_registry import (
+            DATABASE_COMPANY_UPDATE_TOOL,
+            DATABASE_JOB_LEAD_DELETE_TOOL,
+            create_default_agent_tool_registry,
+        )
+
+        registry = create_default_agent_tool_registry()
+        for tool_name in (DATABASE_COMPANY_UPDATE_TOOL, DATABASE_JOB_LEAD_DELETE_TOOL):
+            with self.subTest(tool_name=tool_name):
+                blocked = AgentToolRuntimeGuard().pre_check(
+                    AgentToolCallContext(stage="database_mutation", tool_name=tool_name, source_type="agent_chat"),
+                    registry=registry,
+                )
+                confirmed = AgentToolRuntimeGuard().pre_check(
+                    AgentToolCallContext(
+                        stage="database_mutation",
+                        tool_name=tool_name,
+                        source_type="agent_chat",
+                        user_confirmed=True,
+                    ),
+                    registry=registry,
+                )
+
+                self.assertFalse(blocked.ok)
+                self.assertEqual("TOOL_USER_CONFIRMATION_REQUIRED", blocked.error_code)
+                self.assertTrue(confirmed.ok)
+
+    def test_low_risk_resume_tailor_can_run_outside_skill_allowlist(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="resume.tailor",
+                    description="Generate revised resume text from user-provided resume content and a target JD.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.LOW,
+                    requires_confirmation=False,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+        policy = AgentToolPermissionPolicy.from_skill_metadata(
+            "skill-chat",
+            {"allowed_tools": ["external.web_search"]},
+        )
+
+        result = AgentToolRuntimeGuard().pre_check(
+            AgentToolCallContext(stage="resume", tool_name="resume.tailor", source_type="agent_chat"),
+            registry=registry,
+            skill_permission_policy=policy,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("allow_low_risk_runtime_capability", result.artifacts["skill_permission_decision"])
+        self.assertEqual("skill-chat", result.artifacts["skill_id"])
+
+    def test_medium_runtime_capability_without_confirmation_can_run_outside_unrelated_skill_allowlist(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
+        from app.agent_runtime.tool_registry import OFFERIO_COMPANY_JOBS_TOOL, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name=OFFERIO_COMPANY_JOBS_TOOL,
+                    description="Sync OfferIO company aggregated campus recruiting jobs into local job leads.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.MEDIUM,
+                    requires_confirmation=False,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+        policy = AgentToolPermissionPolicy.from_skill_metadata(
+            "skill-xiaohongshu",
+            {"allowed_tools": ["xiaohongshu-mcp.search_feeds"]},
+        )
+
+        result = AgentToolRuntimeGuard().pre_check(
+            AgentToolCallContext(stage="sync", tool_name=OFFERIO_COMPANY_JOBS_TOOL, source_type="agent_chat"),
+            registry=registry,
+            skill_permission_policy=policy,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("allow_low_risk_runtime_capability", result.artifacts["skill_permission_decision"])
+        self.assertEqual("skill-xiaohongshu", result.artifacts["skill_id"])
+
     def test_skill_permission_policy_round_trips_loaded_skill_snapshot(self) -> None:
         from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
 

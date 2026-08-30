@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
   BadgeCheck,
   Bot,
   BriefcaseBusiness,
@@ -10,6 +11,7 @@ import {
   CircleDot,
   Clock3,
   Copy,
+  Cpu,
   DatabaseZap,
   Download,
   ExternalLink,
@@ -32,11 +34,23 @@ import {
   Sparkles,
   Trash2,
   Workflow,
+  Wrench,
   X,
 } from "lucide-react";
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import { approveAgentApproval, createAgentSession, deleteAgentSession, getAgentMessages, listAgentSessions, rejectAgentApproval, streamAgentMessage, updateAgentSession } from "../api/agent";
+import {
+  approveAgentApproval,
+  createAgentSession,
+  deleteAgentSession,
+  getAgentMessages,
+  getAgentTaskPlan,
+  listAgentSessions,
+  rejectAgentApproval,
+  streamAgentMessage,
+  updateAgentSession,
+} from "../api/agent";
+import { getAgentRuntimePanel } from "../api/agentRuntime";
 import { archiveAgentSkill, importAgentSkill, listAgentSkills, pinAgentSkill } from "../api/agentSkills";
 import { createApplicationFromJob, listApplications, updateApplication } from "../api/applications";
 import { listOfferIOCompanies, listOfferIOCompanyOpenings, listOfferIOJobs } from "../api/jobBoard";
@@ -44,7 +58,18 @@ import { createJobSource, disableJobSource, listJobSources, syncJobSource, updat
 import { extractJobLeads, listJobLeads, verifyAndConvertJobLead, verifyJobLead } from "../api/jobLeads";
 import { listArticleCandidates } from "../api/recruitingSignals";
 import { importJobLeadsFromUrl, listDomainHealth, listDomainHealthByDomain, pollUrlImportRun, submitVisiblePageContent } from "../api/urlImport";
-import type { AgentApprovalRequiredPayload, AgentContextMetadata, AgentMessage, AgentSession, AgentStreamOuterSessionEvent, AgentStreamToolEvent } from "../types/agent";
+import { AsciiArt } from "../components/ui/n-ascii";
+import type {
+  AgentApprovalRequiredPayload,
+  AgentContextMetadata,
+  AgentMessage,
+  AgentSession,
+  AgentStreamOuterSessionEvent,
+  AgentStreamToolEvent,
+  AgentTaskPlan,
+  AgentTaskPlanStage,
+} from "../types/agent";
+import type { AgentRuntimeCapability, AgentRuntimeHealth, AgentRuntimeMember, AgentRuntimePanel } from "../types/agentRuntime";
 import type { AgentSkill, AgentSkillAvailabilityState, AgentSkillImportInput } from "../types/agentSkills";
 import type {
   ArticleCandidate,
@@ -67,7 +92,7 @@ import type {
   UrlImportInput,
 } from "../types/jobs";
 
-type PageId = "chat" | "skills" | "dashboard" | "sources" | "jobs" | "leads" | "pipeline" | "guardrails";
+type PageId = "chat" | "agents" | "skills" | "dashboard" | "sources" | "jobs" | "leads" | "pipeline" | "guardrails";
 type NoticeKind = "success" | "warning" | "danger" | "info";
 
 interface Notice {
@@ -149,6 +174,26 @@ interface ChatMessage {
 
 type ChatRuntimeEventKind = "outer_session" | "tool";
 type ChatRuntimeEventTone = "running" | "success" | "warning" | "danger" | "muted";
+type ChatRuntimeEventGroup = "reasoning" | "tooling" | "observation" | "evidence" | "status";
+type ChatRuntimeActorType = "main_model" | "sub_agent" | "local_tool" | "runtime" | "observation";
+
+interface RuntimeEvidenceItem {
+  title: string;
+  url?: string;
+}
+
+interface RuntimeActorInfo {
+  type: ChatRuntimeActorType;
+  label: string;
+  detail: string;
+}
+
+interface RuntimeActorVisual {
+  Icon: LucideIcon;
+  label: string;
+  caption: string;
+  className: string;
+}
 
 interface ChatRuntimeTimelineEvent {
   id: string;
@@ -161,6 +206,10 @@ interface ChatRuntimeTimelineEvent {
   stepIndex?: number | null;
   inputHint?: string | null;
   candidateNames?: string[];
+  inputPreview?: Record<string, unknown> | null;
+  resultSummary?: Record<string, unknown> | null;
+  reflection?: Record<string, unknown> | null;
+  evidence?: RuntimeEvidenceItem[];
   createdAt: number;
   tone: ChatRuntimeEventTone;
 }
@@ -172,6 +221,7 @@ interface SkillImportDraft {
 
 const NAV_ITEMS: Array<{ id: PageId; label: string; description: string; icon: LucideIcon }> = [
   { id: "chat", label: "AI 对话", description: "简历/岗位/面试问答", icon: Bot },
+  { id: "agents", label: "Agent 面板", description: "成员与能力注册", icon: Network },
   { id: "skills", label: "Skill 管理", description: "内容源能力与依赖", icon: Layers3 },
   { id: "dashboard", label: "总览", description: "同步态势与下一步", icon: Gauge },
   { id: "sources", label: "信息源", description: "高校/企业/社媒入口", icon: RadioTower },
@@ -276,18 +326,36 @@ const RUNTIME_TOOL_LABELS: Record<string, string> = {
   "local.job_source_overview": "岗位来源概览",
   "offerio.sync_company_jobs": "OfferIO 岗位同步",
   "applications.find_apply_entry": "申请入口发现",
+  "resume.tailor": "简历优化 Agent",
+  "filesystem.list_dir": "查看目录",
+  "filesystem.path_exists": "检查路径是否存在",
+  "filesystem.path_stat": "查看文件信息",
+  "filesystem.read_file": "读取文件",
+  "filesystem.write_text": "写入文件",
+  "filesystem.replace_text": "精确替换文本",
+  "filesystem.copy_file": "复制文件",
+  "filesystem.move_file": "移动/重命名文件",
+  "filesystem.delete_path": "删除文件",
+  "filesystem.make_dir": "创建目录",
   memory_search: "会话记忆检索",
 };
 
 const RUNTIME_EVENT_LABELS: Record<string, string> = {
   candidate_capabilities: "候选能力",
+  reasoning_summary: "思考摘要",
   task_started: "任务开始",
   turn_started: "开始思考",
   model_decision: "模型选择能力",
+  tool_input_preview: "工具输入",
   tool_started: "工具开始",
   tool_finished: "工具完成",
+  tool_result_summary: "结果摘要",
+  reflection_evaluation: "反思判断",
+  evidence_selected: "证据选择",
   turn_finished: "观察结果",
   tool_reflection_retry: "结果不足，准备重试",
+  textual_tool_call_recovered: "自动纠偏执行",
+  textual_tool_call_blocked: "疑似工具调用",
   observation_insufficient: "观察不足",
   waiting_user: "等待用户确认或补充",
   task_finished: "任务结束",
@@ -295,13 +363,20 @@ const RUNTIME_EVENT_LABELS: Record<string, string> = {
 
 const RUNTIME_EVENT_SUMMARIES: Record<string, (toolLabel: string) => string> = {
   candidate_capabilities: () => "主 agent 已把候选能力交给模型选择。",
+  reasoning_summary: () => "主 agent 已生成本轮安全思考摘要。",
   task_started: () => "主 agent 开始处理本轮任务。",
   turn_started: () => "主 agent 正在判断下一步该直接回答还是调用能力。",
   model_decision: (toolLabel) => `模型判断下一步要使用：${toolLabel}。`,
+  tool_input_preview: (toolLabel) => `准备传给 ${toolLabel} 的输入已整理。`,
   tool_started: (toolLabel) => `开始调用：${toolLabel}。`,
   tool_finished: (toolLabel) => `已观察到 ${toolLabel} 的执行结果。`,
+  tool_result_summary: (toolLabel) => `${toolLabel} 的结果已整理成可读摘要。`,
+  reflection_evaluation: () => "主 agent 已判断工具结果是否足够回答。",
+  evidence_selected: () => "主 agent 已选择本轮回答要引用的证据。",
   turn_finished: (toolLabel) => `主 agent 已读取 ${toolLabel} 的观察结果。`,
   tool_reflection_retry: () => "当前结果不够好，主 agent 准备调整输入后重试。",
+  textual_tool_call_recovered: () => "模型把工具调用写成了普通文字，运行时已转换为真实工具流程。",
+  textual_tool_call_blocked: () => "模型把工具调用写成了普通文字，运行时已拦截，没有当作真实工具执行。",
   observation_insufficient: () => "当前观察结果还不足以完成任务，需要继续补充信息。",
   waiting_user: () => "当前步骤需要用户确认或补充信息后才能继续。",
   task_finished: () => "本轮 agent loop 已结束。",
@@ -331,12 +406,105 @@ function ChatMessageContent({ content }: { content: string }) {
           <ChatTableCard key={`table-${index}`} table={block.table} />
         ) : block.text.trim() ? (
           <p className="chat-message-text" key={`text-${index}`}>
-            {block.text.trim()}
+            {renderInlineLinks(block.text.trim())}
           </p>
         ) : null,
       )}
     </div>
   );
+}
+
+function renderInlineLinks(text: string): ReactNode[] {
+  const markdownLinkPattern = /\[([^\]\n]+)]\((https?:\/\/[^\s)]+)\)/gi;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = markdownLinkPattern.exec(text))) {
+    const [raw, label, url] = match;
+    const matchStart = match.index;
+
+    if (matchStart > cursor) {
+      nodes.push(...renderBareLinks(text.slice(cursor, matchStart), `text-${cursor}`));
+    }
+
+    if (isSafeHttpUrl(url)) {
+      nodes.push(
+        <a className="chat-inline-link" href={url} key={`markdown-link-${matchStart}`} target="_blank" rel="noreferrer">
+          {label}
+        </a>,
+      );
+    } else {
+      nodes.push(raw);
+    }
+
+    cursor = matchStart + raw.length;
+  }
+
+  if (cursor < text.length) {
+    nodes.push(...renderBareLinks(text.slice(cursor), `text-${cursor}`));
+  }
+
+  return nodes.length ? nodes : [text];
+}
+
+function renderBareLinks(text: string, keyPrefix: string): ReactNode[] {
+  const bareUrlPattern = /https?:\/\/[^\s<>"'`]+/gi;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = bareUrlPattern.exec(text))) {
+    const rawUrl = match[0];
+    const matchStart = match.index;
+    const { url, trailingText } = splitTrailingUrlText(rawUrl);
+
+    if (!url || !isSafeHttpUrl(url)) {
+      continue;
+    }
+
+    if (matchStart > cursor) {
+      nodes.push(text.slice(cursor, matchStart));
+    }
+
+    nodes.push(
+      <a className="chat-inline-link" href={url} key={`${keyPrefix}-link-${matchStart}`} target="_blank" rel="noreferrer">
+        {url}
+      </a>,
+    );
+
+    if (trailingText) {
+      nodes.push(trailingText);
+    }
+
+    cursor = matchStart + rawUrl.length;
+  }
+
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor));
+  }
+
+  return nodes.length ? nodes : [text];
+}
+
+function splitTrailingUrlText(rawUrl: string): { url: string; trailingText: string } {
+  const trailingMatch = rawUrl.match(/[.,!?;:，。！？；：、)）\]]+$/);
+  if (!trailingMatch?.index) {
+    return { url: rawUrl, trailingText: "" };
+  }
+  return {
+    url: rawUrl.slice(0, trailingMatch.index),
+    trailingText: rawUrl.slice(trailingMatch.index),
+  };
+}
+
+function isSafeHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function ChatTableCard({ table }: { table: ParsedMarkdownTable }) {
@@ -417,9 +585,11 @@ function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
   const [agentSessions, setAgentSessions] = useState<AgentSession[]>([]);
   const [agentSession, setAgentSession] = useState<AgentSession | null>(null);
+  const [agentRuntimePanel, setAgentRuntimePanel] = useState<AgentRuntimePanel | null>(null);
   const [agentSkills, setAgentSkills] = useState<AgentSkill[]>([]);
   const [skillImportDraft, setSkillImportDraft] = useState<SkillImportDraft>(INITIAL_SKILL_IMPORT_DRAFT);
   const [chatContextMetadata, setChatContextMetadata] = useState<AgentContextMetadata | null>(null);
+  const [taskPlan, setTaskPlan] = useState<AgentTaskPlan | null>(null);
   const [pendingApproval, setPendingApproval] = useState<AgentApprovalRequiredPayload | null>(null);
   const [runtimeEvents, setRuntimeEvents] = useState<ChatRuntimeTimelineEvent[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
@@ -457,6 +627,22 @@ function App() {
     }));
   }, []);
 
+  const refreshActiveTaskPlan = useCallback(async (metadata: AgentContextMetadata | null): Promise<AgentTaskPlan | null> => {
+    const taskId = extractActiveTaskId(metadata);
+    if (!taskId) {
+      setTaskPlan(null);
+      return null;
+    }
+    try {
+      const plan = await getAgentTaskPlan(taskId);
+      setTaskPlan(plan);
+      return plan;
+    } catch {
+      setTaskPlan(null);
+      return null;
+    }
+  }, []);
+
   const loadAgentSession = useCallback(async (targetSessionId?: string) => {
     setChatLoading(true);
 
@@ -482,13 +668,18 @@ function App() {
       setChatContextMetadata(latestAssistantContext);
       setPendingApproval(null);
       setRuntimeEvents([]);
+      await refreshActiveTaskPlan(latestAssistantContext);
     } finally {
       setChatLoading(false);
     }
-  }, []);
+  }, [refreshActiveTaskPlan]);
 
   const refreshSkills = useCallback(async () => {
     setAgentSkills(await listAgentSkills("active", 120));
+  }, []);
+
+  const refreshAgentRuntimePanel = useCallback(async () => {
+    setAgentRuntimePanel(await getAgentRuntimePanel());
   }, []);
 
   const refreshApplications = useCallback(async () => {
@@ -553,6 +744,12 @@ function App() {
   }, [refreshSkills]);
 
   useEffect(() => {
+    refreshAgentRuntimePanel().catch((error: unknown) => {
+      setNotice({ kind: "warning", message: `Agent 面板暂未连接：${toDisplayError(error)}` });
+    });
+  }, [refreshAgentRuntimePanel]);
+
+  useEffect(() => {
     refreshApplications().catch((error: unknown) => {
       setNotice({ kind: "warning", message: `投递进度暂未连接：${toDisplayError(error)}` });
     });
@@ -588,6 +785,7 @@ function App() {
   const handleRefresh = () =>
     runAction("refresh", async () => {
       await refreshData(buildLeadFilters(leadFilters));
+      await refreshAgentRuntimePanel();
       await refreshSkills();
       await refreshApplications();
       await refreshJobBoard(jobBoardFilters);
@@ -988,9 +1186,11 @@ function App() {
       const messages = await getAgentMessages(session.id, 100);
       const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
       const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
+      const nextContextMetadata = result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null);
       setPendingApproval(null);
-      setChatContextMetadata(result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null));
+      setChatContextMetadata(nextContextMetadata);
       setChatMessages(toChatMessages(nextMessages));
+      await refreshActiveTaskPlan(nextContextMetadata);
       setAgentSession({
         ...session,
         message_count: Math.max(session.message_count, nextMessages.length),
@@ -1025,9 +1225,11 @@ function App() {
       const messages = await getAgentMessages(session.id, 100);
       const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
       const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
+      const nextContextMetadata = result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null);
       setPendingApproval(null);
-      setChatContextMetadata(result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null));
+      setChatContextMetadata(nextContextMetadata);
       setChatMessages(toChatMessages(nextMessages));
+      await refreshActiveTaskPlan(nextContextMetadata);
       setAgentSession({
         ...session,
         message_count: Math.max(session.message_count, nextMessages.length),
@@ -1062,6 +1264,7 @@ function App() {
       setPendingApproval(null);
       setChatDraft("");
       setRuntimeEvents([]);
+      setTaskPlan(null);
       setChatMessages((current) => [
         ...withoutWelcomeMessage(current),
         { id: tempUserId, role: "user", content, meta: "你" },
@@ -1146,7 +1349,11 @@ function App() {
           : nextChatMessages,
       );
       if (lastMessage?.role === "assistant") {
-        setChatContextMetadata(extractContextMetadata(lastMessage));
+        const nextContextMetadata = extractContextMetadata(lastMessage);
+        setChatContextMetadata(nextContextMetadata);
+        await refreshActiveTaskPlan(nextContextMetadata);
+      } else if (approvalRequiredPayload) {
+        await refreshActiveTaskPlan(approvalRequiredPayload.context_metadata);
       }
       return "AI 对话已流式回复并写入会话记忆。";
     });
@@ -1157,6 +1364,7 @@ function App() {
       <a className="skip-link" href="#main-content">
         跳到主内容
       </a>
+      <AsciiArt className="app-ascii-background" rows={48} density="compact" intensity={0.2} seedText="agent tool runtime" showHeader={false} aria-hidden="true" />
       <div className="app-shell">
         <aside className="sidebar glass-panel" aria-label="主导航">
           <div className="brand-block">
@@ -1234,11 +1442,13 @@ function App() {
                   contextMetadata={chatContextMetadata}
                   isLoading={chatLoading}
                   isWorking={workingAction === "agent-chat-send"}
+                  approvalWorking={workingAction?.startsWith("agent-approval-") ?? false}
                   messages={chatMessages}
                   pendingApproval={pendingApproval}
                   runtimeEvents={runtimeEvents}
                   session={agentSession}
                   sessions={agentSessions}
+                  taskPlan={taskPlan}
                   onDraftChange={setChatDraft}
                   onApprovePendingApproval={handleApprovePendingApproval}
                   onPromptSelect={setChatDraft}
@@ -1262,6 +1472,7 @@ function App() {
                   onPin={handlePinSkill}
                 />
               ) : null}
+              {activePage === "agents" ? <AgentRuntimePage panel={agentRuntimePanel} navigate={navigate} /> : null}
               {activePage === "dashboard" ? <DashboardPage summary={summary} sources={sources} leads={leads} navigate={navigate} /> : null}
               {activePage === "sources" ? (
                 <SourcesPage
@@ -1332,6 +1543,7 @@ function App() {
 }
 
 function ChatPage({
+  approvalWorking,
   draft,
   contextMetadata,
   isLoading,
@@ -1342,6 +1554,7 @@ function ChatPage({
   runtimeEvents,
   session,
   sessions,
+  taskPlan,
   onApprovePendingApproval,
   onCreateSession,
   onDeleteSession,
@@ -1352,6 +1565,7 @@ function ChatPage({
   onSelectSession,
   onSubmit,
 }: {
+  approvalWorking: boolean;
   draft: string;
   contextMetadata: AgentContextMetadata | null;
   isLoading: boolean;
@@ -1361,6 +1575,7 @@ function ChatPage({
   runtimeEvents: ChatRuntimeTimelineEvent[];
   session: AgentSession | null;
   sessions: AgentSession[];
+  taskPlan: AgentTaskPlan | null;
   navigate: (page: PageId) => void;
   onApprovePendingApproval: () => void;
   onCreateSession: () => void;
@@ -1493,7 +1708,8 @@ function ChatPage({
         {pendingApproval ? (
           <ToolApprovalCard
             approval={pendingApproval}
-            disabled={isWorking || isLoading}
+            approvalWorking={approvalWorking}
+            disabled={approvalWorking || isWorking || isLoading}
             onApprove={onApprovePendingApproval}
             onReject={onRejectPendingApproval}
           />
@@ -1528,6 +1744,7 @@ function ChatPage({
       </div>
 
       <aside className="glass-panel chat-side-panel">
+        <ChatTaskPlanPanel plan={taskPlan} isWorking={isWorking} />
         <ChatRuntimeTimeline events={runtimeEvents} isWorking={isWorking} />
         <button className="button button-ghost full-width" type="button" onClick={() => navigate("leads")}>
           <FileSearch size={16} />
@@ -1538,49 +1755,242 @@ function ChatPage({
   );
 }
 
+function ChatTaskPlanPanel({ plan, isWorking }: { plan: AgentTaskPlan | null; isWorking: boolean }) {
+  const stages = plan?.stages ?? [];
+  const currentStage = stages.find((stage) => stage.capability === plan?.current_stage_id) ?? null;
+
+  return (
+    <section className="chat-task-plan-panel" aria-label="阶段任务链">
+      <div className="task-plan-heading">
+        <div>
+          <p className="eyebrow">任务链</p>
+          <h4>阶段任务链</h4>
+        </div>
+        <span className={`runtime-status-pill ${isWorking ? "is-running" : stages.length ? "is-finished" : "is-idle"}`}>
+          {isWorking ? "运行中" : stages.length ? `${stages.length} 阶段` : "暂无"}
+        </span>
+      </div>
+
+      {plan?.user_goal ? <p className="task-plan-goal">{plan.user_goal}</p> : null}
+
+      {stages.length ? (
+        <ol className="task-plan-step-list">
+          {stages.map((stage) => (
+            <ChatTaskPlanStageCard isCurrent={stage.step_id === currentStage?.step_id} key={stage.step_id} stage={stage} />
+          ))}
+        </ol>
+      ) : (
+        <div className="task-plan-empty">
+          {isWorking ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Workflow size={15} aria-hidden="true" />}
+          <span>{isWorking ? "任务阶段正在生成，稍后会显示阶段链。" : "暂无阶段任务链，发送任务后会在这里展示。"}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ChatTaskPlanStageCard({ stage, isCurrent }: { stage: AgentTaskPlanStage; isCurrent: boolean }) {
+  const tone = taskPlanStageTone(stage.status);
+  const Icon = taskPlanStageIcon(stage.status);
+  const handoffSummary = taskPlanPayloadSummary(stage.handoff_payload);
+  const receivedSummary = taskPlanPayloadSummary(stage.received_context);
+  const toolNames = taskPlanToolNames(stage.handoff_payload ?? stage.received_context);
+  const allowedToolNames = stage.allowed_capabilities ?? [];
+  const strategyLabel = taskPlanStrategyLabel(stage.tool_strategy);
+  const rankingPolicy = stage.ranking_policy ?? [];
+
+  return (
+    <li className={`task-plan-step-card task-plan-step-${tone} ${isCurrent ? "is-current" : ""}`}>
+      <span className="task-plan-step-icon" aria-hidden="true">
+        <Icon size={14} />
+      </span>
+      <div className="task-plan-step-body">
+        <div className="task-plan-step-title-row">
+          <strong>{stage.title}</strong>
+          <span>{taskPlanStatusLabel(stage.status)}</span>
+        </div>
+        <p>{stage.objective}</p>
+        {stage.business_action ? <TaskPlanInfoBox label="业务动作" summary={stage.business_action} /> : null}
+        {allowedToolNames.length ? (
+          <div className="task-plan-strategy-box">
+            <b>可用工具</b>
+            <div className="task-plan-tool-tags" aria-label="阶段可用工具">
+              {allowedToolNames.map((toolName) => (
+                <span key={`${stage.step_id}-allowed-${toolName}`}>{formatRuntimeToolName(toolName)}</span>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {strategyLabel ? <TaskPlanInfoBox label="工具策略" summary={strategyLabel} /> : null}
+        {rankingPolicy.length ? (
+          <div className="task-plan-strategy-box">
+            <b>匹配排序规则</b>
+            <ul className="task-plan-ranking-list">
+              {rankingPolicy.slice(0, 4).map((item) => (
+                <li key={`${stage.step_id}-ranking-${item}`}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {toolNames.length ? (
+          <div className="task-plan-tool-tags" aria-label="阶段工具">
+            {toolNames.map((toolName) => (
+              <span key={`${stage.step_id}-${toolName}`}>{formatRuntimeToolName(toolName)}</span>
+            ))}
+          </div>
+        ) : null}
+        {receivedSummary ? <TaskPlanInfoBox label="收到上游信息" summary={receivedSummary} /> : null}
+        {handoffSummary ? <TaskPlanInfoBox label="阶段产物" summary={handoffSummary} /> : null}
+      </div>
+    </li>
+  );
+}
+
+function TaskPlanInfoBox({ label, summary }: { label: string; summary: string }) {
+  return (
+    <div className="task-plan-handoff-box">
+      <b>{label}</b>
+      <span>{summary}</span>
+    </div>
+  );
+}
+
 function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelineEvent[]; isWorking: boolean }) {
-  const visibleEvents = events.slice(-8);
+  const runtimeTimelineRef = useRef<HTMLElement | null>(null);
+  const shouldRuntimeTimelineStickToBottomRef = useRef(true);
+  const [runtimeFlowExpanded, setRuntimeFlowExpanded] = useState(false);
+  const visibleEvents = events.slice(-16);
+  const groupedEvents = runtimeEventGroups(visibleEvents);
+  const eventOrder = new Map(visibleEvents.map((event, index) => [event.id, index]));
   const latestEvent = visibleEvents[visibleEvents.length - 1] ?? null;
   const statusLabel = isWorking ? "运行中" : visibleEvents.length ? "已结束" : "待运行";
 
+  useLayoutEffect(() => {
+    if (isWorking && visibleEvents.length <= 1) {
+      shouldRuntimeTimelineStickToBottomRef.current = true;
+    }
+  }, [isWorking, visibleEvents.length]);
+
+  useLayoutEffect(() => {
+    if (!shouldRuntimeTimelineStickToBottomRef.current) {
+      return;
+    }
+
+    scrollElementToBottom(runtimeTimelineRef.current);
+  }, [visibleEvents.length, latestEvent?.id, isWorking]);
+
+  const handleRuntimeTimelineScroll = () => {
+    const element = runtimeTimelineRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldRuntimeTimelineStickToBottomRef.current = isScrollableElementNearBottom(element);
+  };
+
   return (
-    <section className="chat-runtime-timeline" aria-label="Agent 执行过程" aria-live="polite">
+    <section ref={runtimeTimelineRef} className="chat-runtime-timeline" aria-label="Agent 执行过程" aria-live="polite" onScroll={handleRuntimeTimelineScroll}>
       <div className="chat-runtime-heading">
         <div>
           <p className="eyebrow">执行过程</p>
           <h4>本轮执行过程</h4>
         </div>
-        <span className={`runtime-status-pill ${isWorking ? "is-running" : visibleEvents.length ? "is-finished" : "is-idle"}`}>{statusLabel}</span>
+        <div className="chat-runtime-heading-actions">
+          <button
+            type="button"
+            className="runtime-flow-toggle"
+            aria-expanded={runtimeFlowExpanded}
+            onClick={() => setRuntimeFlowExpanded((expanded) => !expanded)}
+          >
+            <Workflow size={14} aria-hidden="true" />
+            {runtimeFlowExpanded ? "收起流程图" : "展开流程图"}
+          </button>
+          <span className={`runtime-status-pill ${isWorking ? "is-running" : visibleEvents.length ? "is-finished" : "is-idle"}`}>{statusLabel}</span>
+        </div>
       </div>
+      <RuntimeFlowMap events={visibleEvents} />
+      {runtimeFlowExpanded ? <RuntimeExpandedFlowBoard events={visibleEvents} isWorking={isWorking} /> : null}
       {visibleEvents.length ? (
-        <ol className="runtime-event-list">
-          {visibleEvents.map((event) => {
-            const Icon = runtimeEventIcon(event);
-            return (
-              <li className={`runtime-event-item runtime-event-${event.tone}`} key={event.id}>
-                <span className="runtime-event-icon" aria-hidden="true">
-                  <Icon className={runtimeEventShouldSpin(event, latestEvent, isWorking) ? "spin-slow" : undefined} size={15} />
-                </span>
-                <div className="runtime-event-copy">
-                  <div className="runtime-event-title-row">
-                    <strong>{event.label}</strong>
-                    {event.toolName ? <code>{formatRuntimeToolName(event.toolName)}</code> : null}
-                    {event.stepIndex ? <span>第 {event.stepIndex} 步</span> : null}
-                  </div>
-                  <p>{formatRuntimeEventSummary(event)}</p>
-                  {event.inputHint ? <small>{event.inputHint}</small> : null}
-                  {event.candidateNames?.length ? (
-                    <div className="runtime-event-candidates" aria-label="候选能力">
-                      {event.candidateNames.map((candidate) => (
-                        <span key={candidate}>{candidate}</span>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              </li>
-            );
-          })}
-        </ol>
+        <div className="runtime-event-groups">
+          {groupedEvents.map((group) => (
+            <section className="runtime-event-group" key={group.group} aria-label={runtimeEventGroupTitle(group.group)}>
+              <div className="runtime-event-group-heading">
+                <h5>{runtimeEventGroupTitle(group.group)}</h5>
+                <span>{group.events.length} 项</span>
+              </div>
+              <ol className="runtime-event-list">
+                {group.events.map((event, groupEventIndex) => {
+                  const index = eventOrder.get(event.id) ?? groupEventIndex;
+                  const Icon = runtimeEventIcon(event);
+                  const details = runtimeEventDetails(event);
+                  const actor = runtimeEventActor(event);
+                  const chain = runtimeAgentChain(event, actor);
+                  const payloadPreview = runtimePayloadPreview(event);
+                  return (
+                    <li
+                      className={`runtime-event-item runtime-event-animated runtime-event-${event.tone}`}
+                      key={event.id}
+                      style={{ animationDelay: runtimeEventAnimationDelay(index) }}
+                    >
+                      <span className="runtime-event-icon" aria-hidden="true">
+                        <Icon className={runtimeEventShouldSpin(event, latestEvent, isWorking) ? "spin-slow" : undefined} size={15} />
+                      </span>
+                      <div className={`runtime-event-card ${runtimeActorEventCardClass(actor.type)}`}>
+                        <div className="runtime-event-card-head">
+                          <div className="runtime-event-title-row">
+                            <RuntimeActorBadge actor={actor} />
+                            <strong>{event.label}</strong>
+                            {event.toolName ? <code>{formatRuntimeToolName(event.toolName)}</code> : null}
+                          </div>
+                          <span className="runtime-event-state">{runtimeEventStateLabel(event)}</span>
+                        </div>
+                        <p>{formatRuntimeEventSummary(event)}</p>
+                        {chain.length ? <RuntimeAgentChain chain={chain} /> : null}
+                        <div className="runtime-event-meta-row">
+                          {event.stepIndex ? <span>第 {event.stepIndex} 步</span> : null}
+                          <span>{actor.detail}</span>
+                        </div>
+                        {event.inputHint ? <small>{event.inputHint}</small> : null}
+                        {details.length ? (
+                          <div className="runtime-event-detail-grid">
+                            {details.map((detail) => (
+                              <span key={`${event.id}-${detail.label}`}>
+                                <b>{detail.label}</b>
+                                {detail.value}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                        {payloadPreview ? <pre className="runtime-event-payload-preview">{payloadPreview}</pre> : null}
+                        {event.candidateNames?.length ? (
+                          <div className="runtime-event-candidates" aria-label="候选能力">
+                            {event.candidateNames.map((candidate) => (
+                              <span key={candidate}>{candidate}</span>
+                            ))}
+                          </div>
+                        ) : null}
+                        {event.evidence?.length ? (
+                          <div className="runtime-event-evidence" aria-label="证据来源">
+                            {event.evidence.map((item) =>
+                              item.url ? (
+                                <a href={item.url} key={`${item.title}-${item.url}`} rel="noreferrer" target="_blank">
+                                  <Link2 size={12} aria-hidden="true" />
+                                  {item.title}
+                                </a>
+                              ) : (
+                                <span key={item.title}>{item.title}</span>
+                              ),
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            </section>
+          ))}
+        </div>
       ) : (
         <div className="runtime-event-empty">
           {isWorking ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Activity size={15} aria-hidden="true" />}
@@ -1591,13 +2001,115 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
   );
 }
 
+function RuntimeFlowMap({ events }: { events: ChatRuntimeTimelineEvent[] }) {
+  const actorCounts = runtimeActorCounts(events);
+  const mainVisual = runtimeActorVisual("main_model");
+  const subAgentVisual = runtimeActorVisual("sub_agent");
+  const toolVisual = runtimeActorVisual("local_tool");
+  const returnVisual = runtimeActorVisual("observation");
+  return (
+    <div className="runtime-flow-map" aria-label="Agent 执行链路概览">
+      <RuntimeFlowNode visual={mainVisual} count={actorCounts.main_model + actorCounts.runtime} />
+      <ArrowRight size={14} aria-hidden="true" />
+      <RuntimeFlowNode visual={subAgentVisual} count={actorCounts.sub_agent} />
+      <ArrowRight size={14} aria-hidden="true" />
+      <RuntimeFlowNode visual={toolVisual} count={actorCounts.local_tool} />
+      <ArrowRight size={14} aria-hidden="true" />
+      <RuntimeFlowNode visual={returnVisual} count={actorCounts.observation} />
+    </div>
+  );
+}
+
+function RuntimeFlowNode({ visual, count }: { visual: RuntimeActorVisual; count: number }) {
+  const Icon = visual.Icon;
+  return (
+    <div className={`runtime-flow-node ${visual.className}`}>
+      <Icon size={15} aria-hidden="true" />
+      <span>{visual.label}</span>
+      <b>{count} 步</b>
+    </div>
+  );
+}
+
+function RuntimeExpandedFlowBoard({ events, isWorking }: { events: ChatRuntimeTimelineEvent[]; isWorking: boolean }) {
+  const flowEvents = events.length ? events : buildRuntimeEmptyFlowEvents(isWorking);
+
+  return (
+    <div className="runtime-flow-expanded-board" aria-label="横向 Agent 执行流程">
+      <ol className="runtime-flow-lane-list">
+        {flowEvents.map((event, index) => {
+          const actor = runtimeEventActor(event);
+          const visual = runtimeActorVisual(actor.type);
+          const Icon = visual.Icon;
+          const details = runtimeEventDetails(event).slice(0, 2);
+          const chain = runtimeAgentChain(event, actor);
+          return (
+            <li className={`runtime-flow-lane-card ${visual.className}`} key={`${event.id}-${index}`}>
+              <div className="runtime-flow-lane-topline">
+                <span className="runtime-flow-lane-icon" aria-hidden="true">
+                  <Icon size={15} />
+                </span>
+                <span className="runtime-flow-lane-step">{index + 1}</span>
+              </div>
+              <div className="runtime-flow-lane-body">
+                <b>{visual.label}</b>
+                <small>{visual.caption}</small>
+                <strong>{event.label}</strong>
+                <p>{formatRuntimeEventSummary(event)}</p>
+              </div>
+              {event.toolName ? <code>{formatRuntimeToolName(event.toolName)}</code> : null}
+              {chain.length ? <RuntimeAgentChain chain={chain} /> : null}
+              {details.length ? (
+                <div className="runtime-flow-lane-details">
+                  {details.map((detail) => (
+                    <span key={`${event.id}-lane-${detail.label}`}>
+                      <b>{detail.label}</b>
+                      {detail.value}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+function RuntimeActorBadge({ actor }: { actor: RuntimeActorInfo }) {
+  const visual = runtimeActorVisual(actor.type);
+  const Icon = visual.Icon;
+  return (
+    <span className={`runtime-actor-badge ${runtimeActorBadgeClass(actor.type)}`}>
+      <Icon size={12} aria-hidden="true" />
+      {actor.label}
+    </span>
+  );
+}
+
+function RuntimeAgentChain({ chain }: { chain: string[] }) {
+  return (
+    <div className="runtime-agent-chain" aria-label="执行链路">
+      {chain.map((item, index) => (
+        <span key={`${item}-${index}`}>
+          {index > 0 ? <ChevronRight size={12} aria-hidden="true" /> : null}
+          {item}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ToolApprovalCard({
   approval,
+  approvalWorking,
   disabled,
   onApprove,
   onReject,
 }: {
   approval: AgentApprovalRequiredPayload;
+  approvalWorking: boolean;
   disabled: boolean;
   onApprove: () => void;
   onReject: () => void;
@@ -1619,12 +2131,12 @@ function ToolApprovalCard({
       </div>
       <div className="tool-approval-actions">
         <button className="button button-ghost" type="button" onClick={onReject} disabled={disabled}>
-          <X size={16} />
-          拒绝
+          {approvalWorking ? <Loader2 className="spin" size={16} /> : <X size={16} />}
+          {approvalWorking ? "处理中" : "拒绝"}
         </button>
         <button className="button button-primary" type="button" onClick={onApprove} disabled={disabled}>
-          <CheckCircle2 size={16} />
-          确认执行
+          {approvalWorking ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}
+          {approvalWorking ? "正在执行" : "确认执行"}
         </button>
       </div>
     </section>
@@ -1649,139 +2161,303 @@ function SkillManagementPage({
   onPin: (skill: AgentSkill) => void;
 }) {
   const pinnedCount = skills.filter((skill) => skill.pinned).length;
-  const unavailableCount = skills.filter((skill) => getSkillAvailabilityState(skill) === "unavailable").length;
+  const needsAttentionCount = skills.filter((skill) => ["partial", "unavailable"].includes(getSkillAvailabilityState(skill))).length;
 
   return (
     <section className="skill-management-grid">
-      <Panel className="span-4 skill-import-panel" title="导入 Skill" eyebrow="Skill Registry">
-        <form className="form-stack" onSubmit={onImport}>
-          <p className="form-hint">把已经下载到本机的内容源 Skill 登记进平台，Agent 才能在对话和后续 Workflow 中按需加载。</p>
-          <label>
-            <span>本地 SKILL.md 或目录</span>
-            <input
-              value={draft.source_path}
-              onChange={(event) => onDraftChange({ ...draft, source_path: event.target.value })}
-              placeholder="F:/skills/xiaohongshu-recruiting/SKILL.md"
-            />
-          </label>
-          <label>
-            <span>分类</span>
-            <select value={draft.category} onChange={(event) => onDraftChange({ ...draft, category: event.target.value })}>
-              <option value="content_source">内容源解析</option>
-              <option value="job_discovery">岗位发现</option>
-              <option value="resume_delivery">简历投递</option>
-              <option value="tool_recovery">工具恢复经验</option>
-            </select>
-          </label>
-          <button className="button button-primary full-width" type="submit" disabled={workingAction === "agent-skill-import"}>
-            {workingAction === "agent-skill-import" ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-            导入 Skill
-          </button>
-        </form>
-      </Panel>
-
-      <Panel className="span-8" title="Skill 管理" eyebrow="Agent Capability Catalog">
-        <div className="skill-catalog-summary" aria-label="Skill 目录概览">
+      <Panel className="span-12 skill-list-panel" title="已接入能力" eyebrow="Skill 管理">
+        <div className="skill-list-toolbar">
+          <div className="skill-catalog-summary" aria-label="Skill 目录概览">
           <MetricRow label="已启用" value={`${skills.length} 个`} />
           <MetricRow label="已置顶" value={`${pinnedCount} 个`} />
-          <MetricRow label="缺少依赖" value={`${unavailableCount} 个`} />
+            <MetricRow label="需处理" value={`${needsAttentionCount} 个`} />
+          </div>
+          <details className="skill-import-drawer">
+            <summary>
+              <Plus size={16} />
+              导入新 Skill
+            </summary>
+            <form className="form-stack" onSubmit={onImport}>
+              <p className="form-hint">把本机的 Skill 登记进平台后，主 agent 才能在对话和工作流中按需加载它。</p>
+              <label>
+                <span>本地 Skill 文件或目录</span>
+                <input
+                  value={draft.source_path}
+                  onChange={(event) => onDraftChange({ ...draft, source_path: event.target.value })}
+                  placeholder="F:/skills/xiaohongshu-recruiting/SKILL.md"
+                />
+              </label>
+              <label>
+                <span>能力类型</span>
+                <select value={draft.category} onChange={(event) => onDraftChange({ ...draft, category: event.target.value })}>
+                  <option value="content_source">内容源解析</option>
+                  <option value="job_discovery">岗位发现</option>
+                  <option value="resume_delivery">简历投递</option>
+                  <option value="tool_recovery">工具恢复经验</option>
+                </select>
+              </label>
+              <button className="button button-primary full-width" type="submit" disabled={workingAction === "agent-skill-import"}>
+                {workingAction === "agent-skill-import" ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+                导入 Skill
+              </button>
+            </form>
+          </details>
         </div>
 
         {skills.length ? (
-          <div className="skill-card-grid">
-            {skills.map((skill) => {
-              const metadata = skill.metadata_json ?? {};
-              const sourceTypes = normalizeMetadataList(metadata.source_types);
-              const requiredTools = normalizeMetadataList(metadata.required_tools);
-              const availableRequiredTools = normalizeMetadataList(metadata.available_required_tools);
-              const missingRequiredTools = normalizeMetadataList(metadata.missing_required_tools);
-              const missingOptionalTools = normalizeMetadataList(metadata.missing_optional_tools);
-              const allowedTools = normalizeMetadataList(metadata.allowed_tools);
-              const askTools = normalizeMetadataList(metadata.ask_tools);
-              const disallowedTools = normalizeMetadataList(metadata.disallowed_tools);
-              const descriptionQualityScore = typeof metadata.description_quality_score === "number" ? metadata.description_quality_score : null;
-              const securityRiskLevel = typeof metadata.security_risk_level === "string" ? metadata.security_risk_level : "unknown";
-              const availability_state = getSkillAvailabilityState(skill);
-
-              return (
-                <article className="skill-card" key={skill.id}>
-                  <div className="skill-card-header">
-                    <div>
-                      <p className="eyebrow">{skill.category}</p>
-                      <h3>{skill.title}</h3>
-                      <span>{skill.name}</span>
-                    </div>
-                    <span className={`skill-status-chip skill-status-${availability_state}`}>{skillAvailabilityLabel(availability_state)}</span>
-                  </div>
-                  <p>{skill.description}</p>
-                  <div className="skill-meta-row">
-                    <strong>来源类型</strong>
-                    <div className="tag-row">
-                      {sourceTypes.length ? sourceTypes.map((type) => <span key={type}>{type}</span>) : <span>未声明</span>}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>依赖工具</strong>
-                    <div className="skill-dependency-list">
-                      {requiredTools.length ? requiredTools.map((tool) => <span key={tool}>{tool}</span>) : <span>无外部依赖</span>}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>依赖检查</strong>
-                    <div className="skill-dependency-list">
-                      <span>tool_dependency_state: {String(metadata.tool_dependency_state ?? availability_state)}</span>
-                      {availableRequiredTools.length ? availableRequiredTools.map((tool) => <span className="dependency-ok" key={`available-${tool}`}>{tool}</span>) : null}
-                      {missingRequiredTools.length ? missingRequiredTools.map((tool) => <span className="dependency-missing" key={`missing-${tool}`}>{tool}</span>) : null}
-                      {missingOptionalTools.length ? missingOptionalTools.map((tool) => <span className="dependency-optional-missing" key={`optional-${tool}`}>{tool}</span>) : null}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>申请权限</strong>
-                    <div className="skill-dependency-list">
-                      {allowedTools.length ? allowedTools.map((tool) => <span key={tool}>{tool}</span>) : <span>未声明 allowed_tools</span>}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>需确认工具</strong>
-                    <div className="skill-dependency-list">
-                      {askTools.length ? askTools.map((tool) => <span key={tool}>{tool}</span>) : <span>未声明 ask_tools</span>}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>禁止工具</strong>
-                    <div className="skill-dependency-list">
-                      {disallowedTools.length ? disallowedTools.map((tool) => <span key={tool}>{tool}</span>) : <span>未声明 disallowed_tools</span>}
-                    </div>
-                  </div>
-                  <div className="skill-meta-row">
-                    <strong>描述质量</strong>
-                    <div className="tag-row">
-                      <span>{descriptionQualityScore === null ? "未评分" : `${descriptionQualityScore}/10`}</span>
-                      <span>risk: {securityRiskLevel}</span>
-                    </div>
-                  </div>
-                  <div className="skill-card-footer">
-                    <span>更新：{formatDateTime(skill.updated_at)}</span>
-                    <div className="table-actions">
-                      <button className="button button-small button-ghost" type="button" onClick={() => onPin(skill)} disabled={skill.pinned || workingAction === `agent-skill-pin-${skill.id}`}>
-                        <BadgeCheck size={14} />
-                        {skill.pinned ? "已置顶" : "置顶"}
-                      </button>
-                      <button className="button button-small button-danger" type="button" onClick={() => onArchive(skill)} disabled={workingAction === `agent-skill-archive-${skill.id}`}>
-                        <Trash2 size={14} />
-                        归档
-                      </button>
-                    </div>
-                  </div>
-                </article>
-              );
-            })}
+          <div className="skill-list">
+            {skills.map((skill) => (
+              <SkillListItem
+                key={skill.id}
+                skill={skill}
+                workingAction={workingAction}
+                onArchive={onArchive}
+                onPin={onPin}
+              />
+            ))}
           </div>
         ) : (
-          <EmptyState icon={Layers3} title="还没有导入 Skill" body="先安装或下载小红书、公众号、抖音内容解析 Skill，再把本地 SKILL.md 路径登记进来。" />
+          <EmptyState icon={Layers3} title="还没有导入 Skill" body="先安装或下载小红书、公众号、抖音内容解析 Skill，再把本地 Skill 文件路径登记进来。" />
         )}
       </Panel>
     </section>
+  );
+}
+
+function SkillListItem({
+  skill,
+  workingAction,
+  onArchive,
+  onPin,
+}: {
+  skill: AgentSkill;
+  workingAction: string | null;
+  onArchive: (skill: AgentSkill) => void;
+  onPin: (skill: AgentSkill) => void;
+}) {
+  const metadata = skill.metadata_json ?? {};
+  const sourceTypes = normalizeMetadataList(metadata.source_types);
+  const requiredTools = normalizeMetadataList(metadata.required_tools);
+  const availableRequiredTools = normalizeMetadataList(metadata.available_required_tools);
+  const missingRequiredTools = normalizeMetadataList(metadata.missing_required_tools);
+  const missingOptionalTools = normalizeMetadataList(metadata.missing_optional_tools);
+  const allowedTools = normalizeMetadataList(metadata.allowed_tools);
+  const askTools = normalizeMetadataList(metadata.ask_tools);
+  const disallowedTools = normalizeMetadataList(metadata.disallowed_tools);
+  const descriptionQualityScore = typeof metadata.description_quality_score === "number" ? metadata.description_quality_score : null;
+  const securityRiskLevel = typeof metadata.security_risk_level === "string" ? metadata.security_risk_level : "unknown";
+  const availability_state = getSkillAvailabilityState(skill);
+  const Icon = skillListIcon(skill);
+
+  return (
+    <article className="skill-list-item">
+      <div className="skill-list-icon" aria-hidden="true">
+        <Icon size={22} />
+      </div>
+      <div className="skill-list-main">
+        <div className="skill-list-title-row">
+          <div>
+            <h3>{skillDisplayTitle(skill)}</h3>
+            <p>{skillDisplayDescription(skill)}</p>
+          </div>
+          <span className={`skill-toggle skill-toggle-${availability_state}`} aria-label={`启用状态：${skillAvailabilityLabel(availability_state)}`}>
+            <span />
+          </span>
+        </div>
+        <div className="skill-list-meta-row" aria-label="Skill 简要信息">
+          <span>能力类型：{skillCategoryLabel(skill.category)}</span>
+          <span>使用场景：{skillUseCaseLabel(skill, sourceTypes)}</span>
+          <span>启用状态：{skillAvailabilityLabel(availability_state)}</span>
+          {skill.pinned ? <span>已置顶</span> : null}
+        </div>
+        <details className="skill-list-details">
+          <summary>查看详情</summary>
+          <div className="skill-detail-grid">
+            <SkillDetail label="内容来源" value={formatSkillList(sourceTypes.map(skillSourceTypeLabel), "未指定来源")} />
+            <SkillDetail label="关键依赖" value={formatSkillList(requiredTools.map(skillToolLabel), "无外部依赖")} />
+            <SkillDetail label="依赖检查" value={skillDependencySummary(availableRequiredTools, missingRequiredTools, missingOptionalTools)} />
+            <SkillDetail label="可自动使用" value={formatSkillList(allowedTools.map(skillToolLabel), "未单独声明")} />
+            <SkillDetail label="需要确认" value={formatSkillList(askTools.map(skillToolLabel), "暂无")} />
+            <SkillDetail label="安全边界" value={formatSkillList(disallowedTools.map(skillToolLabel), "暂无禁止项")} />
+            <SkillDetail label="描述质量" value={descriptionQualityScore === null ? "未评分" : `${descriptionQualityScore}/10`} />
+            <SkillDetail label="风险等级" value={skillRiskLabel(securityRiskLevel)} />
+          </div>
+        </details>
+      </div>
+      <div className="skill-list-actions">
+        <button className="button button-small button-ghost" type="button" onClick={() => onPin(skill)} disabled={skill.pinned || workingAction === `agent-skill-pin-${skill.id}`}>
+          <BadgeCheck size={14} />
+          {skill.pinned ? "已置顶" : "置顶"}
+        </button>
+        <button className="button button-small button-danger" type="button" onClick={() => onArchive(skill)} disabled={workingAction === `agent-skill-archive-${skill.id}`}>
+          <Trash2 size={14} />
+          归档
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function SkillDetail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="skill-detail-item">
+      <strong>{label}</strong>
+      <span>{value}</span>
+    </div>
+  );
+}
+
+function AgentRuntimePage({ panel, navigate }: { panel: AgentRuntimePanel | null; navigate: (page: PageId) => void }) {
+  const [activeTab, setActiveTab] = useState<"members" | "capabilities">("members");
+
+  if (!panel) {
+    return (
+      <section className="agent-console-layout">
+        <div className="agent-console-main glass-panel agent-console-empty">
+          <EmptyState icon={Network} title="Agent 面板暂未连接" body="后端启动后会显示主 agent、已注册子 agent 和每个能力声明。" />
+        </div>
+      </section>
+    );
+  }
+
+  const activeAgents = panel.agents.filter((agent) => agent.status === "active").length;
+  const standbyAgents = panel.agents.length - activeAgents;
+
+  return (
+    <section className="agent-console-layout" aria-label="Agent 运行时面板">
+      <aside className="agent-console-profile glass-panel">
+        <div className="agent-profile-mark" aria-hidden="true">
+          <Bot size={28} />
+        </div>
+        <div className="agent-profile-heading">
+          <p className="eyebrow">Main Orchestrator</p>
+          <h3>{panel.main_agent.name}</h3>
+          <p>{panel.main_agent.description}</p>
+        </div>
+
+        <div className="agent-console-stats" aria-label="Agent 注册概览">
+          <MetricRow label="接入成员" value={`${panel.summary.agent_count} 个`} />
+          <MetricRow label="能力声明" value={`${panel.summary.capability_count} 个`} />
+          <MetricRow label="低风险能力" value={`${panel.summary.low_risk_count} 个`} />
+          <MetricRow label="需确认能力" value={`${panel.summary.confirmation_required_count} 个`} />
+        </div>
+
+        <div className="agent-runtime-status-list">
+          <RuntimeStatusRow icon={Workflow} label="统一运行时" value="已接入" />
+          <RuntimeStatusRow icon={Network} label="搜索 Provider" value={panel.summary.configured_web_search_provider} />
+          <RuntimeStatusRow icon={ShieldCheck} label="权限边界" value="运行时校验" />
+          <RuntimeStatusRow icon={BadgeCheck} label="结果标准化" value="观察结果回传" />
+        </div>
+
+        <button className="button button-ghost full-width" type="button" onClick={() => navigate("skills")}>
+          <Layers3 size={16} />
+          查看 Skill 管理
+        </button>
+      </aside>
+
+      <section className="agent-console-main glass-panel">
+        <header className="agent-console-header">
+          <div>
+            <p className="eyebrow">Agent As Tool</p>
+            <h3>运行时成员</h3>
+            <p>
+              主 agent 只负责编排；每个子 agent 或工具先声明能力，再进入统一调度。
+            </p>
+          </div>
+          <div className="agent-console-counts" aria-label="成员状态">
+            <span>{activeAgents} 个运行中</span>
+            <span>{standbyAgents} 个待命</span>
+          </div>
+        </header>
+
+        <div className="agent-console-tabs" role="tablist" aria-label="Agent 面板视图">
+          <button className={activeTab === "members" ? "is-active" : ""} type="button" role="tab" aria-selected={activeTab === "members"} onClick={() => setActiveTab("members")}>
+            <Network size={16} />
+            成员
+          </button>
+          <button className={activeTab === "capabilities" ? "is-active" : ""} type="button" role="tab" aria-selected={activeTab === "capabilities"} onClick={() => setActiveTab("capabilities")}>
+            <Sparkles size={16} />
+            能力声明
+          </button>
+        </div>
+
+        {activeTab === "members" ? <AgentMemberList agents={panel.agents} /> : <AgentCapabilityList capabilities={panel.capabilities} />}
+      </section>
+    </section>
+  );
+}
+
+function RuntimeStatusRow({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
+  return (
+    <div className="agent-runtime-status-row">
+      <Icon size={16} aria-hidden="true" />
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function AgentMemberList({ agents }: { agents: AgentRuntimeMember[] }) {
+  if (!agents.length) {
+    return <EmptyState icon={Network} title="还没有注册成员" body="接入新的子 agent 后，它会在这里声明自己负责的能力。" />;
+  }
+
+  return (
+    <div className="agent-member-list">
+      {agents.map((agent) => (
+        <article className="agent-member-card" key={agent.id}>
+          <div className="agent-member-avatar" aria-hidden="true">
+            {agent.kind === "external_agent" ? <Bot size={22} /> : <DatabaseZap size={22} />}
+          </div>
+          <div className="agent-member-body">
+            <div className="agent-member-title-row">
+              <div>
+                <h3>{agent.name}</h3>
+                <span>{agent.role}</span>
+              </div>
+              <span className={`agent-status-chip agent-status-${agent.status}`}>{agentStatusLabel(agent.status)}</span>
+            </div>
+            <p>{agent.description}</p>
+            {agent.health ? <p className={`agent-health-line agent-health-${agent.health.status}`}>心跳检查：{agentHealthLabel(agent.health)}</p> : null}
+            <div className="agent-chip-row" aria-label={`${agent.name} 能力列表`}>
+              {agent.capabilities.length ? agent.capabilities.slice(0, 6).map((capability) => <span key={capability.id}>{capability.name}</span>) : <span>当前没有接管能力</span>}
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function AgentCapabilityList({ capabilities }: { capabilities: AgentRuntimeCapability[] }) {
+  if (!capabilities.length) {
+    return <EmptyState icon={Sparkles} title="还没有能力声明" body="工具或子 agent 注册能力后，主 agent 才能把它放进候选工具池。" />;
+  }
+
+  return (
+    <div className="agent-capability-grid">
+      {capabilities.map((capability) => (
+        <article className="agent-capability-card" key={capability.id}>
+          <div className="agent-capability-header">
+            <div>
+              <p className="eyebrow">{capability.provider} · {capability.executor_id}</p>
+              <h3>{capability.name}</h3>
+            </div>
+            <span className={`agent-risk-chip agent-risk-${capability.risk_level}`}>{riskLevelLabel(capability.risk_level)}</span>
+          </div>
+          <p>{capability.description}</p>
+          <div className="agent-capability-facts">
+            <span><strong>输入</strong>{formatCompactList(capability.input_fields, "未声明")}</span>
+            <span><strong>输出</strong>{formatCompactList(capability.output_fields, "未声明")}</span>
+            <span><strong>来源</strong>{formatCompactList(capability.allowed_source_types, "不限")}</span>
+            <span><strong>确认</strong>{capability.requires_confirmation ? "需要用户确认" : "可自动执行"}</span>
+          </div>
+          <div className="agent-chip-row">
+            {(capability.candidate_categories.length ? capability.candidate_categories : capability.candidate_keywords).slice(0, 5).map((item) => <span key={item}>{item}</span>)}
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -3077,6 +3753,145 @@ function skillAvailabilityLabel(state: AgentSkillAvailabilityState): string {
   return labels[state];
 }
 
+function skillDisplayTitle(skill: AgentSkill): string {
+  const text = `${skill.name} ${skill.title}`.toLowerCase();
+  if (text.includes("xiaohongshu")) {
+    return "小红书内容抓取";
+  }
+  if (text.includes("wechat") || text.includes("weixin")) {
+    return "微信公众号文章读取";
+  }
+  if (text.includes("resume")) {
+    return "简历处理能力";
+  }
+  if (text.includes("pdf")) {
+    return "PDF 文档处理";
+  }
+  return skill.title || humanizeIdentifier(skill.name);
+}
+
+function skillDisplayDescription(skill: AgentSkill): string {
+  const text = `${skill.name} ${skill.title} ${skill.description}`.toLowerCase();
+  if (text.includes("xiaohongshu")) {
+    return "读取小红书笔记、账号或可见页面里的招聘信息，适合从社媒内容发现公司和岗位线索。";
+  }
+  if (text.includes("wechat") || text.includes("weixin")) {
+    return "读取微信公众号文章内容，适合从校招汇总文章中提取公司、岗位和报名入口。";
+  }
+  return skill.description || "为主 agent 提供可按需加载的专项能力。";
+}
+
+function skillCategoryLabel(category: string): string {
+  const labels: Record<string, string> = {
+    content_source: "内容来源",
+    job_discovery: "岗位发现",
+    resume_delivery: "简历投递",
+    tool_recovery: "工具恢复经验",
+  };
+  return labels[category] ?? humanizeIdentifier(category);
+}
+
+function skillUseCaseLabel(skill: AgentSkill, sourceTypes: string[]): string {
+  if (sourceTypes.length) {
+    return sourceTypes.map(skillSourceTypeLabel).slice(0, 2).join("、");
+  }
+  return skillCategoryLabel(skill.category);
+}
+
+function skillSourceTypeLabel(sourceType: string): string {
+  const labels: Record<string, string> = {
+    xiaohongshu_note: "小红书笔记",
+    wechat_article: "公众号文章",
+    wechat_account: "公众号账号",
+    job_board_visible_page: "招聘页面",
+    university_career_site: "高校就业网",
+    official_career_site: "企业招聘官网",
+    manual_clip: "手动粘贴内容",
+  };
+  return labels[sourceType] ?? humanizeIdentifier(sourceType);
+}
+
+function skillToolLabel(toolName: string): string {
+  const labels: Record<string, string> = {
+    "xiaohongshu-mcp.search_feeds": "搜索小红书笔记",
+    "xiaohongshu-mcp.get_feed_detail": "读取小红书笔记详情",
+    "xiaohongshu-mcp.check_login_status": "检查小红书登录状态",
+    "xiaohongshu-mcp.get_login_qrcode": "获取小红书登录二维码",
+    "xiaohongshu-mcp.user_profile": "读取小红书账号资料",
+    "xhscrawl.search": "搜索小红书内容",
+    "xhscrawl.note_detail": "读取小红书笔记详情",
+    "xhscrawl.user_notes": "读取小红书用户笔记",
+    "weixin-articles-mcp.read_article": "读取公众号文章",
+    "weixin-articles.read_article": "读取公众号文章",
+    read_article: "读取文章正文",
+    "browser.open": "打开浏览器页面",
+    mcp_visible_page_read: "读取用户可见页面",
+    "mcp.visible_page_read": "读取用户可见页面",
+    "ocr.extract_text": "图片文字识别",
+    memory_search: "搜索会话记忆",
+    memory_get: "读取会话记忆",
+    submit_application: "提交投递动作",
+  };
+  return labels[toolName] ?? humanizeIdentifier(toolName);
+}
+
+function skillDependencySummary(availableTools: string[], missingTools: string[], missingOptionalTools: string[]): string {
+  if (missingTools.length) {
+    return `缺少 ${missingTools.length} 个必要依赖：${missingTools.map(skillToolLabel).slice(0, 2).join("、")}`;
+  }
+  if (missingOptionalTools.length) {
+    return `核心可用，${missingOptionalTools.length} 个可选依赖未接入`;
+  }
+  if (availableTools.length) {
+    return `必要依赖已满足：${availableTools.length} 个`;
+  }
+  return "无需额外依赖";
+}
+
+function skillRiskLabel(riskLevel: string): string {
+  if (riskLevel === "low") {
+    return "低风险";
+  }
+  if (riskLevel === "medium") {
+    return "中风险";
+  }
+  if (riskLevel === "high") {
+    return "高风险";
+  }
+  return "未标注";
+}
+
+function skillListIcon(skill: AgentSkill): LucideIcon {
+  const text = `${skill.name} ${skill.title} ${skill.category}`.toLowerCase();
+  if (text.includes("wechat") || text.includes("weixin") || text.includes("xiaohongshu")) {
+    return MessageCircle;
+  }
+  if (text.includes("resume") || text.includes("pdf") || text.includes("document")) {
+    return FileSearch;
+  }
+  if (text.includes("job") || text.includes("source")) {
+    return RadioTower;
+  }
+  return Layers3;
+}
+
+function formatSkillList(values: string[], fallback: string): string {
+  const cleanValues = values.map((value) => value.trim()).filter(Boolean);
+  if (!cleanValues.length) {
+    return fallback;
+  }
+  return cleanValues.slice(0, 4).join("、");
+}
+
+function humanizeIdentifier(value: string): string {
+  return value
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replaceAll(".", " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function sourceToDraft(source: JobSource): SourceDraft {
   return {
     name: source.name,
@@ -3212,12 +4027,12 @@ async function waitForUrlImportRun(runId: string, onProgress: (run: ImportUrlRun
   return latest;
 }
 
-function isChatMessageListNearBottom(element: HTMLDivElement, threshold = 96): boolean {
+function isScrollableElementNearBottom(element: HTMLElement, threshold = 96): boolean {
   const { scrollTop, clientHeight, scrollHeight } = element;
   return scrollTop + clientHeight >= scrollHeight - threshold;
 }
 
-function scrollChatMessagesToBottom(element: HTMLDivElement | null): void {
+function scrollElementToBottom(element: HTMLElement | null): void {
   if (!element) {
     return;
   }
@@ -3225,6 +4040,14 @@ function scrollChatMessagesToBottom(element: HTMLDivElement | null): void {
   window.requestAnimationFrame(() => {
     element.scrollTop = element.scrollHeight;
   });
+}
+
+function isChatMessageListNearBottom(element: HTMLDivElement, threshold = 96): boolean {
+  return isScrollableElementNearBottom(element, threshold);
+}
+
+function scrollChatMessagesToBottom(element: HTMLDivElement | null): void {
+  scrollElementToBottom(element);
 }
 
 function appendAgentMessageIfMissing(messages: AgentMessage[], message: AgentMessage | null | undefined): AgentMessage[] {
@@ -3388,6 +4211,10 @@ function appendRuntimeEvent(current: ChatRuntimeTimelineEvent[], nextEvent: Chat
   return [...current, nextEvent].slice(-24);
 }
 
+function runtimeEventAnimationDelay(index: number): string {
+  return `${Math.min(index, 8) * 35}ms`;
+}
+
 function toRuntimeEventFromOuterSession(payload: AgentStreamOuterSessionEvent, ordinal: number): ChatRuntimeTimelineEvent {
   const eventType = payload.event_type;
   const status = payload.status ?? null;
@@ -3409,6 +4236,10 @@ function toRuntimeEventFromTool(payload: AgentStreamToolEvent, ordinal: number):
   const inputHint = runtimeInputHint(payload.suggested_input_patch ?? null);
   const toolName = stringOrNull(payload.tool_name) ?? stringOrNull(payload.capability);
   const candidateNames = runtimeCandidateNames(payload.candidate_capabilities ?? null);
+  const inputPreview = recordOrNull(payload.input_preview);
+  const resultSummary = recordOrNull(payload.result_summary);
+  const reflection = recordOrNull(payload.reflection);
+  const evidence = runtimeEvidence(payload.evidence ?? null);
   return {
     id: runtimeEventId("tool", eventType, payload.tool_call_id ?? payload.workflow_run_id ?? null, ordinal),
     kind: "tool",
@@ -3420,9 +4251,52 @@ function toRuntimeEventFromTool(payload: AgentStreamToolEvent, ordinal: number):
     stepIndex: typeof payload.step_index === "number" ? payload.step_index : null,
     inputHint,
     candidateNames,
+    inputPreview,
+    resultSummary,
+    reflection,
+    evidence,
     createdAt: Date.now(),
     tone: runtimeEventTone(eventType, status),
   };
+}
+
+function runtimeEventGroups(events: ChatRuntimeTimelineEvent[]): Array<{ group: ChatRuntimeEventGroup; events: ChatRuntimeTimelineEvent[] }> {
+  const order: ChatRuntimeEventGroup[] = ["reasoning", "tooling", "observation", "evidence", "status"];
+  const grouped = new Map<ChatRuntimeEventGroup, ChatRuntimeTimelineEvent[]>();
+  events.forEach((event) => {
+    const group = runtimeEventGroup(event.eventType);
+    grouped.set(group, [...(grouped.get(group) ?? []), event]);
+  });
+  return order.flatMap((group) => {
+    const groupEvents = grouped.get(group) ?? [];
+    return groupEvents.length ? [{ group, events: groupEvents }] : [];
+  });
+}
+
+function runtimeEventGroup(eventType: string): ChatRuntimeEventGroup {
+  if (["reasoning_summary", "candidate_capabilities", "turn_started", "model_decision"].includes(eventType)) {
+    return "reasoning";
+  }
+  if (["tool_input_preview", "tool_started", "tool_finished", "textual_tool_call_recovered", "textual_tool_call_blocked"].includes(eventType)) {
+    return "tooling";
+  }
+  if (["tool_result_summary", "reflection_evaluation", "tool_reflection_retry", "observation_insufficient", "turn_finished"].includes(eventType)) {
+    return "observation";
+  }
+  if (eventType === "evidence_selected") {
+    return "evidence";
+  }
+  return "status";
+}
+
+function runtimeEventGroupTitle(group: ChatRuntimeEventGroup): string {
+  return {
+    reasoning: "思考摘要",
+    tooling: "工具调用",
+    observation: "观察与重试",
+    evidence: "证据来源",
+    status: "任务状态",
+  }[group];
 }
 
 function runtimeEventId(kind: ChatRuntimeEventKind, eventType: string, runOrCallId: string | null, ordinal: number): string {
@@ -3433,16 +4307,284 @@ function runtimeEventTone(eventType: string, status?: string | null): ChatRuntim
   if (status === "failed" || status === "error" || status === "denied") {
     return "danger";
   }
-  if (eventType === "waiting_user" || eventType === "tool_reflection_retry" || eventType === "observation_insufficient" || status === "retry") {
+  if (eventType === "waiting_user" || eventType === "tool_reflection_retry" || eventType === "textual_tool_call_blocked" || eventType === "observation_insufficient" || status === "retry") {
     return "warning";
   }
   if (eventType === "task_finished" || status === "succeeded" || status === "success") {
     return "success";
   }
-  if (eventType === "task_started" || eventType === "turn_started" || eventType === "model_decision" || eventType === "candidate_capabilities" || eventType === "tool_started" || status === "running") {
+  if (eventType === "task_started" || eventType === "turn_started" || eventType === "model_decision" || eventType === "candidate_capabilities" || eventType === "reasoning_summary" || eventType === "tool_input_preview" || eventType === "tool_started" || eventType === "textual_tool_call_recovered" || status === "running") {
     return "running";
   }
   return "muted";
+}
+
+function runtimeEventActor(event: ChatRuntimeTimelineEvent): RuntimeActorInfo {
+  if (["candidate_capabilities", "reasoning_summary", "turn_started", "model_decision", "task_started"].includes(event.eventType)) {
+    return {
+      type: "main_model",
+      label: "主模型调度",
+      detail: "主 agent 在判断下一步、选择能力或规划本轮行动。",
+    };
+  }
+  if (event.eventType === "textual_tool_call_blocked") {
+    return {
+      type: "runtime",
+      label: "运行时守卫",
+      detail: "模型输出了像工具调用的普通文字，运行时没有把它当成真实工具执行。",
+    };
+  }
+  if (event.eventType === "textual_tool_call_recovered") {
+    return {
+      type: "runtime",
+      label: "运行时守卫",
+      detail: "模型输出了像工具调用的普通文字，运行时已转入真实工具流程。",
+    };
+  }
+  if (["tool_result_summary", "reflection_evaluation", "tool_reflection_retry", "observation_insufficient", "evidence_selected", "turn_finished"].includes(event.eventType)) {
+    return {
+      type: "observation",
+      label: "结果返回主 agent",
+      detail: "子任务结果已回到主 agent，由主 agent 验收、重试或总结。",
+    };
+  }
+  if (runtimeToolRunsInSubAgent(event.toolName)) {
+    return {
+      type: "sub_agent",
+      label: "子 Agent 执行",
+      detail: `${runtimeSubAgentName(event.toolName)} 正在执行主 agent 派发的任务。`,
+    };
+  }
+  if (event.kind === "tool" || event.toolName) {
+    return {
+      type: "local_tool",
+      label: "工具函数执行",
+      detail: "主 agent 正在通过本地工具注册中心执行这个能力。",
+    };
+  }
+  return {
+    type: "runtime",
+    label: "运行时守卫",
+    detail: "后端运行时正在推进会话、权限或状态管理。",
+  };
+}
+
+function runtimeActorVisual(actorType: ChatRuntimeActorType): RuntimeActorVisual {
+  return {
+    main_model: {
+      Icon: Bot,
+      label: "主模型调度",
+      caption: "判断下一步、选择能力、汇总回答",
+      className: "runtime-flow-lane-card-main",
+    },
+    sub_agent: {
+      Icon: Network,
+      label: "子 Agent 执行",
+      caption: "Claude / OpenAI 等子 agent 接收任务",
+      className: "runtime-flow-lane-card-subagent",
+    },
+    local_tool: {
+      Icon: Wrench,
+      label: "工具函数执行",
+      caption: "搜索、文件、本地数据库等真实工具动作",
+      className: "runtime-flow-lane-card-tool",
+    },
+    observation: {
+      Icon: BadgeCheck,
+      label: "结果返回主 agent",
+      caption: "把观察结果交回主模型继续判断",
+      className: "runtime-flow-lane-card-return",
+    },
+    runtime: {
+      Icon: ShieldCheck,
+      label: "运行时守卫",
+      caption: "权限、参数、状态和纠偏检查",
+      className: "runtime-flow-lane-card-runtime",
+    },
+  }[actorType];
+}
+
+function runtimeActorEventCardClass(actorType: ChatRuntimeActorType): string {
+  return {
+    main_model: "runtime-event-card-main",
+    sub_agent: "runtime-event-card-subagent",
+    local_tool: "runtime-event-card-tool",
+    observation: "runtime-event-card-return",
+    runtime: "runtime-event-card-runtime",
+  }[actorType];
+}
+
+function buildRuntimeEmptyFlowEvents(isWorking: boolean): ChatRuntimeTimelineEvent[] {
+  const now = Date.now();
+  return [
+    {
+      id: "empty-main-model",
+      kind: "outer_session",
+      eventType: isWorking ? "turn_started" : "task_started",
+      label: isWorking ? "等待主模型判断" : "主模型待命",
+      summary: isWorking ? "主 agent 即将判断下一步。" : "本轮还没有真实执行事件。",
+      status: isWorking ? "thinking" : "idle",
+      createdAt: now,
+      tone: isWorking ? "running" : "muted",
+    },
+    {
+      id: "empty-worker",
+      kind: "tool",
+      eventType: "tool_started",
+      label: "等待选择工具或子 Agent",
+      summary: "当模型选择能力后，这里会显示被调用的一方。",
+      status: "not_executed",
+      createdAt: now + 1,
+      tone: "muted",
+    },
+    {
+      id: "empty-return",
+      kind: "outer_session",
+      eventType: "turn_finished",
+      label: "等待结果返回",
+      summary: "工具或子 Agent 完成后，结果会回到主 agent。",
+      status: "not_executed",
+      createdAt: now + 2,
+      tone: "muted",
+    },
+  ];
+}
+
+function runtimeToolRunsInSubAgent(toolName?: string | null): boolean {
+  if (!toolName) {
+    return false;
+  }
+  return (
+    toolName === "resume.tailor" ||
+    toolName === "external.web_search" ||
+    toolName === "applications.find_apply_entry" ||
+    toolName.includes("openai") ||
+    toolName.includes("claude") ||
+    toolName.includes("agent")
+  );
+}
+
+function runtimeSubAgentName(toolName?: string | null): string {
+  if (toolName === "resume.tailor" || toolName?.includes("openai")) {
+    return "OpenAI SDK Agent";
+  }
+  if (toolName?.includes("claude")) {
+    return "Claude SDK Agent";
+  }
+  if (toolName === "external.web_search") {
+    return "联网搜索 Agent";
+  }
+  if (toolName === "applications.find_apply_entry") {
+    return "浏览器执行 Agent";
+  }
+  return "能力子 Agent";
+}
+
+function runtimeActorBadgeClass(actorType: ChatRuntimeActorType): string {
+  return {
+    main_model: "runtime-actor-badge-main",
+    sub_agent: "runtime-actor-badge-subagent",
+    local_tool: "runtime-actor-badge-tool",
+    runtime: "runtime-actor-badge-runtime",
+    observation: "runtime-actor-badge-return",
+  }[actorType];
+}
+
+function runtimeActorCounts(events: ChatRuntimeTimelineEvent[]): Record<ChatRuntimeActorType, number> {
+  return events.reduce<Record<ChatRuntimeActorType, number>>(
+    (counts, event) => {
+      const actorType = runtimeEventActor(event).type;
+      return { ...counts, [actorType]: counts[actorType] + 1 };
+    },
+    { main_model: 0, sub_agent: 0, local_tool: 0, runtime: 0, observation: 0 },
+  );
+}
+
+function runtimeAgentChain(event: ChatRuntimeTimelineEvent, actor: RuntimeActorInfo): string[] {
+  if (actor.type === "main_model") {
+    return ["主模型", "选择下一步"];
+  }
+  if (actor.type === "sub_agent") {
+    return ["主 agent", runtimeSubAgentName(event.toolName), "返回主 agent"];
+  }
+  if (actor.type === "local_tool") {
+    return ["主 agent", "本地工具注册中心", "返回主 agent"];
+  }
+  if (actor.type === "observation") {
+    return ["工具结果", "主 agent 验收", event.eventType === "tool_reflection_retry" ? "准备重试" : "整理回答"];
+  }
+  return ["运行时", "更新状态"];
+}
+
+function runtimeEventStateLabel(event: ChatRuntimeTimelineEvent): string {
+  if (event.status === "not_executed") {
+    return "未执行";
+  }
+  if (event.status === "thinking") {
+    return "思考中";
+  }
+  if (event.status === "retry") {
+    return "重试";
+  }
+  if (event.status === "running") {
+    return "执行中";
+  }
+  if (event.status === "succeeded" || event.status === "success") {
+    return "完成";
+  }
+  if (event.status === "failed" || event.status === "error") {
+    return "失败";
+  }
+  if (event.eventType === "task_finished") {
+    return "结束";
+  }
+  return event.status ?? "记录";
+}
+
+function runtimePayloadPreview(event: ChatRuntimeTimelineEvent): string | null {
+  if (event.inputPreview) {
+    return runtimeCompactJson(event.inputPreview);
+  }
+  if (event.resultSummary) {
+    return runtimeCompactJson(event.resultSummary);
+  }
+  if (event.reflection) {
+    return runtimeCompactJson(event.reflection);
+  }
+  return null;
+}
+
+function runtimeCompactJson(value: Record<string, unknown>): string {
+  const entries = Object.entries(value)
+    .filter(([, item]) => item !== undefined && item !== null && item !== "")
+    .slice(0, 6)
+    .map(([key, item]) => `${runtimeFieldLabel(key)}：${runtimePreviewValue(item)}`);
+  return entries.join("\n");
+}
+
+function runtimeFieldLabel(key: string): string {
+  return {
+    query: "关键词",
+    max_results: "结果上限",
+    path: "路径",
+    encoding: "编码",
+    result_count: "结果数",
+    source_count: "来源数",
+    source_domains: "来源域名",
+    next_action: "下一步",
+    reason: "原因",
+  }[key] ?? key.replaceAll("_", " ");
+}
+
+function runtimePreviewValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).slice(0, 4).join("、");
+  }
+  if (isRecord(value)) {
+    return Object.keys(value).slice(0, 4).join("、") || "对象";
+  }
+  const text = String(value);
+  return text.length > 180 ? `${text.slice(0, 180)}...` : text;
 }
 
 function runtimeEventShouldSpin(
@@ -3457,11 +4599,32 @@ function runtimeEventIcon(event: ChatRuntimeTimelineEvent): LucideIcon {
   if (event.tone === "danger") {
     return AlertTriangle;
   }
+  if (event.eventType === "textual_tool_call_blocked") {
+    return AlertTriangle;
+  }
+  if (event.eventType === "textual_tool_call_recovered") {
+    return Wrench;
+  }
   if (event.eventType === "tool_reflection_retry" || event.eventType === "observation_insufficient") {
     return RefreshCcw;
   }
   if (event.eventType === "candidate_capabilities") {
     return Layers3;
+  }
+  if (event.eventType === "reasoning_summary") {
+    return Sparkles;
+  }
+  if (event.eventType === "tool_input_preview") {
+    return FileSearch;
+  }
+  if (event.eventType === "tool_result_summary") {
+    return BadgeCheck;
+  }
+  if (event.eventType === "reflection_evaluation") {
+    return Activity;
+  }
+  if (event.eventType === "evidence_selected") {
+    return Link2;
   }
   if (event.eventType === "model_decision") {
     return Sparkles;
@@ -3471,6 +4634,9 @@ function runtimeEventIcon(event: ChatRuntimeTimelineEvent): LucideIcon {
   }
   if (event.tone === "success") {
     return CheckCircle2;
+  }
+  if (runtimeToolRunsInSubAgent(event.toolName)) {
+    return Cpu;
   }
   if (event.toolName?.includes("search")) {
     return Search;
@@ -3516,6 +4682,50 @@ function runtimeCandidateNames(capabilities: string[] | null): string[] {
   return capabilities.map((capability) => formatRuntimeToolName(capability)).filter(Boolean).slice(0, 6);
 }
 
+function runtimeEventDetails(event: ChatRuntimeTimelineEvent): Array<{ label: string; value: string }> {
+  const details: Array<{ label: string; value: string }> = [];
+  const query = stringOrNull(event.inputPreview?.query);
+  if (query) {
+    details.push({ label: "关键词", value: query });
+  }
+  const maxResults = event.inputPreview?.max_results;
+  if (typeof maxResults === "number" || typeof maxResults === "string") {
+    details.push({ label: "上限", value: `${maxResults}` });
+  }
+  const resultCount = event.resultSummary?.result_count;
+  if (typeof resultCount === "number") {
+    details.push({ label: "结果数", value: `${resultCount}` });
+  }
+  const sourceCount = event.resultSummary?.source_count;
+  if (typeof sourceCount === "number") {
+    details.push({ label: "来源数", value: `${sourceCount}` });
+  }
+  const sourceDomains = Array.isArray(event.resultSummary?.source_domains)
+    ? event.resultSummary.source_domains.map((domain) => String(domain)).filter(Boolean)
+    : [];
+  if (sourceDomains.length) {
+    details.push({ label: "来源", value: sourceDomains.slice(0, 4).join("、") });
+  }
+  return details;
+}
+
+function runtimeEvidence(value: Array<Record<string, unknown>> | null): RuntimeEvidenceItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      const title = stringOrNull(item.title) ?? stringOrNull(item.name) ?? "证据来源";
+      const url = stringOrNull(item.url) ?? undefined;
+      return { title, url };
+    })
+    .slice(0, 5);
+}
+
+function recordOrNull(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
 function runtimeInputHint(patch: Record<string, unknown> | null): string | null {
   if (!patch) {
     return null;
@@ -3526,6 +4736,86 @@ function runtimeInputHint(patch: Record<string, unknown> | null): string | null 
   }
   const keys = Object.keys(patch);
   return keys.length ? `下一次会调整输入字段：${keys.join("、")}` : null;
+}
+
+function taskPlanStageTone(status: string): ChatRuntimeEventTone {
+  if (status === "succeeded") {
+    return "success";
+  }
+  if (status === "failed" || status === "blocked") {
+    return "danger";
+  }
+  if (status === "waiting_user") {
+    return "warning";
+  }
+  if (status === "running") {
+    return "running";
+  }
+  return "muted";
+}
+
+function taskPlanStageIcon(status: string): LucideIcon {
+  if (status === "succeeded") {
+    return CheckCircle2;
+  }
+  if (status === "failed" || status === "blocked") {
+    return AlertTriangle;
+  }
+  if (status === "waiting_user") {
+    return Clock3;
+  }
+  if (status === "running") {
+    return Activity;
+  }
+  return CircleDot;
+}
+
+function taskPlanStatusLabel(status: string): string {
+  return {
+    pending: "待执行",
+    running: "运行中",
+    succeeded: "已完成",
+    failed: "失败",
+    skipped: "已跳过",
+    waiting_user: "等用户",
+    blocked: "已阻塞",
+  }[status] ?? status;
+}
+
+function taskPlanPayloadSummary(payload: Record<string, unknown> | null | undefined): string | null {
+  if (!payload) {
+    return null;
+  }
+  const summary = stringOrNull(payload.summary) ?? stringOrNull(payload.final_answer_preview) ?? stringOrNull(payload.waiting_message);
+  return summary ? summary.slice(0, 220) : null;
+}
+
+function taskPlanToolNames(payload: Record<string, unknown> | null | undefined): string[] {
+  if (!payload || !Array.isArray(payload.tool_names)) {
+    return [];
+  }
+  return payload.tool_names.map((toolName) => String(toolName)).filter(Boolean).slice(0, 3);
+}
+
+function taskPlanStrategyLabel(strategy: Record<string, unknown> | null | undefined): string | null {
+  if (!strategy) {
+    return null;
+  }
+  const description = stringOrNull(strategy.description);
+  if (description) {
+    return description;
+  }
+  const mode = stringOrNull(strategy.mode);
+  if (mode === "none") {
+    return "不调用工具，只基于已有信息分析或整理。";
+  }
+  if (mode === "allowlist") {
+    return "只允许本阶段声明的工具。";
+  }
+  if (mode === "inherit") {
+    return "继承本轮候选工具。";
+  }
+  return mode;
 }
 
 function stringOrNull(value: unknown): string | null {
@@ -3540,6 +4830,14 @@ function extractContextMetadata(message: AgentMessage): AgentContextMetadata | n
   const metadata = message.metadata_json;
   const contextMetadata = metadata?.context_metadata;
   return isRecord(contextMetadata) ? (contextMetadata as AgentContextMetadata) : null;
+}
+
+function extractActiveTaskId(metadata: AgentContextMetadata | null): string | null {
+  const outerSession = metadata?.outer_session_loop;
+  if (!isRecord(outerSession)) {
+    return null;
+  }
+  return stringOrNull(outerSession.active_task_id);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -3734,6 +5032,53 @@ function getInitialPage(): PageId {
   return NAV_ITEMS.some((item) => item.id === hash) ? hash : "dashboard";
 }
 
+function agentStatusLabel(status: string): string {
+  if (status === "active") {
+    return "运行中";
+  }
+  if (status === "standby") {
+    return "待命";
+  }
+  if (status === "offline") {
+    return "未启动";
+  }
+  if (status === "disabled") {
+    return "已停用";
+  }
+  return status;
+}
+
+function agentHealthLabel(health: AgentRuntimeHealth): string {
+  if (health.status === "healthy") {
+    return health.label || "已连接";
+  }
+  if (health.status === "unreachable") {
+    return health.label || "未启动或连接失败";
+  }
+  return health.label || "未检测";
+}
+
+function riskLevelLabel(riskLevel: string): string {
+  if (riskLevel === "low") {
+    return "低风险";
+  }
+  if (riskLevel === "medium") {
+    return "中风险";
+  }
+  if (riskLevel === "high") {
+    return "高风险";
+  }
+  return riskLevel;
+}
+
+function formatCompactList(values: string[], fallback: string): string {
+  const cleanValues = values.map((value) => value.trim()).filter(Boolean);
+  if (!cleanValues.length) {
+    return fallback;
+  }
+  return cleanValues.slice(0, 4).join("、");
+}
+
 function formatDateTime(value: string | null): string {
   if (!value) {
     return "未同步";
@@ -3756,6 +5101,7 @@ function toDisplayError(error: unknown): string {
 
 const PAGE_TITLES: Record<PageId, string> = {
   chat: "AI 求职助手",
+  agents: "Agent 面板",
   skills: "Skill 管理",
   dashboard: "秋招发现总览",
   sources: "岗位信息源管理",
@@ -3767,6 +5113,7 @@ const PAGE_TITLES: Record<PageId, string> = {
 
 const PAGE_DESCRIPTIONS: Record<PageId, string> = {
   chat: "已接入 Agent 会话 API，先验证记忆、历史加载和手动压缩链路。",
+  agents: "查看主 agent 当前接入了哪些子 agent，以及每个 agent 声明的能力、风险和执行边界。",
   skills: "管理内容源解析 Skill，展示依赖工具和 Agent 可加载能力。",
   dashboard: "先广撒网收集来源，再让线索进入验证与用户确认流程。",
   sources: "管理高校就业网、企业官网、公众号、小红书和可见招聘页来源。",

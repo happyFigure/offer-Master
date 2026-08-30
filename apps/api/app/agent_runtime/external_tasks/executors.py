@@ -17,6 +17,7 @@ from app.agent_runtime.agent_as_tool import (
     AgentRuntimeContext,
     AgentTask,
     CLAUDE_SDK_AGENT_EXECUTOR_ID,
+    OPENAI_SDK_AGENT_EXECUTOR_ID,
     StandardAgentResult,
 )
 from app.agent_runtime.external_tasks.schemas import (
@@ -24,7 +25,8 @@ from app.agent_runtime.external_tasks.schemas import (
     FindApplyEntryTaskEnvelope,
 )
 from app.agent_runtime.reflection.schemas import campus_recruiting_web_search_result_evaluation_spec
-from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL
+from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolCandidateProfile
+from app.infrastructure.llm.client import LLMRuntimeConfig
 
 
 class ExternalExecutorError(RuntimeError):
@@ -38,6 +40,21 @@ class ExternalExecutor(Protocol):
         ...
 
     def execute_web_search(self, query: str, *, max_results: int = 5) -> dict[str, Any]:
+        ...
+
+
+class ResumeTailoringExecutor(Protocol):
+    executor_name: str
+
+    def execute_resume_tailoring(
+        self,
+        *,
+        resume_text: str,
+        job_description: str,
+        language: str | None = None,
+        style: str | None = None,
+        constraints: list[str] | None = None,
+    ) -> dict[str, Any]:
         ...
 
 
@@ -138,6 +155,215 @@ class ClaudeSdkHttpExecutorAdapter:
             return response.json()
 
 
+class BailianWebSearchExecutor:
+    executor_name = "bailian-enable-search"
+
+    def __init__(self, *, config: LLMRuntimeConfig, client: httpx.Client | None = None) -> None:
+        self._config = config
+        self._client = client
+
+    def execute_web_search(self, query: str, *, max_results: int = 5) -> dict[str, Any]:
+        search_query = str(query or "").strip()
+        if not search_query:
+            raise ExternalExecutorError("Bailian web search query is required")
+        result_limit = max(1, min(int(max_results or 5), 10))
+        response_payload = self._post_dashscope_generation(
+            _build_bailian_dashscope_payload(search_query, max_results=result_limit, model=self._config.model)
+        )
+        answer = _bailian_dashscope_answer(response_payload).strip()
+        if not answer:
+            raise ExternalExecutorError("Bailian web search returned empty assistant content")
+        search_results = _bailian_dashscope_search_results(response_payload, limit=result_limit)
+        sources = [result["url"] for result in search_results if result.get("url")]
+        return {
+            "executor_name": self.executor_name,
+            "query": search_query,
+            "answer": answer,
+            "sources": sources,
+            "observations": [answer],
+            "results": search_results,
+            "artifacts": _search_results_to_artifacts(search_results),
+            "raw_response": response_payload,
+        }
+
+    def _post_dashscope_generation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = _headers(self._config.api_key)
+        url = _dashscope_generation_url(self._config.base_url)
+        if self._client is not None:
+            response = self._client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+        with httpx.Client(timeout=self._config.timeout_seconds) as client:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+
+@dataclass(frozen=True)
+class OpenAISdkAgentConfig:
+    model: str = "gpt-4o-mini"
+    api_key: str | None = None
+    base_url: str | None = None
+    timeout_seconds: float = 120.0
+
+
+class OpenAISdkResumeClientAdapter:
+    executor_name = OPENAI_SDK_AGENT_EXECUTOR_ID
+
+    def __init__(self, *, config: OpenAISdkAgentConfig, client: Any | None = None) -> None:
+        self._config = config
+        self._client = client or _build_openai_sdk_client(config)
+
+    def execute_resume_tailoring(
+        self,
+        *,
+        resume_text: str,
+        job_description: str,
+        language: str | None = None,
+        style: str | None = None,
+        constraints: list[str] | None = None,
+    ) -> dict[str, Any]:
+        resume = _required_text(resume_text, "resume_text")
+        jd = _required_text(job_description, "job_description")
+        completion = self._client.chat.completions.create(
+            model=self._config.model,
+            messages=[
+                {"role": "system", "content": _build_resume_tailoring_system_prompt()},
+                {
+                    "role": "user",
+                    "content": _build_resume_tailoring_user_prompt(
+                        resume_text=resume,
+                        job_description=jd,
+                        language=language,
+                        style=style,
+                        constraints=constraints,
+                    ),
+                },
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            timeout=self._config.timeout_seconds,
+        )
+        content = _openai_assistant_content(completion)
+        payload = _extract_json_object(content)
+        revised_resume = _required_text(payload.get("revised_resume"), "revised_resume")
+        change_summary = _text_list(payload.get("change_summary"))
+        warnings = _text_list(payload.get("warnings"))
+        return {
+            "executor_name": self.executor_name,
+            "revised_resume": revised_resume,
+            "change_summary": change_summary or ["已根据目标 JD 改写简历表达。"],
+            "warnings": warnings,
+        }
+
+
+class OpenAISdkAgentExecutor:
+    executor_id = OPENAI_SDK_AGENT_EXECUTOR_ID
+
+    def __init__(self, executor: ResumeTailoringExecutor) -> None:
+        self._executor = executor
+
+    def capabilities(self) -> list[AgentCapabilityDefinition]:
+        return [
+            AgentCapabilityDefinition(
+                capability_id="resume.tailor",
+                name="简历修改",
+                description="根据用户简历和目标 JD 改写简历内容，只生成修改建议和新版文本，不直接覆盖文件。",
+                executor_id=self.executor_id,
+                input_schema={
+                    "type": "object",
+                    "required": ["resume_text", "job_description"],
+                    "properties": {
+                        "resume_text": {"type": "string", "description": "用户当前简历正文。"},
+                        "job_description": {"type": "string", "description": "目标 JD 或岗位要求。"},
+                        "language": {"type": ["string", "null"], "default": "zh-CN"},
+                        "style": {"type": ["string", "null"], "description": "可选风格，例如简洁、STAR、校招投递版。"},
+                        "constraints": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                            "description": "必须遵守的改写约束。",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["tool_name", "ok", "result"],
+                    "properties": {
+                        "tool_name": {"type": "string"},
+                        "ok": {"type": "boolean"},
+                        "result": {
+                            "type": "object",
+                            "required": ["revised_resume", "change_summary"],
+                            "properties": {
+                                "revised_resume": {"type": "string"},
+                                "change_summary": {"type": "array", "items": {"type": "string"}},
+                                "warnings": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+                risk_level="low",
+                supported_intents=("resume_tailoring",),
+                requires_confirmation=False,
+                allowed_source_types=frozenset({"agent_chat"}),
+                candidate_profile=AgentToolCandidateProfile(
+                    categories=frozenset({"resume_tailoring", "content_processing"}),
+                    keywords=frozenset({"简历", "优化简历", "修改简历", "改简历", "润色简历", "匹配 JD", "目标 JD"}),
+                    examples=("根据这份简历和 Java 后端 JD 帮我改简历", "把我的简历改得更适合这个 Agent 开发岗位"),
+                ),
+            )
+        ]
+
+    def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+        if task.capability_id != "resume.tailor":
+            return StandardAgentResult(
+                status="failed",
+                summary=f"{self.executor_id} 暂不支持能力：{task.capability_id}",
+                missing_information=[task.capability_id],
+            )
+        resume_text = str(task.input_payload.get("resume_text") or "").strip()
+        if not resume_text:
+            return _resume_tailoring_missing_input_result("resume_text", "缺少必要输入：resume_text")
+        job_description = str(task.input_payload.get("job_description") or "").strip()
+        if not job_description:
+            return _resume_tailoring_missing_input_result("job_description", "缺少必要输入：job_description")
+        try:
+            tailoring_result = self._executor.execute_resume_tailoring(
+                resume_text=resume_text,
+                job_description=job_description,
+                language=_optional_text(task.input_payload.get("language")),
+                style=_optional_text(task.input_payload.get("style")),
+                constraints=_text_list(task.input_payload.get("constraints")),
+            )
+        except Exception as exc:
+            return StandardAgentResult(
+                status="failed",
+                summary=f"{self.executor_id} 执行简历修改失败：{type(exc).__name__}: {exc}",
+                raw_result={
+                    "tool_name": "resume.tailor",
+                    "ok": False,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+        result = dict(tailoring_result)
+        result.setdefault("executor_name", getattr(self._executor, "executor_name", self.executor_id))
+        revised_resume = str(result.get("revised_resume") or "").strip()
+        if not revised_resume:
+            return _resume_tailoring_missing_input_result("revised_resume", "OpenAI SDK agent 没有返回改写后的简历")
+        result["change_summary"] = _text_list(result.get("change_summary")) or ["已根据目标 JD 改写简历表达。"]
+        result["warnings"] = _text_list(result.get("warnings"))
+        raw_payload = {"tool_name": "resume.tailor", "ok": True, "result": result}
+        return StandardAgentResult(
+            status="succeeded",
+            summary="OpenAI SDK agent 已完成简历修改",
+            observation=_resume_tailoring_observation(result),
+            raw_result=raw_payload,
+        )
+
+
 class ClaudeSdkAgentExecutor:
     executor_id = CLAUDE_SDK_AGENT_EXECUTOR_ID
 
@@ -208,6 +434,130 @@ class ClaudeSdkAgentExecutor:
             evidence=_web_search_evidence(result),
             raw_result=raw_payload,
         )
+
+
+def _build_openai_sdk_client(config: OpenAISdkAgentConfig) -> Any:
+    try:
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover - depends on deployment packaging.
+        raise ExternalExecutorError("OpenAI SDK is not installed. Install the openai package to enable openai-sdk-agent.") from exc
+    kwargs: dict[str, Any] = {}
+    api_key = str(config.api_key or "").strip()
+    if api_key:
+        kwargs["api_key"] = api_key
+    base_url = str(config.base_url or "").strip().rstrip("/")
+    if base_url:
+        kwargs["base_url"] = base_url
+    timeout = float(config.timeout_seconds or 0)
+    if timeout > 0:
+        kwargs["timeout"] = timeout
+    return OpenAI(**kwargs)
+
+
+def _build_resume_tailoring_system_prompt() -> str:
+    return (
+        "你是 OfferMaster 的简历修改子 agent。\n"
+        "你的任务是根据用户提供的原始简历和目标 JD 改写简历。\n"
+        "必须保留用户真实经历，不得编造公司、学历、项目、时间、奖项、指标或成果。\n"
+        "如果目标 JD 信息不足，只能在已有事实基础上增强表达，并在 warnings 中说明限制。\n"
+        "只返回一个 JSON 对象，不要输出 Markdown，不要解释内部推理。\n"
+        "JSON 格式：{\"revised_resume\": \"改写后的完整简历\", \"change_summary\": [\"修改点\"], \"warnings\": [\"限制或风险\"]}"
+    )
+
+
+def _build_resume_tailoring_user_prompt(
+    *,
+    resume_text: str,
+    job_description: str,
+    language: str | None,
+    style: str | None,
+    constraints: list[str] | None,
+) -> str:
+    constraint_lines = "\n".join(f"- {item}" for item in constraints or [] if str(item).strip()) or "- 保留真实经历，不编造。"
+    return (
+        f"输出语言：{language or 'zh-CN'}\n"
+        f"改写风格：{style or '清晰、具体、适合投递'}\n"
+        "必须遵守的约束：\n"
+        f"{constraint_lines}\n\n"
+        "原始简历：\n"
+        f"{resume_text}\n\n"
+        "目标 JD：\n"
+        f"{job_description}\n\n"
+        "请输出 JSON。"
+    )
+
+
+def _openai_assistant_content(payload: Any) -> str:
+    choices = payload.get("choices") if isinstance(payload, dict) else getattr(payload, "choices", None)
+    if not isinstance(choices, list) or not choices:
+        raise ExternalExecutorError("OpenAI SDK agent response did not contain choices")
+    first_choice = choices[0]
+    message = first_choice.get("message") if isinstance(first_choice, dict) else getattr(first_choice, "message", None)
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    if isinstance(content, list):
+        content = "".join(_openai_content_part_text(part) for part in content)
+    if not isinstance(content, str) or not content.strip():
+        raise ExternalExecutorError("OpenAI SDK agent response did not contain assistant content")
+    return content
+
+
+def _openai_content_part_text(part: Any) -> str:
+    if isinstance(part, dict):
+        return str(part.get("text") or part.get("content") or "")
+    return str(getattr(part, "text", None) or getattr(part, "content", None) or "")
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ExternalExecutorError(f"{field_name} is required")
+    return text
+
+
+def _optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _text_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list | tuple | set):
+        return [text for item in value if (text := str(item or "").strip())]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _resume_tailoring_missing_input_result(field_name: str, summary: str) -> StandardAgentResult:
+    error_code = f"{field_name.upper()}_REQUIRED"
+    return StandardAgentResult(
+        status="failed",
+        summary=summary,
+        missing_information=[field_name],
+        raw_result={
+            "tool_name": "resume.tailor",
+            "ok": False,
+            "error": error_code,
+            "retryable": False,
+        },
+    )
+
+
+def _resume_tailoring_observation(result: dict[str, Any]) -> str:
+    revised_resume = str(result.get("revised_resume") or "").strip()
+    change_summary = _text_list(result.get("change_summary"))
+    warnings = _text_list(result.get("warnings"))
+    lines: list[str] = []
+    if revised_resume:
+        lines.append(revised_resume)
+    if change_summary:
+        lines.append("修改摘要：" + "；".join(change_summary))
+    if warnings:
+        lines.append("注意事项：" + "；".join(warnings))
+    return "\n".join(lines)
 
 
 def _bounded_web_search_limit(value: Any) -> int:
@@ -330,6 +680,99 @@ def _build_web_search_prompt(query: str, *, max_results: int) -> str:
         f"Use no more than {max(1, int(max_results or 5))} relevant results.\n\n"
         f"User query: {query}"
     )
+
+
+def _build_bailian_web_search_system_prompt(max_results: int) -> str:
+    limit = max(1, min(int(max_results or 5), 10))
+    return (
+        "你是 OfferMaster 的联网搜索执行器。\n"
+        "你必须基于联网搜索结果回答，不能只凭模型记忆回答。\n"
+        "如果是实时问题，优先使用最新、权威、可核验来源。\n"
+        "回答要简洁，使用用户的语言。\n"
+        "必须尽量包含来源链接；如果搜索结果不足以支持结论，要明确说明证据不足。\n"
+        f"最多整理 {limit} 条相关结果，不要展开无关信息。"
+    )
+
+
+def _build_bailian_dashscope_payload(query: str, *, max_results: int, model: str) -> dict[str, Any]:
+    return {
+        "model": str(model or "qwen-plus"),
+        "input": {
+            "messages": [
+                {"role": "system", "content": _build_bailian_web_search_system_prompt(max_results)},
+                {"role": "user", "content": query},
+            ]
+        },
+        "parameters": {
+            "result_format": "message",
+            "enable_search": True,
+            "search_options": {
+                "forced_search": True,
+                "enable_source": True,
+                "enable_citation": True,
+                "citation_format": "[ref_<number>]",
+                "search_strategy": "max",
+            },
+        },
+    }
+
+
+def _dashscope_generation_url(base_url: str) -> str:
+    normalized = str(base_url or "").strip().rstrip("/")
+    if normalized.endswith("/api/v1/services/aigc/text-generation/generation"):
+        return normalized
+    parsed = urlparse(normalized or "https://dashscope.aliyuncs.com")
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or "dashscope.aliyuncs.com"
+    return f"{scheme}://{netloc}/api/v1/services/aigc/text-generation/generation"
+
+
+def _bailian_dashscope_answer(response_payload: dict[str, Any]) -> str:
+    output = response_payload.get("output") if isinstance(response_payload, dict) else None
+    choices = output.get("choices") if isinstance(output, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise ExternalExecutorError("Bailian web search response did not contain output choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if content is None:
+        raise ExternalExecutorError("Bailian web search response did not contain assistant content")
+    return str(content)
+
+
+def _bailian_dashscope_search_results(response_payload: dict[str, Any], *, limit: int) -> list[dict[str, str]]:
+    output = response_payload.get("output") if isinstance(response_payload, dict) else None
+    search_info = output.get("search_info") if isinstance(output, dict) else None
+    raw_results = search_info.get("search_results") if isinstance(search_info, dict) else None
+    if not isinstance(raw_results, list):
+        return []
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        site_name = str(item.get("site_name") or "").strip()
+        title = str(item.get("title") or "").strip() or url
+        display_title = f"{site_name} - {title}" if site_name and site_name not in title else title
+        results.append(
+            {
+                "title": display_title,
+                "url": url,
+                "snippet": str(item.get("snippet") or item.get("summary") or "").strip(),
+            }
+        )
+        if len(results) >= max(1, min(int(limit or 5), 10)):
+            break
+    return results
+
+
+def _search_results_to_artifacts(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"type": "url", "title": result.get("title") or "source", "url": result["url"]}
+        for result in results
+        if result.get("url")
+    ]
 
 
 def _looks_like_tool_call_only_answer(content: str) -> bool:

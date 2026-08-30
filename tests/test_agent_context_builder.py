@@ -374,6 +374,57 @@ class AgentContextBuilderTest(unittest.TestCase):
             any(message.get("metadata", {}).get("source") == "agent_skill" for message in built.llm_messages)
         )
 
+    def test_context_builder_recalls_relevant_active_memory_but_not_archived_memory(self):
+        from app.agent_runtime.memory.context_builder import ContextBuildConfig, MemoryContextBuilder
+        from app.domains.agent_memory.models import AgentMemory, AgentMemoryStatus
+        from app.domains.agent_memory.repository import AgentMemoryRepository
+
+        with self.Session() as session:
+            service = self._service(session)
+            conversation = service.create_session(title="长期记忆召回", primary_intent="agent_chat")
+            active = AgentMemory(
+                id="memory-context-active",
+                memory_type="user_preference",
+                scope="application_submission",
+                title="投递前必须用户确认",
+                content="任何岗位最终提交前都必须等待用户确认。",
+                status=AgentMemoryStatus.ACTIVE,
+                importance=95,
+            )
+            archived = AgentMemory(
+                id="memory-context-archived",
+                memory_type="user_preference",
+                scope="application_submission",
+                title="旧投递偏好",
+                content="旧规则不再使用。",
+                status=AgentMemoryStatus.ARCHIVED,
+                importance=100,
+            )
+            session.add_all([active, archived])
+            session.commit()
+
+            built = MemoryContextBuilder(
+                service,
+                memory_repository=AgentMemoryRepository(session),
+            ).build(
+                conversation.id,
+                new_user_message="帮我投递腾讯的 Java 岗位",
+                config=ContextBuildConfig(
+                    max_recent_messages=10,
+                    max_loaded_memories=3,
+                    max_memory_context_chars=1000,
+                ),
+            )
+
+        self.assertEqual(["memory-context-active"], built.loaded_memory_ids)
+        self.assertTrue(
+            any(
+                message.get("metadata", {}).get("source") == "agent_memory"
+                and "最终提交前都必须等待用户确认" in message["content"]
+                for message in built.llm_messages
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

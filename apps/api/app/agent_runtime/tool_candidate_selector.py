@@ -101,11 +101,20 @@ def _detect_task_signals(user_message: str) -> tuple[str, ...]:
         return ()
 
     signals: list[str] = []
-    if _looks_like_local_job_source_data_request(text):
+    file_signals = _filesystem_task_signals(text)
+    if file_signals:
+        return file_signals
+    if _looks_like_local_company_profile_request(text):
+        signals.append("local_company_profile")
+    elif _looks_like_local_job_search_request(text):
+        signals.append("local_job_search")
+    elif _looks_like_local_job_source_data_request(text):
         signals.append("local_job_source_data")
-    if _looks_like_local_company_data_request(text):
+    elif _looks_like_local_company_data_request(text):
         signals.append("local_company_data")
     if signals:
+        if _looks_like_external_enrichment_request(text):
+            signals.append("public_web_information")
         return tuple(signals)
     if _looks_like_wechat_article_read_request(text):
         signals.append("wechat_article_read")
@@ -130,6 +139,91 @@ def _detect_task_signals(user_message: str) -> tuple[str, ...]:
     return tuple(signals)
 
 
+def _filesystem_task_signals(text: str) -> tuple[str, ...]:
+    if not _looks_like_filesystem_request(text):
+        return ()
+
+    signals: list[str] = []
+    if any(marker in text for marker in ("删除", "删掉", "移除", "delete", "remove")):
+        signals.append("filesystem_delete")
+    if any(marker in text for marker in ("复制", "拷贝", "备份", "copy")):
+        signals.append("filesystem_copy")
+    if any(marker in text for marker in ("移动", "重命名", "改名", "move", "rename")):
+        signals.append("filesystem_move")
+    if any(marker in text for marker in ("创建目录", "新建目录", "新建文件夹", "mkdir", "make dir")):
+        signals.append("filesystem_make_dir")
+    if any(marker in text for marker in ("写入", "保存", "修改", "替换", "换成", "换为", "换了", "改成", "改为", "覆盖", "write")):
+        if any(marker in text for marker in ("替换", "换成", "换为", "换了", "改成", "改为", "只改", "其他不要动", "其他的啥都不要动")):
+            signals.append("filesystem_replace")
+        signals.append("filesystem_write")
+        if any(marker in text for marker in ("替换", "换成", "换为", "换了", "改成", "改为", "其他不要动", "其他的啥都不要动")):
+            signals.append("filesystem_read")
+    if any(marker in text for marker in ("列出", "查看目录", "目录下", "文件夹", "有哪些文件", "list")):
+        signals.append("filesystem_list")
+    if any(marker in text for marker in ("是否存在", "存不存在", "有没有这个文件", "文件大小", "修改时间", "stat", "exists")):
+        signals.append("filesystem_stat")
+    if any(marker in text for marker in ("读取", "读一下", "读文件", "读到", "能不能读", "能读", "打开", "查看", "看一下", "read")):
+        signals.append("filesystem_read")
+
+    if not signals:
+        signals.append("filesystem_operation")
+    return tuple(_dedupe(signals))
+
+
+def _looks_like_filesystem_request(text: str) -> bool:
+    lowered = text.lower()
+    path_markers = (
+        ":/",
+        ":\\",
+        "\\",
+        "/",
+        ".tex",
+        ".md",
+        ".txt",
+        ".pdf",
+        ".docx",
+        ".json",
+        ".csv",
+        "本地文件",
+        "文件路径",
+        "目录",
+        "文件夹",
+    )
+    action_markers = (
+        "读取",
+        "读一下",
+        "读到",
+        "能不能读",
+        "能读",
+        "打开",
+        "查看",
+        "列出",
+        "修改",
+        "替换",
+        "换成",
+        "换为",
+        "换了",
+        "改成",
+        "改为",
+        "写入",
+        "保存",
+        "复制",
+        "移动",
+        "删除",
+        "重命名",
+        "创建目录",
+        "新建文件夹",
+        "read",
+        "write",
+        "copy",
+        "move",
+        "delete",
+        "rename",
+        "mkdir",
+    )
+    return any(marker in lowered for marker in path_markers) and any(marker in lowered for marker in action_markers)
+
+
 def _looks_like_local_job_source_data_request(text: str) -> bool:
     source_markers = ("岗位来源", "来源库", "岗位展览", "校招来源", "招聘来源", "岗位线索")
     query_markers = ("多少", "几个", "哪些", "列表", "看一下", "给我", "统计", "概览", "现在")
@@ -140,6 +234,24 @@ def _looks_like_local_company_data_request(text: str) -> bool:
     local_markers = ("数据库", "本地", "我的", "已有", "投递板", "岗位展览", "公司库", "企业库")
     company_markers = ("公司", "企业", "厂", "岗位线索", "校招来源")
     return any(marker in text for marker in local_markers) and any(marker in text for marker in company_markers)
+
+
+def _looks_like_local_company_profile_request(text: str) -> bool:
+    if not _looks_like_local_company_data_request(text):
+        return False
+    detail_markers = ("关于", "详情", "详细", "信息", "档案", "介绍", "主营业务", "主要业务")
+    return any(marker in text for marker in detail_markers)
+
+
+def _looks_like_local_job_search_request(text: str) -> bool:
+    local_markers = ("数据库", "本地", "我的", "已有", "岗位库", "岗位展览")
+    job_markers = ("岗位", "职位", "招聘", "jd", "Java", "Python")
+    query_markers = ("查", "搜", "搜索", "看", "有哪些", "列出", "找")
+    return (
+        any(marker in text for marker in local_markers)
+        and any(marker in text for marker in job_markers)
+        and any(marker in text.lower() for marker in query_markers)
+    )
 
 
 def _looks_like_resume_tailoring_request(text: str) -> bool:
@@ -189,7 +301,7 @@ def _looks_like_realtime_public_information_request(text: str) -> bool:
 
 def _looks_like_public_web_information_request(text: str) -> bool:
     if _looks_like_local_company_data_request(text):
-        return False
+        return _looks_like_external_enrichment_request(text)
     public_markers = (
         "搜",
         "搜索",
@@ -207,6 +319,33 @@ def _looks_like_public_web_information_request(text: str) -> bool:
     if not any(marker in text for marker in public_markers):
         return False
     return True
+
+
+def _looks_like_external_enrichment_request(text: str) -> bool:
+    enrichment_markers = (
+        "补充公开",
+        "公开资料",
+        "公开信息",
+        "外部资料",
+        "外部信息",
+        "联网补充",
+        "主营业务",
+        "主要业务",
+        "官网信息",
+        "招聘动态",
+    )
+    return any(marker in text for marker in enrichment_markers)
+
+
+def _dedupe(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 __all__ = ["ToolCandidateSelection", "ToolCandidateSelector"]

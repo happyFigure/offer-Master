@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent_runtime.routing.schemas import ResultEnvelope
+from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 from app.agent_runtime.tool_registry import APPLICATION_FIND_APPLY_ENTRY_TOOL, EXTERNAL_WEB_SEARCH_TOOL
 
 
@@ -17,7 +18,12 @@ def build_result_envelope(
         return _web_search_result_envelope(status=status, capability=capability, result_payload=result_payload, risk_level=risk_level)
     if capability == APPLICATION_FIND_APPLY_ENTRY_TOOL:
         return _apply_entry_result_envelope(status=status, capability=capability, result_payload=result_payload, risk_level=risk_level)
-    return None
+    return build_tool_result_envelope(
+        capability=capability,
+        status=status,
+        result_payload=result_payload,
+        risk_level=risk_level,
+    )
 
 
 def build_apply_entry_task_result_envelope(

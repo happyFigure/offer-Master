@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from app.api.v1.agent import router as agent_router
 from app.api.v1.agent_learning import router as agent_learning_router
 from app.api.v1.agent_memory import router as agent_memory_router, session_recall_router
+from app.api.v1.agent_runtime import router as agent_runtime_router
 from app.api.v1.agent_skills import router as agent_skills_router
 from app.api.v1.applications import router as applications_router
 from app.api.v1.health import router as health_router
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(tool_health_router)
     app.include_router(session_recall_router)
     app.include_router(agent_router)
+    app.include_router(agent_runtime_router)
     app.include_router(agent_memory_router)
     app.include_router(agent_learning_router)
     app.include_router(agent_skills_router)

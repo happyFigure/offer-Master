@@ -10,9 +10,14 @@ from app.agent_runtime.tool_permissions import (
     AgentToolPermissionResult,
 )
 from app.agent_runtime.tool_registry import (
+    DATABASE_COMPANY_PROFILE_TOOL,
+    DATABASE_COMPANY_SEARCH_TOOL,
+    DATABASE_JOB_SEARCH_TOOL,
+    DATABASE_SOURCE_SEARCH_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+    OFFERIO_COMPANY_JOBS_TOOL,
     AgentToolDefinition,
     AgentToolRegistry,
     AgentToolRiskLevel,
@@ -38,8 +43,14 @@ class AgentToolNextAction(str, Enum):
 LOW_RISK_RUNTIME_CAPABILITY_TOOLS = frozenset(
     {
         EXTERNAL_WEB_SEARCH_TOOL,
+        DATABASE_COMPANY_SEARCH_TOOL,
+        DATABASE_COMPANY_PROFILE_TOOL,
+        DATABASE_JOB_SEARCH_TOOL,
+        DATABASE_SOURCE_SEARCH_TOOL,
         LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
         LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+        OFFERIO_COMPANY_JOBS_TOOL,
+        "resume.tailor",
     }
 )
 
@@ -187,7 +198,7 @@ class AgentToolRuntimeGuard:
     ) -> bool:
         return (
             context.tool_name in LOW_RISK_RUNTIME_CAPABILITY_TOOLS
-            and definition.risk_level == AgentToolRiskLevel.LOW
+            and definition.risk_level in {AgentToolRiskLevel.LOW, AgentToolRiskLevel.MEDIUM}
             and not definition.requires_confirmation
             and context.tool_name not in skill_permission_result.ask_tools
             and context.tool_name not in skill_permission_result.allowed_tools

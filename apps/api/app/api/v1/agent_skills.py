@@ -37,7 +37,7 @@ def list_agent_skills(
     repository: AgentSkillRepository = Depends(get_skill_repository),
     tool_registry: AgentToolRegistry = Depends(get_agent_tool_registry),
 ) -> AgentSkillListResponse:
-    repository.ensure_builtin_content_source_skills()
+    repository.ensure_builtin_skills()
     skills = repository.list_skills(status=status, limit=limit)
     _decorate_skill_dependencies(skills, tool_registry)
     return AgentSkillListResponse(items=[AgentSkillRead.model_validate(skill) for skill in skills])

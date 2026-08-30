@@ -155,6 +155,9 @@ export interface AgentStreamToolEvent {
   summary?: string | null;
   tool_input_keys?: string[];
   candidate_capabilities?: string[];
+  input_preview?: Record<string, unknown> | null;
+  result_summary?: Record<string, unknown> | null;
+  evidence?: Array<Record<string, unknown>> | null;
   metadata?: Record<string, unknown> | null;
   reflection?: Record<string, unknown> | null;
   suggested_input_patch?: Record<string, unknown> | null;
@@ -185,6 +188,33 @@ export interface AgentUserMessageInput {
 export interface AgentChatTurnResponse {
   user_message: AgentMessage;
   assistant_message: AgentMessage;
+}
+
+export interface AgentTaskPlanStage {
+  step_id: string;
+  stage_id: string;
+  sequence_index: number;
+  title: string;
+  objective: string;
+  business_action?: string | null;
+  allowed_capabilities: string[];
+  tool_strategy: Record<string, unknown>;
+  ranking_policy: string[];
+  capability: string;
+  status: string;
+  execution_status?: string | null;
+  waiting_message?: string | null;
+  final_answer_preview?: string | null;
+  depends_on: string[];
+  received_context?: Record<string, unknown> | null;
+  handoff_payload?: Record<string, unknown> | null;
+}
+
+export interface AgentTaskPlan {
+  task_id: string;
+  user_goal: string | null;
+  current_stage_id: string | null;
+  stages: AgentTaskPlanStage[];
 }
 
 export interface AgentCompactInput {

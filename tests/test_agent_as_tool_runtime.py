@@ -107,6 +107,102 @@ class AgentAsToolRuntimeTest(unittest.TestCase):
         self.assertEqual(("campus_recruiting_search", "external_agent_task"), web_search.supported_intents)
         self.assertEqual(("offerio_company_jobs_sync",), offerio_sync.supported_intents)
 
+    def test_default_tool_registry_registers_filesystem_skill_tools(self) -> None:
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+
+        registry = create_default_agent_tool_registry()
+
+        self.assertIsNotNone(registry.get("filesystem.read_file"))
+        self.assertIsNotNone(registry.get("filesystem.write_text"))
+        self.assertIsNotNone(registry.get("filesystem.replace_text"))
+        self.assertIsNotNone(registry.get("filesystem.delete_path"))
+        self.assertFalse(registry.get("filesystem.read_file").requires_confirmation)
+        self.assertTrue(registry.get("filesystem.write_text").requires_confirmation)
+        self.assertTrue(registry.get("filesystem.replace_text").requires_confirmation)
+        self.assertTrue(registry.get("filesystem.delete_path").requires_confirmation)
+
+    def test_filesystem_read_file_tool_runs_packaged_script(self) -> None:
+        from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
+
+        skill_root = PROJECT_ROOT / "runtime" / "test-temp" / "filesystem-skill-root"
+        scripts_dir = skill_root / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script_file = scripts_dir / "read_file.py"
+        script_file.write_text(
+            "import argparse\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--path', required=True)\n"
+            "parser.add_argument('--offset', default='0')\n"
+            "parser.add_argument('--limit', default='0')\n"
+            "parser.add_argument('--encoding', default='utf-8')\n"
+            "args = parser.parse_args()\n"
+            "print(Path(args.path).read_text(encoding=args.encoding))\n",
+            encoding="utf-8",
+        )
+        source_file = skill_root / "resume.tex"
+        source_file.write_text("line one\n姓名：刘汉卿\nline two", encoding="utf-8")
+
+        read_file = next(
+            definition
+            for definition in create_filesystem_agent_tool_definitions(script_root=skill_root)
+            if definition.name == "filesystem.read_file"
+        )
+
+        result = read_file.handler(None, path=str(source_file), encoding="utf-8", offset=0, limit=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("filesystem.read_file", result["tool_name"])
+        self.assertIn("line one", result["result"]["content"])
+        self.assertIn("姓名：刘汉卿", result["result"]["content"])
+        self.assertNotIn("�", result["result"]["content"])
+        self.assertEqual(0, result["result"]["return_code"])
+
+    def test_filesystem_write_tool_requires_runtime_confirmation(self) -> None:
+        from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolNextAction, AgentToolRuntimeGuard
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+
+        result = AgentToolRuntimeGuard().pre_check(
+            AgentToolCallContext(
+                stage="maybe_tool",
+                tool_name="filesystem.write_text",
+                source_type="agent_chat",
+                user_confirmed=False,
+            ),
+            registry=create_default_agent_tool_registry(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(AgentToolNextAction.REQUEST_USER_CONFIRMATION.value, result.next_action)
+
+    def test_filesystem_replace_text_tool_runs_packaged_script(self) -> None:
+        from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
+
+        skill_root = PROJECT_ROOT / "docs" / "agent-skills" / "0539e315-2960-45bf-ae7c-1a7abc4e6755"
+        source_file = PROJECT_ROOT / "runtime" / "test-temp" / "replace-text-resume.tex"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        source_file.write_text("姓名：刘汉卿\n项目：保持原样", encoding="utf-8")
+
+        replace_text = next(
+            definition
+            for definition in create_filesystem_agent_tool_definitions(script_root=skill_root)
+            if definition.name == "filesystem.replace_text"
+        )
+
+        result = replace_text.handler(
+            None,
+            path=str(source_file),
+            old_text="刘汉卿",
+            new_text="王爷",
+            encoding="utf-8",
+            count=0,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("filesystem.replace_text", result["tool_name"])
+        self.assertEqual("姓名：王爷\n项目：保持原样", source_file.read_text(encoding="utf-8"))
+        self.assertIn("REPLACED", result["result"]["stdout"])
+
     def test_tool_registry_executor_runs_registered_handler_through_runtime(self) -> None:
         from app.agent_runtime.agent_as_tool import (
             TOOL_REGISTRY_EXECUTOR_ID,
@@ -259,6 +355,112 @@ class AgentAsToolRuntimeTest(unittest.TestCase):
         self.assertEqual(CLAUDE_SDK_AGENT_EXECUTOR_ID, capability.executor_id)
         self.assertEqual(("campus_recruiting_search", "external_agent_task"), capability.supported_intents)
         self.assertEqual(["query"], capability.input_schema["required"])
+
+    def test_openai_sdk_agent_executor_declares_resume_tailoring_capability(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID
+        from app.agent_runtime.external_tasks.executors import OpenAISdkAgentExecutor
+
+        class FakeOpenAIResumeClient:
+            executor_name = "openai-sdk-agent"
+
+            def execute_resume_tailoring(self, **_arguments):
+                raise AssertionError("not needed")
+
+        capabilities = OpenAISdkAgentExecutor(FakeOpenAIResumeClient()).capabilities()
+
+        self.assertEqual(["resume.tailor"], [definition.capability_id for definition in capabilities])
+        capability = capabilities[0]
+        self.assertEqual(OPENAI_SDK_AGENT_EXECUTOR_ID, capability.executor_id)
+        self.assertEqual("简历修改", capability.name)
+        self.assertEqual(["resume_text", "job_description"], capability.input_schema["required"])
+        self.assertEqual(("resume_tailoring",), capability.supported_intents)
+        self.assertEqual("low", capability.risk_level)
+        self.assertFalse(capability.requires_confirmation)
+        self.assertEqual(frozenset({"agent_chat"}), capability.allowed_source_types)
+        self.assertIn("resume_tailoring", capability.candidate_profile.categories)
+
+    def test_openai_sdk_agent_executor_runs_resume_tailoring(self) -> None:
+        from app.agent_runtime.agent_as_tool import AgentRuntimeContext, AgentTask
+        from app.agent_runtime.external_tasks.executors import OpenAISdkAgentExecutor
+
+        calls = []
+
+        class FakeOpenAIResumeClient:
+            executor_name = "openai-sdk-agent"
+
+            def execute_resume_tailoring(self, **arguments):
+                calls.append(arguments)
+                return {
+                    "executor_name": "openai-sdk-agent",
+                    "revised_resume": "改写后：突出 Spring Boot、接口性能优化和 MySQL 经验。",
+                    "change_summary": ["根据 Java 后端 JD 强化项目关键词", "保留原始经历，不新增虚构内容"],
+                    "warnings": [],
+                }
+
+        result = OpenAISdkAgentExecutor(FakeOpenAIResumeClient()).call(
+            AgentTask(
+                capability_id="resume.tailor",
+                goal="根据 JD 修改简历",
+                input_payload={
+                    "resume_text": "做过 Java 后端项目，使用 Spring Boot 和 MySQL。",
+                    "job_description": "Java 后端开发，要求 Spring Boot、数据库和接口性能优化。",
+                    "language": "zh-CN",
+                },
+            ),
+            AgentRuntimeContext(session_id="session-1", run_id="run-1", task_id="task-1"),
+        )
+
+        self.assertEqual("succeeded", result.status)
+        self.assertEqual("OpenAI SDK agent 已完成简历修改", result.summary)
+        self.assertIn("改写后", result.observation)
+        self.assertEqual("resume.tailor", result.raw_result["tool_name"])
+        self.assertTrue(result.raw_result["ok"])
+        self.assertEqual("openai-sdk-agent", result.raw_result["result"]["executor_name"])
+        self.assertEqual("做过 Java 后端项目，使用 Spring Boot 和 MySQL。", calls[0]["resume_text"])
+        self.assertEqual("Java 后端开发，要求 Spring Boot、数据库和接口性能优化。", calls[0]["job_description"])
+
+    def test_openai_sdk_resume_client_adapter_uses_chat_completion_json(self) -> None:
+        from app.agent_runtime.external_tasks.executors import OpenAISdkAgentConfig, OpenAISdkResumeClientAdapter
+
+        calls = []
+
+        class FakeCompletions:
+            def create(self, **payload):
+                calls.append(payload)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"revised_resume":"新版简历","change_summary":["突出 JD 关键词"],"warnings":[]}'
+                            }
+                        }
+                    ]
+                }
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeOpenAIClient:
+            chat = FakeChat()
+
+        adapter = OpenAISdkResumeClientAdapter(
+            config=OpenAISdkAgentConfig(model="gpt-test", timeout_seconds=12.0),
+            client=FakeOpenAIClient(),
+        )
+
+        result = adapter.execute_resume_tailoring(
+            resume_text="原简历：Java 项目",
+            job_description="目标 JD：Java 后端",
+            language="zh-CN",
+        )
+
+        self.assertEqual("新版简历", result["revised_resume"])
+        self.assertEqual(["突出 JD 关键词"], result["change_summary"])
+        self.assertEqual("gpt-test", calls[0]["model"])
+        self.assertEqual(12.0, calls[0]["timeout"])
+        self.assertEqual({"type": "json_object"}, calls[0]["response_format"])
+        self.assertIn("原简历：Java 项目", calls[0]["messages"][1]["content"])
+        self.assertIn("目标 JD：Java 后端", calls[0]["messages"][1]["content"])
 
     def test_runtime_bundle_collects_capabilities_declared_by_agents(self) -> None:
         from app.agent_runtime.agent_as_tool import (

@@ -2,6 +2,9 @@ import { apiRequest, toQueryString } from "./client";
 import type { OfferIOCompany, OfferIOCompanyOpening, OfferIOJob, OfferIOPage } from "../types/jobs";
 
 
+const OFFERIO_SOURCE_TIMEOUT_MS = 25_000;
+
+
 export interface OfferIOCompanyFilters {
   job_type?: string;
   page?: number;
@@ -36,7 +39,7 @@ export async function listOfferIOCompanies(filters: OfferIOCompanyFilters = {}):
     keyword: filters.keyword,
     industry: filters.industry,
   });
-  return apiRequest<OfferIOPage<OfferIOCompany>>(`/api/v1/jobs/offerio/companies${query}`);
+  return apiRequest<OfferIOPage<OfferIOCompany>>(`/api/v1/jobs/offerio/companies${query}`, { timeoutMs: OFFERIO_SOURCE_TIMEOUT_MS });
 }
 
 export async function listOfferIOCompanyOpenings(filters: OfferIOCompanyOpeningFilters = {}): Promise<OfferIOPage<OfferIOCompanyOpening>> {
@@ -49,7 +52,7 @@ export async function listOfferIOCompanyOpenings(filters: OfferIOCompanyOpeningF
     target: filters.target,
     company_nature: filters.company_nature,
   });
-  return apiRequest<OfferIOPage<OfferIOCompanyOpening>>(`/api/v1/jobs/offerio/company-openings${query}`);
+  return apiRequest<OfferIOPage<OfferIOCompanyOpening>>(`/api/v1/jobs/offerio/company-openings${query}`, { timeoutMs: OFFERIO_SOURCE_TIMEOUT_MS });
 }
 
 export async function listOfferIOJobs(filters: OfferIOJobFilters = {}): Promise<OfferIOPage<OfferIOJob>> {
@@ -60,5 +63,5 @@ export async function listOfferIOJobs(filters: OfferIOJobFilters = {}): Promise<
     page: filters.page ?? 1,
     page_size: filters.page_size ?? 50,
   });
-  return apiRequest<OfferIOPage<OfferIOJob>>(`/api/v1/jobs/offerio/jobs${query}`);
+  return apiRequest<OfferIOPage<OfferIOJob>>(`/api/v1/jobs/offerio/jobs${query}`, { timeoutMs: OFFERIO_SOURCE_TIMEOUT_MS });
 }

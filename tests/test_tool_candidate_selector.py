@@ -41,6 +41,28 @@ class ToolCandidateSelectorTest(unittest.TestCase):
         self.assertEqual((LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,), selection.capabilities)
         self.assertIn("local_company_data", selection.signals)
 
+    def test_selects_database_company_profile_for_specific_company_question(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_PROFILE_TOOL, create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "数据库中关于京东这个公司的详细信息有什么"
+        )
+
+        self.assertEqual((DATABASE_COMPANY_PROFILE_TOOL,), selection.capabilities)
+        self.assertIn("local_company_profile", selection.signals)
+
+    def test_selects_database_job_search_for_local_job_question(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import DATABASE_JOB_SEARCH_TOOL, create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "查一下数据库里腾讯的 Python 后端岗位"
+        )
+
+        self.assertEqual((DATABASE_JOB_SEARCH_TOOL,), selection.capabilities)
+        self.assertIn("local_job_search", selection.signals)
+
     def test_selects_local_job_source_overview_for_source_board_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL, create_default_agent_tool_registry
@@ -98,6 +120,48 @@ class ToolCandidateSelectorTest(unittest.TestCase):
 
         self.assertIn("xiaohongshu-mcp.search_feeds", selection.capabilities)
         self.assertIn("xiaohongshu_content_search", selection.signals)
+
+    def test_selects_filesystem_read_tool_for_user_provided_file_path(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "请读取 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex",
+            auto_executable_only=False,
+        )
+
+        self.assertIn("filesystem.read_file", selection.capabilities)
+        self.assertIn("filesystem_read", selection.signals)
+
+    def test_selects_filesystem_read_tool_for_can_you_read_path_question(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "你现在能不能读到 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 这个文件呢？",
+            auto_executable_only=False,
+        )
+
+        self.assertIn("filesystem.read_file", selection.capabilities)
+        self.assertIn("filesystem_read", selection.signals)
+
+    def test_selects_filesystem_read_and_write_for_exact_file_text_replacement(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "请把 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 里的刘汉卿替换为王爷，其他不要动",
+            auto_executable_only=False,
+        )
+
+        self.assertIn("filesystem.read_file", selection.capabilities)
+        self.assertIn("filesystem.write_text", selection.capabilities)
+        self.assertIn("filesystem.replace_text", selection.capabilities)
+        self.assertIn("filesystem_read", selection.signals)
+        self.assertIn("filesystem_write", selection.signals)
+        self.assertIn("filesystem_replace", selection.signals)
+        self.assertNotIn("filesystem.delete_path", selection.capabilities)
+        self.assertNotIn("filesystem.move_file", selection.capabilities)
 
 
 if __name__ == "__main__":

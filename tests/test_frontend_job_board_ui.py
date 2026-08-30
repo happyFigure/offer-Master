@@ -33,6 +33,12 @@ class FrontendJobBoardUiTest(unittest.TestCase):
         self.assertIn("listOfferIOCompanyOpenings", job_board_api)
         self.assertIn("/api/v1/jobs/offerio/company-openings", job_board_api)
 
+    def test_company_exhibition_requests_use_longer_timeout_than_generic_api(self):
+        job_board_api = (PROJECT_ROOT / "apps" / "web" / "src" / "api" / "jobBoard.ts").read_text(encoding="utf-8")
+
+        self.assertIn("const OFFERIO_SOURCE_TIMEOUT_MS = 25_000", job_board_api)
+        self.assertIn("{ timeoutMs: OFFERIO_SOURCE_TIMEOUT_MS }", job_board_api)
+
     def test_job_board_metric_labels_make_count_scope_explicit(self):
         app_source = (PROJECT_ROOT / "apps" / "web" / "src" / "app" / "App.tsx").read_text(encoding="utf-8")
 

@@ -17,7 +17,7 @@ from app.agent_runtime.loop_agent.schemas import (
     LoopAgentStopReason,
     LoopAgentTraceEntry,
 )
-from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
+from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentStageContext, LoopAgentTask, ToolChoiceLoopRunner
 
 __all__ = [
     "BoundedReActPolicy",
@@ -30,6 +30,7 @@ __all__ = [
     "LoopAgentObservation",
     "LoopAgentRunResult",
     "LoopAgentStopReason",
+    "LoopAgentStageContext",
     "LoopAgentTraceEntry",
     "LoopAgentTask",
     "OuterSessionLoopController",

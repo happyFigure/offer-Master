@@ -8,7 +8,7 @@ from app.domains.applications.repository import (
     ApplicationEventRepository,
     ApplicationRepository,
 )
-from app.domains.applications.schemas import ApplicationCreate
+from app.domains.applications.schemas import ApplicationCreate, ApplicationUpdate
 
 
 @dataclass(frozen=True)
@@ -62,3 +62,46 @@ class ApplicationService:
                 occurred_at=utc_now(),
             ),
         )
+
+    def list_applications(self, limit: int = 100):
+        return self._applications.list_filtered(limit=limit)
+
+    def update_application(self, application_id: str, command: ApplicationUpdate) -> Application:
+        application = self._applications.get(application_id)
+        if application is None:
+            raise ValueError(f"Application not found: {application_id}")
+
+        previous_status = application.status
+        updates = command.model_dump(exclude_unset=True, exclude={"actor", "source"})
+        for field, value in updates.items():
+            setattr(application, field, value)
+
+        if command.status is not None and command.status != previous_status:
+            self._events.add(
+                ApplicationEvent(
+                    application=application,
+                    event_type="status_changed",
+                    from_status=previous_status,
+                    to_status=command.status,
+                    title="Application status changed",
+                    body=command.notes,
+                    actor=command.actor,
+                    source=command.source,
+                    event_metadata={"priority": application.priority},
+                )
+            )
+        elif updates:
+            self._events.add(
+                ApplicationEvent(
+                    application=application,
+                    event_type="application_updated",
+                    from_status=previous_status,
+                    to_status=application.status,
+                    title="Application updated",
+                    body=command.notes,
+                    actor=command.actor,
+                    source=command.source,
+                    event_metadata={"updated_fields": sorted(updates)},
+                )
+            )
+        return application

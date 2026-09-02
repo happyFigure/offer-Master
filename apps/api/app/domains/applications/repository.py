@@ -31,6 +31,12 @@ class ApplicationRepository:
             ).all()
         )
 
+    def list_filtered(self, status: ApplicationStatus | None = None, limit: int = 100) -> list[Application]:
+        statement = select(Application).order_by(Application.updated_at.desc())
+        if status is not None:
+            statement = statement.where(Application.status == status)
+        return list(self._session.scalars(statement.limit(limit)).all())
+
     def add(self, application: Application) -> Application:
         self._session.add(application)
         self._session.flush()

@@ -1,0 +1,111 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 18008
+  },
+  "claude": {
+    "workdir": "../..",
+    "config_dir": ".claude",
+    "cli_path": "E:\\zte\\lastest_bizcore\\my-agents\\.venv\\Lib\\site-packages\\claude_agent_sdk\\_bundled\\claude.exe",
+    "default_model": "qwen-plus",
+    "permission_mode": "default",
+    "setting_sources": [
+      "user",
+      "project",
+      "local"
+    ],
+    "tools": {
+      "type": "preset",
+      "preset": "claude_code"
+    },
+    "allowed_tools": [
+      "WebSearch",
+      "WebFetch",
+      "mcp__MiniMax__web_search"
+    ],
+    "disallowed_tools": [],
+    "strict_mcp_config": false,
+    "skills_filter": "all",
+    "system_prompt_preset": "claude_code",
+    "system_prompt_append": "",
+    "system_prompt_file": null,
+    "continue_conversation": false,
+    "max_turns": 8,
+    "max_budget_usd": null,
+    "fallback_model": null,
+    "betas": [],
+    "permission_prompt_tool_name": null,
+    "settings": null,
+    "add_dirs": [],
+    "env": {},
+    "extra_args": {},
+    "max_buffer_size": 10485760,
+    "user": null,
+    "include_partial_messages": true,
+    "include_hook_events": false,
+    "fork_session": false,
+    "agents": {},
+    "sandbox": null,
+    "plugins": [],
+    "max_thinking_tokens": 512,
+    "thinking": null,
+    "effort": null,
+    "output_format": null,
+    "enable_file_checkpointing": true,
+    "session_store_flush": null,
+    "load_timeout_ms": null,
+    "task_budget": null
+  },
+  "provider": {
+    "base_url": "http://10.2.67.41:18081",
+    "anthropic_version": "2023-06-01",
+    "request_timeout_sec": 600.0
+  },
+  "auth": {
+    "enabled": false,
+    "uac_auth_url": "https://zxmte.zte.com.cn:3303/tdl/api_key/user",
+    "allow_users_path": "data/runtime/allow_users.json",
+    "shared_tdl_api_key_path": "../my-agents/config/allow_users.json"
+  },
+  "sessions": {
+    "mapping_path": "data/sessions/session-map.json",
+    "checkpoints_path": "data/sessions/checkpoints.json",
+    "goals_path": "data/sessions/goals.json"
+  },
+  "skills": {
+    "source_dirs": [
+      "../my-agents/user-skills",
+      "../my-agents/skills"
+    ],
+    "mount_dir": "data/skill-mount"
+  },
+  "skill_usage_audit": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:18000",
+    "endpoint": "/v1/skill-center/usage",
+    "timeout_sec": 3.0
+  },
+  "workflows": {
+    "source_dirs": [
+      "../my-agents/user-workflows",
+      "../my-agents/workflows"
+    ],
+    "target_dir": ".claude/workflows"
+  },
+  "mcp": {
+    "config_dir": "../my-agents/mcps",
+    "extra_config_dirs": [
+      "config/mcps"
+    ],
+    "auto_load": true
+  },
+  "features": {
+    "auto_interrupt_on_disconnect": true,
+    "approval_frontend_enabled": true,
+    "question_frontend_enabled": true,
+    "hook_frontend_enabled": false,
+    "checkpoint_rewind_frontend_enabled": true,
+    "task_panel_frontend_enabled": true,
+    "subagent_events_frontend_enabled": false
+  }
+}

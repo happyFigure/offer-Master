@@ -48,13 +48,14 @@ class SocialLeadImportProvider:
         raw_lead_id: str,
         raw_content: str,
         source_url: str | None,
-        trust_level: JobSourceTrustLevel,
+        trust_level: JobSourceTrustLevel | str,
     ) -> list[JobLeadCreate]:
+        normalized_trust_level = _normalize_trust_level(trust_level)
         source_context = {
             "source_id": source_id,
             "raw_lead_id": raw_lead_id,
             "source_url": source_url,
-            "trust_level": trust_level.value,
+            "trust_level": normalized_trust_level.value,
         }
         extracted_items = self._extractor.extract(raw_content, source_context)
 
@@ -83,11 +84,17 @@ class SocialLeadImportProvider:
                     skills=_normalize_skills(extracted.skills),
                     deadline=extracted.deadline,
                     confidence_score=extracted.confidence_score,
-                    trust_level=trust_level,
+                    trust_level=normalized_trust_level,
                     raw_payload=extracted.raw_payload,
                 )
             )
         return drafts
+
+
+def _normalize_trust_level(trust_level: JobSourceTrustLevel | str) -> JobSourceTrustLevel:
+    if isinstance(trust_level, JobSourceTrustLevel):
+        return trust_level
+    return JobSourceTrustLevel(str(trust_level))
 
 
 def _clean_text(value: str | None) -> str | None:

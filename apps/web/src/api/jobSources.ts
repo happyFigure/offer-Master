@@ -1,5 +1,5 @@
 import { apiRequest } from "./client";
-import type { JobSource, JobSourceCreateInput, JobSourceSyncResponse } from "../types/jobs";
+import type { JobSource, JobSourceCreateInput, JobSourceSyncResponse, JobSourceUpdateInput } from "../types/jobs";
 
 interface JobSourceListResponse {
   items: JobSource[];
@@ -14,6 +14,19 @@ export async function createJobSource(input: JobSourceCreateInput): Promise<JobS
   return apiRequest<JobSource>("/api/v1/job-sources", {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+export async function updateJobSource(sourceId: string, input: JobSourceUpdateInput): Promise<JobSource> {
+  return apiRequest<JobSource>(`/api/v1/job-sources/${sourceId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function disableJobSource(sourceId: string): Promise<JobSource> {
+  return apiRequest<JobSource>(`/api/v1/job-sources/${sourceId}`, {
+    method: "DELETE",
   });
 }
 

@@ -40,3 +40,23 @@ def build_llm_runtime_config(settings: Settings | None = None) -> LLMRuntimeConf
         timeout_seconds=runtime_settings.llm_timeout_seconds,
         max_retries=runtime_settings.llm_max_retries,
     )
+
+
+def build_intent_llm_runtime_config(settings: Settings | None = None) -> LLMRuntimeConfig:
+    runtime_settings = settings or get_settings()
+    api_key_secret = runtime_settings.intent_llm_api_key or runtime_settings.llm_api_key
+    if api_key_secret is None:
+        raise ValueError("JOBPILOT_INTENT_LLM_API_KEY or JOBPILOT_LLM_API_KEY is required to call the intent LLM provider")
+
+    api_key = api_key_secret.get_secret_value().strip()
+    if not api_key:
+        raise ValueError("Intent LLM API key cannot be empty")
+
+    return LLMRuntimeConfig(
+        provider=runtime_settings.intent_llm_provider or runtime_settings.llm_provider,
+        base_url=runtime_settings.intent_llm_base_url or runtime_settings.llm_base_url,
+        api_key=api_key,
+        model=runtime_settings.intent_llm_model or runtime_settings.llm_model,
+        timeout_seconds=runtime_settings.intent_llm_timeout_seconds or runtime_settings.llm_timeout_seconds,
+        max_retries=runtime_settings.intent_llm_max_retries if runtime_settings.intent_llm_max_retries is not None else runtime_settings.llm_max_retries,
+    )

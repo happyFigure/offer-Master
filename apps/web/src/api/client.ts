@@ -1,4 +1,4 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 export class ApiError extends Error {
   constructor(
@@ -11,12 +11,17 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 8_000);
-  const headers = new Headers(options.headers);
+interface ApiRequestOptions extends RequestInit {
+  timeoutMs?: number;
+}
 
-  if (options.body && !headers.has("Content-Type")) {
+export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const controller = new AbortController();
+  const { timeoutMs = 8_000, ...requestOptions } = options;
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const headers = new Headers(requestOptions.headers);
+
+  if (requestOptions.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
@@ -24,9 +29,9 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
 
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
-      ...options,
+      ...requestOptions,
       headers,
-      signal: options.signal ?? controller.signal,
+      signal: requestOptions.signal ?? controller.signal,
     });
   } catch (error: unknown) {
     if (error instanceof DOMException && error.name === "AbortError") {

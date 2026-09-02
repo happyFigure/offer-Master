@@ -4,9 +4,13 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.core.config import get_settings
+from app.agent_runtime.durable_state import models as durable_state_models  # noqa: F401
+from app.agent_runtime.external_tasks import models as external_task_models  # noqa: F401
 from app.db.base import Base
 from app.domains.applications import models as application_models  # noqa: F401
+from app.domains.agent_memory import models as agent_memory_models  # noqa: F401
 from app.domains.automation import models as automation_models  # noqa: F401
+from app.domains.conversations import models as conversation_models  # noqa: F401
 from app.domains.jobs import models as job_models  # noqa: F401
 
 config = context.config

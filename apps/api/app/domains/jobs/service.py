@@ -12,6 +12,7 @@ from app.domains.jobs.events import (
     JobLeadVerified,
 )
 from app.domains.jobs.models import (
+    ArticleCandidate,
     Company,
     Job,
     JobLead,
@@ -21,24 +22,30 @@ from app.domains.jobs.models import (
     JobSourceType,
     RawJobLead,
     RawJobLeadStatus,
+    RecruitingSignal,
     SourceSyncRun,
     SourceSyncRunStatus,
     utc_now,
 )
 from app.domains.jobs.repository import (
+    ArticleCandidateRepository,
     CompanyRepository,
     JobLeadRepository,
     JobRepository,
     JobSourceRepository,
     RawJobLeadRepository,
+    RecruitingSignalRepository,
     SourceSyncRunRepository,
 )
 from app.domains.jobs.schemas import (
+    ArticleCandidateCreate,
     JobImportDraft,
     JobLeadCreate,
     JobLeadVerification,
     JobSourceCreate,
+    JobSourceUpdate,
     RawJobLeadCreate,
+    RecruitingSignalCreate,
     SourceSyncRunCreate,
 )
 
@@ -63,6 +70,18 @@ class JobLeadCreateResult:
     lead: JobLead
     created: bool
     event: JobLeadCreated
+
+
+@dataclass(frozen=True)
+class ArticleCandidateCaptureResult:
+    candidate: ArticleCandidate
+    created: bool
+
+
+@dataclass(frozen=True)
+class RecruitingSignalCreateResult:
+    signal: RecruitingSignal
+    created: bool
 
 
 @dataclass(frozen=True)
@@ -153,15 +172,28 @@ class JobLeadService:
         sync_runs: SourceSyncRunRepository,
         raw_leads: RawJobLeadRepository,
         leads: JobLeadRepository,
+        article_candidates: ArticleCandidateRepository | None = None,
+        recruiting_signals: RecruitingSignalRepository | None = None,
     ) -> None:
         self._sources = sources
         self._sync_runs = sync_runs
         self._raw_leads = raw_leads
         self._leads = leads
+        self._article_candidates = article_candidates
+        self._recruiting_signals = recruiting_signals
 
     def create_source(self, draft: JobSourceCreate) -> JobSource:
         existing = self._sources.get_by_name(draft.name)
         if existing is not None:
+            if not existing.enabled:
+                existing.source_type = draft.source_type
+                existing.entry_url = draft.entry_url
+                existing.enabled = draft.enabled
+                existing.sync_interval_hours = draft.sync_interval_hours
+                existing.trust_level = draft.trust_level
+                existing.fetch_mode = draft.fetch_mode
+                existing.notes = draft.notes
+                existing.raw_payload = draft.raw_payload
             return existing
 
         return self._sources.add(
@@ -177,6 +209,24 @@ class JobLeadService:
                 raw_payload=draft.raw_payload,
             )
         )
+
+    def update_source(self, source_id: str, draft: JobSourceUpdate) -> JobSource:
+        source = self._require_source(source_id)
+        updates = draft.model_dump(exclude_unset=True)
+
+        if "name" in updates and updates["name"] != source.name:
+            existing = self._sources.get_by_name(updates["name"])
+            if existing is not None and existing.id != source.id:
+                raise ValueError(f"Job source name already exists: {updates['name']}")
+
+        for field, value in updates.items():
+            setattr(source, field, value)
+        return source
+
+    def disable_source(self, source_id: str) -> JobSource:
+        source = self._require_source(source_id)
+        source.enabled = False
+        return source
 
     def get_source(self, source_id: str) -> JobSource:
         return self._require_source(source_id)
@@ -324,6 +374,88 @@ class JobLeadService:
             )
         )
 
+    def capture_article_candidate(self, draft: ArticleCandidateCreate) -> ArticleCandidateCaptureResult:
+        self._require_source(draft.source_id)
+        repository = self._require_article_candidate_repository()
+        url_hash = self._content_hash(draft.url)
+        existing = repository.get_by_source_url_hash(draft.source_id, url_hash)
+        if existing is not None:
+            return ArticleCandidateCaptureResult(candidate=existing, created=False)
+
+        candidate = repository.add(
+            ArticleCandidate(
+                source_id=draft.source_id,
+                sync_run_id=draft.sync_run_id,
+                title=" ".join(draft.title.split()),
+                url=draft.url.strip(),
+                url_hash=url_hash,
+                source_account=draft.source_account,
+                published_at=draft.published_at,
+                status=draft.status,
+                raw_payload=draft.raw_payload,
+            )
+        )
+        return ArticleCandidateCaptureResult(candidate=candidate, created=True)
+
+    def create_recruiting_signal(self, draft: RecruitingSignalCreate) -> RecruitingSignalCreateResult:
+        source = self._require_source(draft.source_id)
+        repository = self._require_recruiting_signal_repository()
+        normalized_company_name = self.normalize_company_name(draft.company_name)
+        signal_hash = self._signal_hash(draft, normalized_company_name)
+        existing = repository.get_by_source_signal_hash(draft.source_id, signal_hash)
+        if existing is not None:
+            return RecruitingSignalCreateResult(signal=existing, created=False)
+
+        signal = repository.add(
+            RecruitingSignal(
+                source_id=draft.source_id,
+                raw_lead_id=draft.raw_lead_id,
+                article_candidate_id=draft.article_candidate_id,
+                signal_hash=signal_hash,
+                company_name=" ".join(draft.company_name.split()),
+                normalized_company_name=normalized_company_name,
+                signal_type=draft.signal_type,
+                graduation_year=draft.graduation_year,
+                source_url=draft.source_url,
+                original_source=draft.original_source,
+                confidence_score=draft.confidence_score,
+                trust_level=draft.trust_level or source.trust_level,
+                status=draft.status,
+                raw_payload=draft.raw_payload,
+            )
+        )
+        return RecruitingSignalCreateResult(signal=signal, created=True)
+
+    def list_article_candidates(
+        self,
+        *,
+        source_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[ArticleCandidate]:
+        return self._require_article_candidate_repository().list_filtered(
+            source_id=source_id,
+            status=status,
+            limit=limit,
+        )
+
+    def list_recruiting_signals(
+        self,
+        *,
+        source_id: str | None = None,
+        status: str | None = None,
+        company: str | None = None,
+        graduation_year: str | None = None,
+        limit: int = 100,
+    ) -> list[RecruitingSignal]:
+        return self._require_recruiting_signal_repository().list_filtered(
+            source_id=source_id,
+            status=status,
+            company=company,
+            graduation_year=graduation_year,
+            limit=limit,
+        )
+
     def verify_lead(self, lead_id: str, verification: JobLeadVerification) -> JobLead:
         lead = self._require_lead(lead_id)
         lead.verification_status = verification.verification_status
@@ -386,10 +518,24 @@ class JobLeadService:
             raise ValueError(f"Job lead not found: {lead_id}")
         return lead
 
+    def _require_article_candidate_repository(self) -> ArticleCandidateRepository:
+        if self._article_candidates is None:
+            raise ValueError("Article candidate repository is not configured")
+        return self._article_candidates
+
+    def _require_recruiting_signal_repository(self) -> RecruitingSignalRepository:
+        if self._recruiting_signals is None:
+            raise ValueError("Recruiting signal repository is not configured")
+        return self._recruiting_signals
+
     @staticmethod
     def _content_hash(raw_content: str) -> str:
         normalized = " ".join(raw_content.split())
         return sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def normalize_company_name(name: str) -> str:
+        return " ".join(name.strip().lower().split())
 
     @staticmethod
     def _is_source_due(source: JobSource, now: datetime) -> bool:
@@ -406,6 +552,18 @@ class JobLeadService:
             draft.city or "",
             draft.source_url or "",
             draft.apply_url or "",
+        ]
+        normalized = "|".join(" ".join(value.lower().split()) for value in values)
+        return sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _signal_hash(draft: RecruitingSignalCreate, normalized_company_name: str) -> str:
+        values = [
+            normalized_company_name,
+            getattr(draft.signal_type, "value", str(draft.signal_type)),
+            draft.graduation_year or "",
+            draft.source_url or "",
+            draft.original_source or "",
         ]
         normalized = "|".join(" ".join(value.lower().split()) for value in values)
         return sha256(normalized.encode("utf-8")).hexdigest()

@@ -1,0 +1,21 @@
+{
+  "name": "MiniMax",
+  "description": "MiniMax Token Plan Web Search MCP. Provides the web_search tool for Claude Code network search when using MiniMax models.",
+  "transport": "stdio",
+  "command": "uvx",
+  "args": [
+    "minimax-coding-plan-mcp",
+    "-y"
+  ],
+  "env": {
+    "MINIMAX_API_KEY": "",
+    "MINIMAX_API_HOST": "https://api.minimaxi.com"
+  },
+  "center": {
+    "mcp_id": "builtin/minimax-web-search",
+    "version": "0.1.0",
+    "source": "claude-sdk-agent-local-config",
+    "installed_at": "2026-07-07T00:00:00+08:00",
+    "builtin": true
+  }
+}

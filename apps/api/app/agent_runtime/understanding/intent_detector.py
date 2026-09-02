@@ -15,7 +15,7 @@ INTENT_DETECTOR_SYSTEM_PROMPT = """你是 OfferMaster 的意图识别器。
 不要猜系统不存在的能力，不要截断中文公司名。
 
 输出 JSON 字段：
-- intent: normal_chat | memory_lookup | campus_recruiting_search | local_company_database_overview | local_job_source_overview | offerio_company_jobs_sync | application_entry_discovery | job_match_analysis | resume_tailoring | external_agent_task
+- intent: normal_chat | memory_lookup | campus_recruiting_search | local_company_database_overview | local_company_database_list | local_job_source_overview | offerio_company_jobs_sync | application_entry_discovery | job_match_analysis | resume_tailoring | external_agent_task
 - confidence: 0 到 1
 - needs_external_info: boolean
 - risk_level: low | medium | high | critical
@@ -57,7 +57,7 @@ class DeterministicIntentMatcher:
                 candidate_intents=["local_job_source_overview"],
                 reason="matched_local_job_source_overview_question",
             )
-        if self._LOCAL_COMPANY_DATABASE_OVERVIEW_RE.search(normalized) or self._LOCAL_COMPANY_LIST_RE.search(normalized):
+        if self._LOCAL_COMPANY_DATABASE_OVERVIEW_RE.search(normalized):
             return IntentFrame(
                 intent="local_company_database_overview",
                 confidence=1.0,
@@ -66,6 +66,16 @@ class DeterministicIntentMatcher:
                 entities=EntityFrame(keywords=["企业数量", "本地数据库"]),
                 candidate_intents=["local_company_database_overview"],
                 reason="matched_local_company_database_overview_question",
+            )
+        if self._LOCAL_COMPANY_LIST_RE.search(normalized):
+            return IntentFrame(
+                intent="local_company_database_list",
+                confidence=1.0,
+                needs_external_info=False,
+                risk_level="low",
+                entities=EntityFrame(keywords=["公司列表", "本地数据库"]),
+                candidate_intents=["local_company_database_list"],
+                reason="matched_local_company_database_list_question",
             )
         if self._OFFERIO_SYNC_RE.search(normalized):
             return IntentFrame(

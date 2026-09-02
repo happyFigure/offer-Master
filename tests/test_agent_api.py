@@ -957,7 +957,7 @@ class AgentApiTest(unittest.TestCase):
         analyze_stage = stages[3]
         self.assertIn("本地", collect_stage["business_action"])
         self.assertEqual(
-            ["local.company_database_overview", "local.job_source_overview"],
+            ["database.company_list", "local.company_database_overview", "local.job_source_overview"],
             collect_stage["allowed_capabilities"],
         )
         self.assertEqual(["external.web_search"], enrich_stage["allowed_capabilities"][:1])

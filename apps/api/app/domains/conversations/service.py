@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from app.agent_runtime.memory.compaction import (
     CompactionConfig,
-    build_deterministic_summary,
     prepare_compaction,
 )
+from app.agent_runtime.memory.summary_provider import DeterministicSummaryProvider, SummaryProvider
 from app.agent_runtime.memory.token_budget import estimate_tokens
 from app.domains.conversations.models import (
     AgentContextSummary,
@@ -34,9 +35,66 @@ class AgentCompactResult:
     should_compact: bool
 
 
+@dataclass(frozen=True)
+class PreCompactionMemoryFlushCommand:
+    session_id: str
+    workflow_run_id: str | None
+    agent_run_id: str | None
+    target_scope: str
+    message_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PreCompactionMemoryFlushResult:
+    reviewed_message_count: int = 0
+    reviewed_tool_call_count: int = 0
+    created_candidate_ids: list[str] = field(default_factory=list)
+    pending_candidate_ids: list[str] = field(default_factory=list)
+    promoted_memory_ids: list[str] = field(default_factory=list)
+    merged_memory_ids: list[str] = field(default_factory=list)
+    skipped_reasons: list[str] = field(default_factory=list)
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "reviewed_message_count": self.reviewed_message_count,
+            "reviewed_tool_call_count": self.reviewed_tool_call_count,
+            "created_candidate_ids": list(self.created_candidate_ids),
+            "pending_candidate_ids": list(self.pending_candidate_ids),
+            "promoted_memory_ids": list(self.promoted_memory_ids),
+            "merged_memory_ids": list(self.merged_memory_ids),
+            "skipped_reasons": list(self.skipped_reasons),
+        }
+
+
+def _summary_json_with_previous_summary(
+    summary_json: dict | None,
+    *,
+    previous_summary_id: str | None,
+) -> dict | None:
+    if summary_json is None:
+        return None
+    payload = dict(summary_json)
+    key_decisions = payload.get("Key Decisions")
+    if isinstance(key_decisions, dict):
+        payload["Key Decisions"] = {
+            **key_decisions,
+            "previous_summary_id": previous_summary_id,
+        }
+    return payload
+
+
 class ConversationService:
-    def __init__(self, repository: ConversationRepository) -> None:
+    def __init__(
+        self,
+        repository: ConversationRepository,
+        *,
+        summary_provider: SummaryProvider | None = None,
+        pre_compaction_memory_flush: Callable[[PreCompactionMemoryFlushCommand], PreCompactionMemoryFlushResult]
+        | None = None,
+    ) -> None:
         self._repository = repository
+        self._summary_provider = summary_provider or DeterministicSummaryProvider()
+        self._pre_compaction_memory_flush = pre_compaction_memory_flush
 
     def create_session(
         self,
@@ -188,7 +246,15 @@ class ConversationService:
         self._repository.flush()
         return updated_count
 
-    def compact_session(self, session_id: str, config: CompactionConfig) -> AgentCompactResult:
+    def compact_session(
+        self,
+        session_id: str,
+        config: CompactionConfig,
+        *,
+        workflow_run_id: str | None = None,
+        agent_run_id: str | None = None,
+        target_scope: str = "agent_memory",
+    ) -> AgentCompactResult:
         self._require_session(session_id)
         latest_summary = self._repository.get_latest_summary(session_id)
         candidate_messages = self._repository.list_uncompacted_messages(session_id)
@@ -200,34 +266,33 @@ class ConversationService:
         if not plan.messages_to_summarize:
             raise ValueError(f"Agent session has no older messages to compact: {session_id}")
 
-        summary_text = build_deterministic_summary(plan)
+        pre_flush_metadata = self._run_pre_compaction_memory_flush(
+            session_id=session_id,
+            plan=plan,
+            workflow_run_id=workflow_run_id,
+            agent_run_id=agent_run_id,
+            target_scope=target_scope,
+        )
+        provider_result = self._summary_provider.summarize(plan)
+        summary_text = provider_result.summary_text
         token_estimate_after = estimate_tokens(summary_text) + plan.kept_token_estimate
         summary = self.create_context_summary(
             session_id,
             AgentContextSummaryCreate(
                 summary_text=summary_text,
-                summary_json={
-                    "Goal": "Preserve older conversation context for future Agent turns.",
-                    "Progress": {
-                        "compacted_message_count": len(plan.messages_to_summarize),
-                        "covered_message_ids": [message.id for message in plan.messages_to_summarize],
-                    },
-                    "Key Decisions": {
-                        "first_kept_message_id": plan.first_kept_message_id,
-                        "previous_summary_id": latest_summary.id if latest_summary is not None else None,
-                    },
-                    "Retrieval Hints": {
-                        "covered_message_start_id": plan.messages_to_summarize[0].id,
-                        "covered_message_end_id": plan.messages_to_summarize[-1].id,
-                    },
-                },
+                summary_json=_summary_json_with_previous_summary(
+                    provider_result.summary_json,
+                    previous_summary_id=latest_summary.id if latest_summary is not None else None,
+                ),
                 covered_message_start_id=plan.messages_to_summarize[0].id,
                 covered_message_end_id=plan.messages_to_summarize[-1].id,
                 first_kept_message_id=plan.first_kept_message_id,
                 previous_summary_id=latest_summary.id if latest_summary is not None else None,
                 token_estimate=estimate_tokens(summary_text),
-                created_by="deterministic_compactor",
+                created_by=provider_result.created_by,
                 metadata_json={
+                    **provider_result.metadata_json,
+                    "pre_compaction_memory_flush": pre_flush_metadata,
                     "token_estimate_before": plan.context_tokens,
                     "token_estimate_after": token_estimate_after,
                     "threshold_tokens": plan.threshold_tokens,
@@ -249,6 +314,36 @@ class ConversationService:
             token_estimate_after=token_estimate_after,
             should_compact=plan.should_compact,
         )
+
+    def _run_pre_compaction_memory_flush(
+        self,
+        *,
+        session_id: str,
+        plan,
+        workflow_run_id: str | None,
+        agent_run_id: str | None,
+        target_scope: str,
+    ) -> dict[str, object]:
+        if self._pre_compaction_memory_flush is None:
+            return PreCompactionMemoryFlushResult(skipped_reasons=["pre_compaction_memory_flush_not_configured"]).to_metadata()
+        try:
+            result = self._pre_compaction_memory_flush(
+                PreCompactionMemoryFlushCommand(
+                    session_id=session_id,
+                    workflow_run_id=workflow_run_id,
+                    agent_run_id=agent_run_id,
+                    target_scope=target_scope,
+                    message_ids=[message.id for message in plan.messages_to_summarize],
+                )
+            )
+            return result.to_metadata()
+        except Exception as exc:
+            return {
+                **PreCompactionMemoryFlushResult(
+                    skipped_reasons=["pre_compaction_memory_flush_failed"]
+                ).to_metadata(),
+                "error": str(exc)[:500] or exc.__class__.__name__,
+            }
 
     def _require_session(self, session_id: str) -> AgentSession:
         session = self._repository.get_session(session_id)

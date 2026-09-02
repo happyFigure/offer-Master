@@ -322,6 +322,7 @@ const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
 const RUNTIME_TOOL_LABELS: Record<string, string> = {
   agent_loop: "主 agent 循环",
   "external.web_search": "网页搜索",
+  "database.company_list": "本地公司列表",
   "local.company_database_overview": "本地企业库概览",
   "local.job_source_overview": "岗位来源概览",
   "offerio.sync_company_jobs": "OfferIO 岗位同步",

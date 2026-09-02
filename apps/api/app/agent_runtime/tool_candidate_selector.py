@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent_runtime.tool_registry import (
+    DATABASE_COMPANY_LIST_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
@@ -86,6 +87,8 @@ def _candidate_categories(definition: Any) -> frozenset[str]:
         return frozenset({"public_web_information", "realtime_public_information"})
     if capability_id == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         return frozenset({"local_company_data", "local_database"})
+    if capability_id == DATABASE_COMPANY_LIST_TOOL:
+        return frozenset({"local_company_list"})
     if capability_id == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
         return frozenset({"local_job_source_data", "local_database"})
     return frozenset()
@@ -106,10 +109,16 @@ def _detect_task_signals(user_message: str) -> tuple[str, ...]:
         return file_signals
     if _looks_like_local_company_profile_request(text):
         signals.append("local_company_profile")
-    elif _looks_like_local_job_search_request(text):
-        signals.append("local_job_search")
+    elif _looks_like_local_source_search_request(text):
+        signals.append("local_source_search")
     elif _looks_like_local_job_source_data_request(text):
         signals.append("local_job_source_data")
+    elif _looks_like_local_job_search_request(text):
+        signals.append("local_job_search")
+    elif _looks_like_local_company_list_request(text):
+        signals.append("local_company_list")
+    elif _looks_like_local_company_search_request(text):
+        signals.append("local_company_search")
     elif _looks_like_local_company_data_request(text):
         signals.append("local_company_data")
     if signals:
@@ -230,10 +239,38 @@ def _looks_like_local_job_source_data_request(text: str) -> bool:
     return any(marker in text for marker in source_markers) and any(marker in text for marker in query_markers)
 
 
+def _looks_like_local_source_search_request(text: str) -> bool:
+    source_markers = ("岗位来源", "来源库", "校招来源", "招聘来源")
+    filter_markers = ("官方", "公众号", "微信", "小红书", "启用", "禁用", "可信", "类型", "来源详情")
+    query_markers = ("查", "搜", "搜索", "看", "有哪些", "列出", "找")
+    return (
+        any(marker in text for marker in source_markers)
+        and any(marker in text for marker in filter_markers)
+        and any(marker in text for marker in query_markers)
+    )
+
+
 def _looks_like_local_company_data_request(text: str) -> bool:
     local_markers = ("数据库", "本地", "我的", "已有", "投递板", "岗位展览", "公司库", "企业库")
     company_markers = ("公司", "企业", "厂", "岗位线索", "校招来源")
     return any(marker in text for marker in local_markers) and any(marker in text for marker in company_markers)
+
+
+def _looks_like_local_company_search_request(text: str) -> bool:
+    local_markers = ("数据库", "本地", "我的", "已有", "公司库", "企业库")
+    lookup_markers = ("有没有记录", "是否有", "有没有", "存不存在", "是否存在", "有无", "查数据库", "查本地")
+    return any(marker in text for marker in local_markers) and any(marker in text for marker in lookup_markers)
+
+
+def _looks_like_local_company_list_request(text: str) -> bool:
+    local_markers = ("数据库", "本地", "我的", "已有", "公司库", "企业库", "库里")
+    company_markers = ("公司", "企业")
+    list_markers = ("有哪些", "列表", "列出", "展示", "多少个", "多少家")
+    return (
+        any(marker in text for marker in local_markers)
+        and any(marker in text for marker in company_markers)
+        and any(marker in text for marker in list_markers)
+    )
 
 
 def _looks_like_local_company_profile_request(text: str) -> bool:

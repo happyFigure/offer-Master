@@ -10,6 +10,7 @@ AgentIntent = Literal[
     "memory_lookup",
     "campus_recruiting_search",
     "local_company_database_overview",
+    "local_company_database_list",
     "local_job_source_overview",
     "offerio_company_jobs_sync",
     "application_entry_discovery",

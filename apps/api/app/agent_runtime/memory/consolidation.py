@@ -30,6 +30,7 @@ class MemoryConsolidationCommand:
     workflow_run_id: str
     agent_run_id: str | None
     target_scope: str
+    message_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -68,7 +69,7 @@ class MemoryConsolidationService:
         self._promotion_service = MemoryPromotionService(self._repository)
 
     def consolidate(self, command: MemoryConsolidationCommand) -> MemoryConsolidationResult:
-        messages = self._messages(command.session_id)
+        messages = self._messages(command.session_id, message_ids=command.message_ids)
         tool_logs = self._tool_logs(command.workflow_run_id)
         drafts = extract_memory_candidates(messages=messages, tool_logs=tool_logs)
         scored_candidates = deduplicate_memory_candidates(
@@ -110,15 +111,18 @@ class MemoryConsolidationService:
 
         return result
 
-    def _messages(self, session_id: str | None) -> list[AgentMessage]:
+    def _messages(self, session_id: str | None, *, message_ids: list[str] | None = None) -> list[AgentMessage]:
         if not session_id:
             return []
+        statement = (
+            select(AgentMessage)
+            .where(AgentMessage.session_id == session_id)
+            .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
+        )
+        if message_ids:
+            statement = statement.where(AgentMessage.id.in_(message_ids))
         return list(
-            self._session.scalars(
-                select(AgentMessage)
-                .where(AgentMessage.session_id == session_id)
-                .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
-            ).all()
+            self._session.scalars(statement).all()
         )
 
     def _tool_logs(self, workflow_run_id: str) -> list[ToolCallLog]:

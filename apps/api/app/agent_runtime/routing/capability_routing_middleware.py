@@ -6,6 +6,7 @@ from app.agent_runtime.routing.schemas import RouteDecision
 from app.agent_runtime.tool_input import requested_sample_limit_from_text
 from app.agent_runtime.tool_registry import (
     APPLICATION_FIND_APPLY_ENTRY_TOOL,
+    DATABASE_COMPANY_LIST_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
@@ -114,6 +115,22 @@ class CapabilityRoutingMiddleware:
                 allowed_capabilities=allowed_capabilities,
                 blocked_capabilities=excluded_capabilities,
                 tool_input={"sample_limit": sample_limit},
+                metadata={"read_only": True, "sync_policy": dict(sync_policy)},
+            )
+
+        if intent == "local_company_database_list" and DATABASE_COMPANY_LIST_TOOL in allowed_capabilities:
+            sync_policy = context_pack.get("sync_policy") if isinstance(context_pack.get("sync_policy"), dict) else {}
+            limit = requested_sample_limit_from_text(user_message, default=int(sync_policy.get("default_limit") or 20))
+            return RouteDecision(
+                route="local_workflow",
+                capability=DATABASE_COMPANY_LIST_TOOL,
+                executor_type="local_workflow",
+                executor_name="company_database_list",
+                confidence=1.0,
+                reason="local_company_database_list is a read-only local company listing workflow",
+                allowed_capabilities=allowed_capabilities,
+                blocked_capabilities=excluded_capabilities,
+                tool_input={"limit": limit},
                 metadata={"read_only": True, "sync_policy": dict(sync_policy)},
             )
 

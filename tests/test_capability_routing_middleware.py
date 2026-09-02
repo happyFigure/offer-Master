@@ -121,19 +121,20 @@ class CapabilityRoutingMiddlewareTest(unittest.TestCase):
 
     def test_routes_local_company_database_question_with_requested_count_to_readonly_workflow(self) -> None:
         from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
-        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL
 
-        context_pack = self._context_pack(intent="local_company_database_overview")
+        context_pack = self._context_pack(intent="local_company_database_list")
 
         decision = CapabilityRoutingMiddleware().decide(
             user_message="给我看一下有哪些公司，给我37个就行",
-            intent_frame={"intent": "local_company_database_overview", "confidence": 1.0, "risk_level": "low"},
+            intent_frame={"intent": "local_company_database_list", "confidence": 1.0, "risk_level": "low"},
             context_pack=context_pack,
         )
 
         self.assertEqual("local_workflow", decision.route)
-        self.assertEqual(LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, decision.capability)
-        self.assertEqual({"sample_limit": 37}, decision.tool_input)
+        self.assertEqual(DATABASE_COMPANY_LIST_TOOL, decision.capability)
+        self.assertEqual("company_database_list", decision.executor_name)
+        self.assertEqual({"limit": 37}, decision.tool_input)
 
     def test_routes_job_source_count_question_to_readonly_job_source_workflow(self) -> None:
         from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware

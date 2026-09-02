@@ -32,14 +32,14 @@ class ToolCandidateSelectorTest(unittest.TestCase):
 
     def test_selects_local_company_database_for_local_company_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
-        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, create_default_agent_tool_registry
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL, create_default_agent_tool_registry
 
         selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
             "数据库里有哪些公司，给我20个"
         )
 
-        self.assertEqual((LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,), selection.capabilities)
-        self.assertIn("local_company_data", selection.signals)
+        self.assertEqual((DATABASE_COMPANY_LIST_TOOL,), selection.capabilities)
+        self.assertIn("local_company_list", selection.signals)
 
     def test_selects_database_company_profile_for_specific_company_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
@@ -51,6 +51,17 @@ class ToolCandidateSelectorTest(unittest.TestCase):
 
         self.assertEqual((DATABASE_COMPANY_PROFILE_TOOL,), selection.capabilities)
         self.assertIn("local_company_profile", selection.signals)
+
+    def test_selects_database_company_search_for_named_company_existence_question(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_SEARCH_TOOL, create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "查数据库里腾讯和京东有没有记录"
+        )
+
+        self.assertEqual((DATABASE_COMPANY_SEARCH_TOOL,), selection.capabilities)
+        self.assertIn("local_company_search", selection.signals)
 
     def test_selects_database_job_search_for_local_job_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
@@ -73,6 +84,17 @@ class ToolCandidateSelectorTest(unittest.TestCase):
 
         self.assertEqual((LOCAL_JOB_SOURCE_OVERVIEW_TOOL,), selection.capabilities)
         self.assertIn("local_job_source_data", selection.signals)
+
+    def test_selects_database_source_search_for_source_filter_question(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import DATABASE_SOURCE_SEARCH_TOOL, create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "查一下本地岗位来源库里有哪些官方来源"
+        )
+
+        self.assertEqual((DATABASE_SOURCE_SEARCH_TOOL,), selection.capabilities)
+        self.assertIn("local_source_search", selection.signals)
 
     def test_selects_declared_agent_capability_from_capability_registry(self) -> None:
         from app.agent_runtime.agent_as_tool import AgentCapabilityDefinition, AgentCapabilityRegistry

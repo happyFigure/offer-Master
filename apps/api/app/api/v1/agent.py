@@ -46,6 +46,13 @@ from app.agent_runtime.external_tasks.configured import (
     build_external_web_search_callback,
 )
 from app.agent_runtime.memory.compaction import CompactionConfig
+from app.agent_runtime.memory.consolidation import MemoryConsolidationCommand, MemoryConsolidationService
+from app.agent_runtime.memory.summary_provider import (
+    DeterministicSummaryProvider,
+    HybridSummaryProvider,
+    LLMSummaryProvider,
+    SummaryProvider,
+)
 from app.agent_runtime.memory.skill_repository import AgentSkillRepository
 from app.agent_runtime.output_sanitizer import (
     contains_false_tool_execution_claim,
@@ -56,6 +63,7 @@ from app.agent_runtime.output_sanitizer import (
 from app.agent_runtime.planning.execution_planner import HybridExecutionPlanner
 from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
 from app.agent_runtime.tool_registry import (
+    DATABASE_COMPANY_LIST_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
@@ -66,6 +74,7 @@ from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.domains.agent_memory.repository import AgentMemoryRepository
+from app.domains.agent_memory.service import AgentLearningService
 from app.domains.automation.repository import (
     ApprovalRequestRepository,
     ToolCallLogRepository,
@@ -91,7 +100,7 @@ from app.domains.conversations.schemas import (
     AgentSessionUpdate,
     AgentUserMessageRequest,
 )
-from app.domains.conversations.service import ConversationService
+from app.domains.conversations.service import ConversationService, PreCompactionMemoryFlushResult
 from app.infrastructure.llm.chat_client import LLMChatClient
 from app.infrastructure.llm.client import build_intent_llm_runtime_config, build_llm_runtime_config
 from app.mcp_gateway.content_source_client import ContentSourceMCPClient
@@ -121,10 +130,10 @@ DEFAULT_TASK_PLAN_STAGES: tuple[dict[str, object], ...] = (
         "title": "收集本地候选信息",
         "objective": "查询本地公司库、岗位线索、校招来源等已有信息。",
         "business_action": "先看 OfferMaster 本地数据库里已经有什么公司、岗位线索和校招来源。",
-        "allowed_capabilities": [LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, LOCAL_JOB_SOURCE_OVERVIEW_TOOL],
+        "allowed_capabilities": [DATABASE_COMPANY_LIST_TOOL, LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, LOCAL_JOB_SOURCE_OVERVIEW_TOOL],
         "tool_strategy": {
             "mode": "allowlist",
-            "description": "本阶段只允许本地只读概览工具，不直接联网，也不做会修改数据的同步动作。",
+            "description": "本阶段只允许本地只读数据库工具，不直接联网，也不做会修改数据的同步动作。",
         },
         "capability": "agent.stage.collect_candidates",
         "depends_on": ["clarify_goal"],
@@ -1861,6 +1870,8 @@ def _tool_log_handoff_summary(tool_log: ToolCallLog) -> str:
     result_payload = output_payload.get("result") if isinstance(output_payload.get("result"), dict) else {}
     local_result = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
     envelope = result_payload.get("result_envelope") if isinstance(result_payload.get("result_envelope"), dict) else {}
+    if tool_log.tool_name == DATABASE_COMPANY_LIST_TOOL and local_result:
+        return _database_company_list_handoff_summary(local_result)
     if tool_log.tool_name == "local.company_database_overview" and local_result:
         return _local_company_overview_handoff_summary(local_result)
     if tool_log.tool_name == "local.job_source_overview" and local_result:
@@ -1885,6 +1896,20 @@ def _local_company_overview_handoff_summary(result: dict[str, object]) -> str:
         f"岗位线索 {lead_count} 条，去重企业 {lead_company_count} 家；"
         f"公司校招来源 {signal_count} 条，去重企业 {signal_company_count} 家。"
     )
+
+
+def _database_company_list_handoff_summary(result: dict[str, object]) -> str:
+    total_count = _int_payload_value(result.get("total_count"))
+    display_count = _int_payload_value(result.get("count"))
+    companies = result.get("companies") if isinstance(result.get("companies"), list) else []
+    names = []
+    for company in companies[:8]:
+        if isinstance(company, dict):
+            name = str(company.get("company_name") or "").strip()
+            if name:
+                names.append(name)
+    name_text = "，样例：" + "、".join(names) if names else ""
+    return f"本地公司列表：去重公司 {total_count} 家，本次展示 {display_count} 家{name_text}。"
 
 
 def _local_job_source_handoff_summary(result: dict[str, object]) -> str:
@@ -1948,7 +1973,7 @@ def _set_plan_stage_status(
 
 def _plan_stage_index_for_tool_name(tool_name: str | None) -> int | None:
     name = str(tool_name or "")
-    if name.startswith("local.") or name.startswith("offerio."):
+    if name.startswith("database.") or name.startswith("local.") or name.startswith("offerio."):
         return 2
     if name.startswith("external.") or "web_search" in name or "xiaohongshu" in name or "wechat" in name:
         return 3
@@ -2864,7 +2889,42 @@ def _apply_approval_decision_for_response(approval: ApprovalRequest, *, status: 
 
 
 def _conversation_service(session: Session) -> ConversationService:
-    return ConversationService(ConversationRepository(session))
+    settings = get_settings()
+    memory_repository = AgentMemoryRepository(session)
+    return ConversationService(
+        ConversationRepository(session),
+        summary_provider=_build_agent_summary_provider(settings),
+        pre_compaction_memory_flush=_build_pre_compaction_memory_flush(session, memory_repository),
+    )
+
+
+def _build_pre_compaction_memory_flush(session: Session, memory_repository: AgentMemoryRepository):
+    learning_service = AgentLearningService(memory_repository)
+    consolidation_service = MemoryConsolidationService(session=session, learning_service=learning_service)
+
+    def flush(command) -> PreCompactionMemoryFlushResult:
+        if not command.workflow_run_id:
+            return PreCompactionMemoryFlushResult(skipped_reasons=["workflow_run_id_missing"])
+        result = consolidation_service.consolidate(
+            MemoryConsolidationCommand(
+                session_id=command.session_id,
+                workflow_run_id=command.workflow_run_id,
+                agent_run_id=command.agent_run_id,
+                target_scope=command.target_scope,
+                message_ids=list(command.message_ids),
+            )
+        )
+        return PreCompactionMemoryFlushResult(
+            reviewed_message_count=result.reviewed_message_count,
+            reviewed_tool_call_count=result.reviewed_tool_call_count,
+            created_candidate_ids=list(result.created_candidate_ids),
+            pending_candidate_ids=list(result.pending_candidate_ids),
+            promoted_memory_ids=list(result.promoted_memory_ids),
+            merged_memory_ids=list(result.merged_memory_ids),
+            skipped_reasons=list(result.skipped_reasons),
+        )
+
+    return flush
 
 
 def _automation_service(session: Session) -> AutomationService:
@@ -3436,6 +3496,18 @@ def _build_agent_llm_client(settings) -> LLMChatClient | None:
         return LLMChatClient(config=build_llm_runtime_config(settings))
     except ValueError:
         return None
+
+
+def _build_agent_summary_provider(settings, *, llm_client: LLMChatClient | None = None) -> SummaryProvider:
+    mode = str(getattr(settings, "agent_summary_provider", "deterministic") or "deterministic").strip().lower()
+    if mode in {"hybrid", "llm", "llm_hybrid"}:
+        candidate_llm_client = llm_client or _build_agent_llm_client(settings)
+        if candidate_llm_client is not None:
+            return HybridSummaryProvider(
+                primary=LLMSummaryProvider(llm_client=candidate_llm_client),
+                fallback=DeterministicSummaryProvider(),
+            )
+    return DeterministicSummaryProvider()
 
 
 def _build_agent_intent_detector(settings) -> HybridIntentDetector:

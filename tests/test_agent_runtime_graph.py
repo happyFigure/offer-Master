@@ -36,7 +36,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self,
         session,
         *,
+        memory_repository=None,
         skill_repository=None,
+        conversation_service=None,
         llm_client=None,
         intent_detector=None,
         execution_planner=None,
@@ -66,9 +68,10 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         return AgentGraphDependencies(
             automation_service=automation_service,
             checkpoint_store=AgentCheckpointStore(session=session, automation_service=automation_service),
-            conversation_service=ConversationService(ConversationRepository(session)),
+            conversation_service=conversation_service or ConversationService(ConversationRepository(session)),
             registry=create_default_agent_tool_registry(),
             guard=AgentToolRuntimeGuard(policy=AgentToolPolicy(max_tool_calls=10)),
+            memory_repository=memory_repository,
             skill_repository=skill_repository,
             db_session=session,
             llm_client=llm_client,
@@ -151,6 +154,52 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 )
 
                 self.assertEqual({"sample_limit": expected_limit}, _resolved_tool_input(command, state))
+
+    def test_database_company_list_uses_requested_limit_from_user_message(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, _resolved_tool_input
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL
+
+        for message, expected_limit in (
+            ("给我看一下有哪些公司，给我20个就行", 20),
+            ("列出三十七家公司", 37),
+            ("给我80家公司", 50),
+        ):
+            with self.subTest(message=message):
+                command = AgentRunCommand(
+                    session_id="session-1",
+                    user_message=message,
+                    requested_tool_name=DATABASE_COMPANY_LIST_TOOL,
+                )
+                state = AgentState(
+                    session_id="session-1",
+                    workflow_run_id="workflow-1",
+                    agent_run_id="agent-run-1",
+                    user_message=message,
+                    current_step="maybe_tool",
+                    requested_tool_name=DATABASE_COMPANY_LIST_TOOL,
+                )
+
+                self.assertEqual({"limit": expected_limit}, _resolved_tool_input(command, state))
+
+    def test_database_company_list_runtime_helpers_are_labeled_as_local_collection(self) -> None:
+        from app.agent_runtime.graph_factory import (
+            _runtime_reasoning_summary,
+            format_runtime_capability_name,
+        )
+        from app.api.v1.agent import _plan_stage_index_for_tool_name
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL
+
+        self.assertEqual("本地公司列表", format_runtime_capability_name(DATABASE_COMPANY_LIST_TOOL))
+        self.assertEqual(2, _plan_stage_index_for_tool_name(DATABASE_COMPANY_LIST_TOOL))
+        self.assertIn(
+            "本地公司列表",
+            _runtime_reasoning_summary(
+                DATABASE_COMPANY_LIST_TOOL,
+                tool_input={"limit": 20},
+                user_message="数据库里有哪些公司，给我20个",
+            ),
+        )
 
     def test_agent_run_checkpoints_loaded_skill_ids_from_runtime_context(self) -> None:
         from app.agent_runtime.checkpoints import AgentCheckpointStore
@@ -237,6 +286,51 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertIn("ContextBuilder loaded session history", snapshots_by_memory_id[previous_message.id].usage_reason)
         self.assertFalse(snapshots_by_memory_id[skill.id].passed_to_executor)
         self.assertFalse(snapshots_by_memory_id[previous_message.id].passed_to_executor)
+
+    def test_context_builder_loaded_long_term_memory_is_recorded_as_memory_snapshot(self) -> None:
+        from app.agent_runtime.durable_state.models import AgentMemorySnapshot
+        from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
+        from app.agent_runtime.durable_state.service import DurableStateService
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.agent_memory.models import AgentMemory, AgentMemoryStatus
+        from app.domains.agent_memory.repository import AgentMemoryRepository
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            memory = AgentMemory(
+                id="memory-submit-confirmation",
+                memory_type="user_preference",
+                scope="application_submission",
+                title="投递前必须用户确认",
+                content="任何岗位最终提交前都必须等待用户确认。",
+                source_type="user_profile",
+                status=AgentMemoryStatus.ACTIVE,
+                importance=95,
+            )
+            session.add(memory)
+            session.commit()
+
+            durable_state_service = DurableStateService(SqlAlchemyDurableStateRepository(session))
+            dependencies = self._dependencies(
+                session,
+                memory_repository=AgentMemoryRepository(session),
+                durable_state_service=durable_state_service,
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="帮我投递腾讯 Java 岗位"),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+            snapshots = list(session.scalars(select(AgentMemorySnapshot)).all())
+
+        snapshots_by_memory_id = {snapshot.memory_id: snapshot for snapshot in snapshots}
+        self.assertEqual([memory.id], result.state.loaded_memory_ids)
+        self.assertIn(memory.id, snapshots_by_memory_id)
+        self.assertEqual("agent_memory", snapshots_by_memory_id[memory.id].source_type)
+        self.assertIn("ContextBuilder loaded long-term memory", snapshots_by_memory_id[memory.id].usage_reason)
+        self.assertFalse(snapshots_by_memory_id[memory.id].passed_to_executor)
 
     def test_high_risk_tool_stops_at_waiting_user_confirmation_node(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -2601,7 +2695,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
     def test_tool_choice_loop_enters_local_company_database_without_fixed_intent(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL
         from app.agent_runtime.understanding.schemas import IntentFrame
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
         from app.domains.jobs.models import Company
@@ -2621,14 +2715,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "腾讯" not in combined:
-                    test_case.assertEqual(["local_company_database_overview"], [tool["function"]["name"] for tool in tools])
+                    test_case.assertEqual(["database_company_list"], [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
-                                id="call-local-company-db",
-                                name="local_company_database_overview",
-                                arguments={"sample_limit": 20},
+                                id="call-database-company-list",
+                                name="database_company_list",
+                                arguments={"limit": 20},
                             )
                         ],
                     )
@@ -2655,12 +2749,12 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        self.assertEqual(LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, result.state.requested_tool_name)
+        self.assertEqual(DATABASE_COMPANY_LIST_TOOL, result.state.requested_tool_name)
         self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertEqual("下面是本地数据库里的公司表格，包含腾讯和 Canonical Ltd.。", result.state.final_response)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual(LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, tool_log.tool_name)
-        self.assertEqual({"sample_limit": 20}, tool_log.input_payload)
+        self.assertEqual(DATABASE_COMPANY_LIST_TOOL, tool_log.tool_name)
+        self.assertEqual({"limit": 20}, tool_log.input_payload)
         self.assertEqual(2, len(fake_llm.calls))
 
     def test_tool_choice_loop_enters_local_job_source_overview_without_fixed_intent(self) -> None:
@@ -4528,6 +4622,69 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertNotIn("Canonical Ltd.", content)
         self.assertNotIn("腾讯", content)
 
+    def test_tool_summary_formats_database_company_list_as_markdown_table(self) -> None:
+        from app.agent_runtime.graph_factory import tool_result_summary_response
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL
+
+        state = AgentState(
+            session_id="session-company-list-summary",
+            workflow_run_id="workflow-company-list-summary",
+            agent_run_id="agent-run-company-list-summary",
+            user_message="给我看一下有哪些公司，给我20个就行",
+            current_step="maybe_tool",
+            requested_tool_name=DATABASE_COMPANY_LIST_TOOL,
+            llm_messages=[
+                {
+                    "role": "assistant",
+                    "content": "Tool result: database.company_list succeeded",
+                    "metadata": {
+                        "content_json": {
+                            "tool_name": DATABASE_COMPANY_LIST_TOOL,
+                            "status": "succeeded",
+                            "result": {
+                                "tool_name": DATABASE_COMPANY_LIST_TOOL,
+                                "ok": True,
+                                "result": {
+                                    "total_count": 3,
+                                    "count": 2,
+                                    "companies": [
+                                        {
+                                            "company_name": "阿里巴巴",
+                                            "has_profile": True,
+                                            "job_count": 2,
+                                            "lead_count": 0,
+                                            "signal_count": 1,
+                                            "total_record_count": 3,
+                                        },
+                                        {
+                                            "company_name": "腾讯",
+                                            "has_profile": True,
+                                            "job_count": 1,
+                                            "lead_count": 2,
+                                            "signal_count": 1,
+                                            "total_record_count": 4,
+                                        },
+                                    ],
+                                },
+                            },
+                        }
+                    },
+                }
+            ],
+        )
+
+        response = tool_result_summary_response(state)
+
+        self.assertIsNotNone(response)
+        content, mode = response
+        self.assertEqual("tool_result_summary", mode)
+        self.assertIn("当前本地数据库去重公司共 3 家", content)
+        self.assertIn("| 公司 | 企业档案 | 正式岗位 | 岗位线索 | 招聘来源 | 已有记录 |", content)
+        self.assertIn("| 阿里巴巴 | 有 | 2 | 0 | 1 | 3 |", content)
+        self.assertIn("| 腾讯 | 有 | 1 | 2 | 1 | 4 |", content)
+        self.assertIn("本次展示 2 家", content)
+
     def test_agent_run_uses_llm_client_for_final_response(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
 
@@ -4873,6 +5030,71 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertGreater(result.state.context_metadata["auto_compacted_message_count"], 0)
         self.assertFalse(result.state.need_compaction)
         self.assertTrue(any(message.compacted_by_summary_id == summaries[0].id for message in messages))
+
+    def test_agent_run_auto_compaction_flushes_memory_before_summary(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.repository import ConversationRepository
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.domains.conversations.service import (
+            ConversationService,
+            PreCompactionMemoryFlushResult,
+        )
+
+        class FakeLLMClient:
+            def complete(self, *, messages):
+                from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+                return LLMChatCompletion(content="ok")
+
+        flush_commands = []
+
+        def flush_memory(command):
+            flush_commands.append(command)
+            return PreCompactionMemoryFlushResult(
+                reviewed_message_count=len(command.message_ids),
+                created_candidate_ids=["candidate-auto-compact"],
+                pending_candidate_ids=["candidate-auto-compact"],
+            )
+
+        with self.Session() as session:
+            conversation_service = ConversationService(
+                ConversationRepository(session),
+                pre_compaction_memory_flush=flush_memory,
+            )
+            created = conversation_service.create_session(title="auto compact flush", primary_intent="agent_chat")
+            session_id = created.id
+            for index in range(8):
+                conversation_service.append_message(
+                    session_id,
+                    AgentMessageCreate(
+                        role=AgentMessageRole.USER if index % 2 == 0 else AgentMessageRole.ASSISTANT,
+                        content_text=f"large historical message {index}",
+                        visible_content_text=f"large historical message {index}",
+                        token_estimate=10_000,
+                    ),
+                )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="new turn after a long transcript"),
+                dependencies=self._dependencies(
+                    session,
+                    conversation_service=conversation_service,
+                    llm_client=FakeLLMClient(),
+                ),
+            )
+            session.commit()
+
+        self.assertEqual(1, len(flush_commands))
+        self.assertEqual(session_id, flush_commands[0].session_id)
+        self.assertEqual(result.workflow_run_id, flush_commands[0].workflow_run_id)
+        self.assertEqual(result.state.agent_run_id, flush_commands[0].agent_run_id)
+        self.assertEqual("agent_chat", flush_commands[0].target_scope)
+        self.assertGreater(len(flush_commands[0].message_ids), 0)
+        self.assertEqual(
+            ["candidate-auto-compact"],
+            result.state.context_metadata["auto_compaction_memory_flush"]["created_candidate_ids"],
+        )
 
     def test_checkpoint_store_makes_checkpoint_timestamps_monotonic(self) -> None:
         from app.agent_runtime.checkpoints import AgentCheckpointStore

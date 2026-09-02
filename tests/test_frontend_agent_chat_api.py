@@ -75,6 +75,7 @@ class FrontendAgentChatApiTest(TestCase):
         self.assertIn("appendRuntimeEvent", app_source)
         self.assertIn("formatRuntimeEventSummary", app_source)
         self.assertIn("执行过程", app_source)
+        self.assertIn('"database.company_list": "本地公司列表"', app_source)
         self.assertIn('"local.company_database_overview": "本地企业库概览"', app_source)
         self.assertIn('event.toolName?.includes("database")', app_source)
         self.assertIn("onOuterSessionEvent", app_source)

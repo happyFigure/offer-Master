@@ -10,6 +10,7 @@ from app.agent_runtime.tool_permissions import (
     AgentToolPermissionResult,
 )
 from app.agent_runtime.tool_registry import (
+    DATABASE_COMPANY_LIST_TOOL,
     DATABASE_COMPANY_PROFILE_TOOL,
     DATABASE_COMPANY_SEARCH_TOOL,
     DATABASE_JOB_SEARCH_TOOL,
@@ -44,6 +45,7 @@ LOW_RISK_RUNTIME_CAPABILITY_TOOLS = frozenset(
     {
         EXTERNAL_WEB_SEARCH_TOOL,
         DATABASE_COMPANY_SEARCH_TOOL,
+        DATABASE_COMPANY_LIST_TOOL,
         DATABASE_COMPANY_PROFILE_TOOL,
         DATABASE_JOB_SEARCH_TOOL,
         DATABASE_SOURCE_SEARCH_TOOL,

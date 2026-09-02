@@ -63,6 +63,7 @@ from app.agent_runtime.textual_tool_call_recovery import TextualToolCall, recove
 from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 from app.agent_runtime.tool_registry import (
     APPLICATION_FIND_APPLY_ENTRY_TOOL,
+    DATABASE_COMPANY_LIST_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
@@ -1117,6 +1118,7 @@ def _tool_choice_loop_event_summary(event_type: str, *, capability: str | None) 
 
 def format_runtime_capability_name(capability: str | None) -> str:
     return {
+        DATABASE_COMPANY_LIST_TOOL: "本地公司列表",
         EXTERNAL_WEB_SEARCH_TOOL: "网页搜索",
         LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL: "本地企业库概览",
         LOCAL_JOB_SOURCE_OVERVIEW_TOOL: "岗位来源概览",
@@ -2195,6 +2197,8 @@ def _loop_agent_observation_summary(
         return str(result["answer"])
     if requested_tool_name == OFFERIO_COMPANY_JOBS_TOOL:
         return _offerio_sync_summary_response(payload)
+    if requested_tool_name == DATABASE_COMPANY_LIST_TOOL:
+        return _database_company_list_summary_response(payload)
     if requested_tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         return _company_database_overview_summary_response(payload)
     if requested_tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
@@ -2279,7 +2283,11 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
                     reserve_tokens=config.reserve_tokens,
                     keep_recent_tokens=config.keep_recent_tokens,
                 ),
+                workflow_run_id=state.workflow_run_id,
+                agent_run_id=state.agent_run_id,
+                target_scope=state.source_type,
             )
+            memory_flush_metadata = (compact_result.summary.metadata_json or {}).get("pre_compaction_memory_flush")
             built = MemoryContextBuilder(
                 dependencies.conversation_service,
                 memory_repository=dependencies.memory_repository,
@@ -2295,6 +2303,7 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
                 "auto_compacted_message_count": compact_result.covered_message_count,
                 "auto_compacted_token_estimate_before": compact_result.token_estimate_before,
                 "auto_compacted_token_estimate_after": compact_result.token_estimate_after,
+                "auto_compaction_memory_flush": memory_flush_metadata if isinstance(memory_flush_metadata, dict) else None,
             }
         except ValueError as exc:
             auto_compaction_metadata = {
@@ -2889,6 +2898,10 @@ def _runtime_reasoning_summary(tool_name: str, *, tool_input: dict[str, Any], us
     if tool_name == EXTERNAL_WEB_SEARCH_TOOL:
         query = str(tool_input.get("query") or user_message).strip()
         return f"当前问题需要公开信息核对，主 agent 准备通过网页搜索确认：{query}。"
+    if tool_name == DATABASE_COMPANY_LIST_TOOL:
+        limit = tool_input.get("limit")
+        limit_text = f"，本次最多展示 {limit} 家" if isinstance(limit, int) else ""
+        return f"当前问题需要读取本地公司列表，主 agent 会使用本地只读数据库工具{limit_text}。"
     if tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         return "当前问题可以先查本地企业库，主 agent 会优先使用本地只读工具。"
     if tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
@@ -3386,6 +3399,16 @@ def _context_snapshot_refs(state: AgentState) -> list[dict[str, Any]]:
                 "memory_payload": {"skill_id": str(skill_id)},
             }
         )
+    for memory_id in state.loaded_memory_ids:
+        refs.append(
+            {
+                "memory_id": str(memory_id),
+                "source_type": "agent_memory",
+                "usage_reason": "ContextBuilder loaded long-term memory for this run",
+                "visibility_scope": AgentMemoryVisibilityScope.MAIN_AGENT_ONLY,
+                "memory_payload": {"memory_id": str(memory_id)},
+            }
+        )
     for message_id in state.loaded_session_history_ids:
         refs.append(
             {
@@ -3587,6 +3610,8 @@ def _resolved_tool_input(command: AgentRunCommand, state: AgentState) -> dict[st
         return {"session_key": state.session_id, "window_before": 5, "window_after": 5}
     if command.requested_tool_name == OFFERIO_COMPANY_JOBS_TOOL:
         return {"limit": 1000}
+    if command.requested_tool_name == DATABASE_COMPANY_LIST_TOOL:
+        return {"limit": requested_sample_limit_from_text(state.user_message)}
     if command.requested_tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         return {"sample_limit": requested_sample_limit_from_text(state.user_message)}
     if command.requested_tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
@@ -3822,6 +3847,11 @@ def tool_result_summary_response(
     *,
     dependencies: AgentGraphDependencies | None = None,
 ) -> tuple[str, str] | None:
+    if state.requested_tool_name == DATABASE_COMPANY_LIST_TOOL:
+        payload = _latest_tool_result_payload(state, DATABASE_COMPANY_LIST_TOOL)
+        if payload is None:
+            return None
+        return _database_company_list_summary_response(payload), "tool_result_summary"
     if state.requested_tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         payload = _latest_tool_result_payload(state, LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL)
         if payload is None:
@@ -4038,6 +4068,54 @@ def _offerio_sync_summary_response(payload: dict[str, Any]) -> str:
     if sync_run_id:
         summary += f" 同步任务：{sync_run_id}。"
     return summary
+
+
+def _database_company_list_summary_response(payload: dict[str, Any]) -> str:
+    tool_result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    result = tool_result.get("result") if isinstance(tool_result.get("result"), dict) else {}
+    ok = payload.get("status") == "succeeded" and _tool_result_ok(tool_result)
+    if not ok:
+        error = payload.get("error") or tool_result.get("error") or result.get("message")
+        return f"本地公司列表读取失败：{error or 'unknown error'}。"
+
+    total_count = _safe_count(result.get("total_count"))
+    display_count = _safe_count(result.get("count"))
+    companies = result.get("companies") if isinstance(result.get("companies"), list) else []
+    response = f"当前本地数据库去重公司共 {total_count} 家，本次展示 {display_count} 家："
+    table = _database_company_list_markdown_table(companies)
+    if table:
+        response += f"\n\n{table}"
+    else:
+        response += "\n\n没有可展示的公司记录。"
+    response += "\n\n说明：这里汇总正式企业、正式岗位、岗位线索和招聘来源信号中的公司名称；只读展示，不会修改数据库。"
+    return response
+
+
+def _database_company_list_markdown_table(companies: list[Any]) -> str:
+    if not companies:
+        return ""
+    lines = [
+        "| 公司 | 企业档案 | 正式岗位 | 岗位线索 | 招聘来源 | 已有记录 |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for company in companies:
+        if not isinstance(company, dict):
+            continue
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _markdown_table_cell(company.get("company_name")),
+                    "有" if company.get("has_profile") else "无",
+                    str(_safe_count(company.get("job_count"))),
+                    str(_safe_count(company.get("lead_count"))),
+                    str(_safe_count(company.get("signal_count"))),
+                    str(_safe_count(company.get("total_record_count"))),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(lines) if len(lines) > 2 else ""
 
 
 def _company_database_overview_summary_response(payload: dict[str, Any]) -> str:

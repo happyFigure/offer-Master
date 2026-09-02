@@ -425,6 +425,8 @@ class AgentSkillRepositoryTest(unittest.TestCase):
         )
         metadata = database_skill["metadata_json"]
         self.assertEqual("available", metadata["availability_state"])
+        self.assertIn("database.company_list", metadata["required_tools"])
+        self.assertIn("database.company_list", metadata["allowed_tools"])
         self.assertIn("database.company_search", metadata["required_tools"])
         self.assertIn("database.company_update", metadata["ask_tools"])
         self.assertIn("database.job_lead_delete", metadata["ask_tools"])

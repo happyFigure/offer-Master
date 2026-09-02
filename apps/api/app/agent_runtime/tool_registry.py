@@ -109,6 +109,7 @@ FILESYSTEM_MAKE_DIR_TOOL = "filesystem.make_dir"
 LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL = "local.company_database_overview"
 LOCAL_JOB_SOURCE_OVERVIEW_TOOL = "local.job_source_overview"
 DATABASE_COMPANY_SEARCH_TOOL = "database.company_search"
+DATABASE_COMPANY_LIST_TOOL = "database.company_list"
 DATABASE_COMPANY_PROFILE_TOOL = "database.company_profile"
 DATABASE_JOB_SEARCH_TOOL = "database.job_search"
 DATABASE_SOURCE_SEARCH_TOOL = "database.source_search"
@@ -312,6 +313,28 @@ def create_database_agent_tool_definitions() -> list[AgentToolDefinition]:
     standard_output = {"type": "object", "required": ["tool_name", "ok", "result"]}
     read_source_types = frozenset({"agent_chat", "job_discovery"})
     return [
+        AgentToolDefinition(
+            name=DATABASE_COMPANY_LIST_TOOL,
+            description="List distinct companies found across local company profiles, formal jobs, job leads, and recruiting signals.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                },
+                "additionalProperties": False,
+            },
+            output_schema=standard_output,
+            handler=lambda session, **arguments: _database_company_list(session, **arguments),
+            risk_level=AgentToolRiskLevel.LOW,
+            requires_confirmation=False,
+            allowed_source_types=read_source_types,
+            candidate_profile=AgentToolCandidateProfile(
+                categories=frozenset({"local_company_list"}),
+                keywords=frozenset({"公司列表", "企业列表", "有哪些公司", "列出公司", "数据库公司"}),
+                examples=("数据库里有哪些公司，给我20个",),
+            ),
+        ),
         AgentToolDefinition(
             name=DATABASE_COMPANY_SEARCH_TOOL,
             description="Search local company records, formal jobs, job leads, and recruiting signals by company name.",
@@ -1302,6 +1325,108 @@ def _database_company_search(
             "queries": queries,
             "companies": companies,
             "matched_count": sum(1 for company in companies if company["exists"]),
+        },
+    }
+
+
+def _database_company_list(
+    session: Any,
+    *,
+    keyword: Any = None,
+    limit: int | str | None = 20,
+) -> dict[str, Any]:
+    if session is None:
+        return _database_session_error(DATABASE_COMPANY_LIST_TOOL)
+
+    from sqlalchemy import func, select
+
+    from app.domains.jobs.models import Company, Job, JobLead, RecruitingSignal
+
+    result_limit = _bounded_int(limit, default=20, minimum=1, maximum=100)
+    keyword_text = _non_empty_str(keyword)
+    keyword_casefold = keyword_text.casefold() if keyword_text else None
+    company_map: dict[str, dict[str, Any]] = {}
+
+    def ensure_company(
+        name: Any,
+        *,
+        has_profile: bool = False,
+        tier_rank: int = 2,
+        sort_key: Any = None,
+    ) -> dict[str, Any] | None:
+        company_name = _non_empty_str(name)
+        if not company_name:
+            return None
+        key = company_name.casefold()
+        resolved_sort_key = _non_empty_str(sort_key) or company_name
+        item = company_map.setdefault(
+            key,
+            {
+                "company_name": company_name,
+                "has_profile": False,
+                "job_count": 0,
+                "lead_count": 0,
+                "signal_count": 0,
+                "tier_rank": tier_rank,
+                "sort_key": resolved_sort_key,
+            },
+        )
+        item["has_profile"] = bool(item["has_profile"] or has_profile)
+        if tier_rank < int(item["tier_rank"]):
+            item["sort_key"] = resolved_sort_key
+        item["tier_rank"] = min(int(item["tier_rank"]), tier_rank)
+        if has_profile:
+            item["company_name"] = company_name
+            item["sort_key"] = resolved_sort_key
+        return item
+
+    for name, normalized_name, job_count in session.execute(
+        select(Company.name, Company.normalized_name, func.count(Job.id))
+        .outerjoin(Job, Job.company_id == Company.id)
+        .group_by(Company.id, Company.name, Company.normalized_name)
+    ).all():
+        item = ensure_company(name, has_profile=True, tier_rank=0, sort_key=normalized_name)
+        if item is not None:
+            item["job_count"] += int(job_count or 0)
+
+    for name, lead_count in session.execute(
+        select(JobLead.company_name, func.count(JobLead.id)).group_by(JobLead.company_name)
+    ).all():
+        item = ensure_company(name, tier_rank=1)
+        if item is not None:
+            item["lead_count"] += int(lead_count or 0)
+
+    for name, signal_count in session.execute(
+        select(RecruitingSignal.company_name, func.count(RecruitingSignal.id)).group_by(RecruitingSignal.company_name)
+    ).all():
+        item = ensure_company(name, tier_rank=2)
+        if item is not None:
+            item["signal_count"] += int(signal_count or 0)
+
+    companies = []
+    for item in sorted(company_map.values(), key=lambda row: (int(row["tier_rank"]), str(row["sort_key"]).casefold())):
+        if keyword_casefold and keyword_casefold not in str(item["company_name"]).casefold():
+            continue
+        companies.append(
+            {
+                "company_name": str(item["company_name"]),
+                "has_profile": bool(item["has_profile"]),
+                "job_count": int(item["job_count"]),
+                "lead_count": int(item["lead_count"]),
+                "signal_count": int(item["signal_count"]),
+                "total_record_count": int(item["job_count"] + item["lead_count"] + item["signal_count"]),
+            }
+        )
+
+    return {
+        "tool_name": DATABASE_COMPANY_LIST_TOOL,
+        "ok": True,
+        "result": {
+            "keyword": keyword_text,
+            "total_count": len(companies),
+            "count": min(result_limit, len(companies)),
+            "companies": companies[:result_limit],
+            "all_companies": companies,
         },
     }
 

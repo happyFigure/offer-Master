@@ -23,6 +23,7 @@ _SPECIALIZED_RESULT_ENVELOPE_CAPABILITIES = {
 DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY: dict[str, tuple[str, ...]] = {
     "external.web_search": ("campus_recruiting_search", "external_agent_task"),
     "local.company_database_overview": ("local_company_database_overview",),
+    "database.company_list": ("local_company_database_list",),
     "local.job_source_overview": ("local_job_source_overview",),
     "offerio.sync_company_jobs": ("offerio_company_jobs_sync",),
     "applications.find_apply_entry": ("application_entry_discovery",),

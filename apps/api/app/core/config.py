@@ -134,6 +134,7 @@ class Settings(BaseSettings):
         validation_alias="JOBPILOT_LLM_TIMEOUT_SECONDS",
     )
     llm_max_retries: int = Field(default=2, validation_alias="JOBPILOT_LLM_MAX_RETRIES")
+    agent_summary_provider: str = Field(default="deterministic", validation_alias="JOBPILOT_AGENT_SUMMARY_PROVIDER")
     execution_planner_enabled: bool = Field(default=False, validation_alias="JOBPILOT_EXECUTION_PLANNER_ENABLED")
     intent_llm_provider: str | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_PROVIDER")
     intent_llm_base_url: str | None = Field(default=None, validation_alias="JOBPILOT_INTENT_LLM_BASE_URL")

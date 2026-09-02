@@ -11,6 +11,7 @@ class AgentToolRegistryTest(TestCase):
         self.assertEqual(
             [
                 "applications.find_apply_entry",
+                "database.company_list",
                 "database.company_profile",
                 "database.company_search",
                 "database.company_update",
@@ -319,6 +320,81 @@ class AgentToolRegistryTest(TestCase):
         self.assertIn("正式企业表", {item["source"] for item in rows["腾讯"]["evidence"]})
         self.assertIn("岗位线索表", {item["source"] for item in rows["京东"]["evidence"]})
         self.assertIn("招聘信号表", {item["source"] for item in rows["字节"]["evidence"]})
+
+    def test_database_company_list_tool_merges_company_sources_and_applies_limit(self) -> None:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL, create_database_agent_tool_definitions
+        from app.db.base import Base
+        import app.domains.agent_memory.models  # noqa: F401
+        import app.domains.applications.models  # noqa: F401
+        import app.domains.automation.models  # noqa: F401
+        import app.domains.conversations.models  # noqa: F401
+        from app.domains.jobs.models import (
+            Company,
+            JobLead,
+            JobLeadStatus,
+            JobSource,
+            JobSourceFetchMode,
+            JobSourceTrustLevel,
+            JobSourceType,
+            RecruitingSignal,
+            RecruitingSignalType,
+        )
+
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+        try:
+            with Session() as session:
+                source = JobSource(
+                    name="列表测试来源",
+                    source_type=JobSourceType.OFFICIAL_API,
+                    entry_url="https://example.com/list",
+                    trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                    fetch_mode=JobSourceFetchMode.OFFICIAL_API,
+                )
+                session.add_all(
+                    [
+                        source,
+                        Company(name="腾讯", normalized_name="tencent"),
+                        Company(name="阿里巴巴", normalized_name="alibaba"),
+                        JobLead(
+                            source=source,
+                            lead_hash="lead-company-list-1",
+                            company_name="字节跳动",
+                            title="字节跳动校招",
+                            source_url="https://example.com/bytedance",
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                            verification_status=JobLeadStatus.VERIFIED,
+                        ),
+                        RecruitingSignal(
+                            source=source,
+                            signal_hash="signal-company-list-1",
+                            company_name="腾讯",
+                            normalized_company_name="tencent",
+                            signal_type=RecruitingSignalType.CAMPUS_RECRUITMENT_OPEN,
+                            source_url="https://example.com/tencent",
+                            trust_level=JobSourceTrustLevel.MEDIUM_HIGH,
+                        ),
+                    ]
+                )
+                session.commit()
+
+                definitions = {definition.name: definition for definition in create_database_agent_tool_definitions()}
+                result = definitions[DATABASE_COMPANY_LIST_TOOL].handler(session, limit=2)
+        finally:
+            engine.dispose()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(3, result["result"]["total_count"])
+        self.assertEqual(2, result["result"]["count"])
+        self.assertEqual(["阿里巴巴", "腾讯"], [item["company_name"] for item in result["result"]["companies"]])
+        tencent = next(item for item in result["result"]["all_companies"] if item["company_name"] == "腾讯")
+        self.assertTrue(tencent["has_profile"])
+        self.assertEqual(1, tencent["signal_count"])
 
     def test_database_company_profile_tool_returns_joined_company_context(self) -> None:
         from sqlalchemy import create_engine

@@ -56,16 +56,16 @@ class AgentContextEngineeringTest(unittest.TestCase):
     def test_deterministic_matcher_routes_generic_company_list_to_local_database_tool(self) -> None:
         from app.agent_runtime.context.capability_catalog import CapabilityCatalog
         from app.agent_runtime.context.context_pack import ContextPackBuilder
-        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, create_default_agent_tool_registry
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL, EXTERNAL_WEB_SEARCH_TOOL, create_default_agent_tool_registry
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
 
         detector = HybridIntentDetector(llm_client=None)
         frame = detector.detect("给我看一下有哪些公司，给我37个就行")
         context_pack = ContextPackBuilder(CapabilityCatalog.from_registry(create_default_agent_tool_registry())).build(frame)
 
-        self.assertEqual("local_company_database_overview", frame.intent)
+        self.assertEqual("local_company_database_list", frame.intent)
         self.assertFalse(frame.needs_external_info)
-        self.assertEqual([LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL], context_pack.allowed_capabilities)
+        self.assertEqual([DATABASE_COMPANY_LIST_TOOL], context_pack.allowed_capabilities)
         self.assertNotIn(EXTERNAL_WEB_SEARCH_TOOL, context_pack.allowed_capabilities)
 
     def test_deterministic_matcher_routes_job_source_count_to_job_source_overview(self) -> None:

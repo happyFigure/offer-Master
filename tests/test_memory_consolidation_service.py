@@ -188,6 +188,67 @@ class MemoryConsolidationServiceTest(unittest.TestCase):
         self.assertIn("tool-log-old", memories[0].metadata_json["evidence_ids"])
         self.assertIn("tool-log-success-2", memories[0].metadata_json["evidence_ids"])
 
+    def test_consolidation_can_scope_messages_to_compaction_cut(self):
+        from app.agent_runtime.memory.consolidation import (
+            MemoryConsolidationCommand,
+            MemoryConsolidationService,
+        )
+        from app.domains.agent_memory.models import AgentLearningCandidate, AgentLearningCandidateStatus
+        from app.domains.agent_memory.repository import AgentMemoryRepository
+        from app.domains.agent_memory.service import AgentLearningService
+        from app.domains.automation.models import WorkflowRun, WorkflowRunStatus
+        from app.domains.conversations.models import AgentMessage, AgentMessageKind, AgentMessageRole, AgentSession
+
+        with self.Session() as session:
+            agent_session = AgentSession(id="session-cut", title="只刷新被压缩旧消息")
+            workflow_run = WorkflowRun(
+                id="workflow-cut",
+                workflow_type="agent_memory",
+                status=WorkflowRunStatus.RUNNING,
+                current_step="build_context",
+                user_goal="压缩前先刷新记忆",
+            )
+            old_message = AgentMessage(
+                id="message-old-boundary",
+                session_id=agent_session.id,
+                role=AgentMessageRole.USER,
+                message_kind=AgentMessageKind.USER_TEXT,
+                content_text="投递前一定要让我确认，不能自动提交。",
+                visible_content_text="投递前一定要让我确认，不能自动提交。",
+            )
+            recent_message = AgentMessage(
+                id="message-recent-integrity",
+                session_id=agent_session.id,
+                role=AgentMessageRole.USER,
+                message_kind=AgentMessageKind.USER_TEXT,
+                content_text="如果企业性质无法判断，就留空，不要编造。",
+                visible_content_text="如果企业性质无法判断，就留空，不要编造。",
+            )
+            session.add_all([agent_session, workflow_run, old_message, recent_message])
+            session.flush()
+
+            result = MemoryConsolidationService(
+                session=session,
+                learning_service=AgentLearningService(AgentMemoryRepository(session)),
+            ).consolidate(
+                MemoryConsolidationCommand(
+                    session_id=agent_session.id,
+                    workflow_run_id=workflow_run.id,
+                    agent_run_id="agent-run-cut",
+                    target_scope="job_discovery",
+                    message_ids=[old_message.id],
+                )
+            )
+            session.commit()
+
+            candidates = list(session.scalars(select(AgentLearningCandidate)).all())
+
+        self.assertEqual(1, result.reviewed_message_count)
+        self.assertEqual(1, result.created_candidate_count)
+        self.assertEqual(AgentLearningCandidateStatus.PENDING_REVIEW, candidates[0].status)
+        self.assertEqual("投递前必须用户确认", candidates[0].candidate_title)
+        self.assertEqual(old_message.id, candidates[0].source_message_id)
+
 
 if __name__ == "__main__":
     unittest.main()

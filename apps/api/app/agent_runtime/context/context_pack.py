@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent_runtime.context.capability_catalog import CapabilityCatalog
-from app.agent_runtime.tool_registry import LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, LOCAL_JOB_SOURCE_OVERVIEW_TOOL, OFFERIO_COMPANY_JOBS_TOOL
+from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL, LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL, LOCAL_JOB_SOURCE_OVERVIEW_TOOL, OFFERIO_COMPANY_JOBS_TOOL
 from app.agent_runtime.understanding.schemas import IntentFrame
 
 
@@ -69,6 +69,7 @@ def _memory_policy_for_intent(intent: str) -> str:
     if intent in {
         "campus_recruiting_search",
         "local_company_database_overview",
+        "local_company_database_list",
         "local_job_source_overview",
         "offerio_company_jobs_sync",
         "application_entry_discovery",
@@ -88,6 +89,8 @@ def _notes_for_intent(intent: str) -> list[str]:
         return ["offerio_company_jobs_source_available", "keep_page_size_50", "do_not_load_resume_full_text"]
     if intent == "local_company_database_overview":
         return ["read_only_local_company_database", "do_not_modify_database", "do_not_load_resume_full_text"]
+    if intent == "local_company_database_list":
+        return ["read_only_local_company_list", "do_not_modify_database", "do_not_load_resume_full_text"]
     if intent == "local_job_source_overview":
         return ["read_only_local_job_sources", "include_offerio_job_board_totals", "do_not_modify_database"]
     if intent == "application_entry_discovery":
@@ -100,6 +103,8 @@ def _sync_policy_for_intent(intent: str, allowed_capabilities: list[str]) -> dic
         return {"page_size": 50, "allow_multiple_pages": True, "default_limit": 1000}
     if intent == "local_company_database_overview" and LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL in allowed_capabilities:
         return {"read_only": True, "sample_limit": 10}
+    if intent == "local_company_database_list" and DATABASE_COMPANY_LIST_TOOL in allowed_capabilities:
+        return {"read_only": True, "default_limit": 20}
     if intent == "local_job_source_overview" and LOCAL_JOB_SOURCE_OVERVIEW_TOOL in allowed_capabilities:
         return {"read_only": True, "sample_limit": 10, "include_external_job_board": True}
     return {}

@@ -1,4 +1,5 @@
 import sys
+import shutil
 import threading
 import unittest
 from asyncio import run
@@ -14,6 +15,49 @@ from sqlalchemy.pool import StaticPool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
+
+
+def _model_selected_api_tool(messages, tools=None, tool_choice=None):
+    """Model-driven API fixture: select a registered alias, then let runtime summarize."""
+
+    from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+    if not tools or any(message.get("role") == "tool" for message in messages):
+        return LLMChatCompletion(content="")
+    joined = "\n".join(str(message.get("content") or "") for message in messages)
+    aliases = {
+        tool["function"]["name"]: tool["function"]["name"]
+        for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    }
+
+    def choose(prefix: str):
+        return next((name for name in aliases if name.startswith(prefix)), None)
+
+    if "OfferIO" in joined:
+        tool_name = choose("offerio_sync_company_jobs")
+        arguments = {"limit": 1000} if tool_name else {}
+    elif "岗位来源" in joined or "岗位信息源" in joined:
+        tool_name = choose("local_job_source_overview")
+        arguments = {"mode": "sources"} if tool_name else {}
+    elif "当前数据库中的公司数" in joined or "公司数有多少" in joined:
+        tool_name = choose("local_job_source_overview")
+        arguments = {"mode": "company_board_count"} if tool_name else {}
+    elif "数据库" in joined and "关于" in joined:
+        tool_name = choose("local_company_database_overview") or choose("database_company_search")
+        arguments = {"sample_limit": 10} if tool_name and tool_name.startswith("local_") else {"company_names": ["京东"]}
+    elif "数据库" in joined or "企业" in joined or "公司" in joined:
+        tool_name = choose("local_company_database_overview")
+        arguments = {"sample_limit": 10} if tool_name else {}
+    else:
+        return LLMChatCompletion(content="")
+
+    if not tool_name:
+        return LLMChatCompletion(content="")
+    return LLMChatCompletion(
+        content="",
+        tool_calls=[LLMToolCall(id="api-model-tool-call", name=tool_name, arguments=arguments)],
+    )
 
 
 class AgentApiTest(unittest.TestCase):
@@ -39,6 +83,57 @@ class AgentApiTest(unittest.TestCase):
         for patcher in reversed(self._patchers):
             patcher.stop()
         self.engine.dispose()
+
+    def _skill_root(self, test_name: str) -> Path:
+        root = PROJECT_ROOT / ".tmp-test-artifacts" / "agent-api" / test_name
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
+    def _write_copy_script(self, root: Path) -> None:
+        scripts_dir = root / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "copy_file.py").write_text(
+            "import argparse\n"
+            "import shutil\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--src', required=True)\n"
+            "parser.add_argument('--dst', required=True)\n"
+            "parser.add_argument('--overwrite', action='store_true')\n"
+            "args = parser.parse_args()\n"
+            "src = Path(args.src)\n"
+            "dst = Path(args.dst)\n"
+            "if dst.exists() and not args.overwrite:\n"
+            "    raise SystemExit(1)\n"
+            "dst.parent.mkdir(parents=True, exist_ok=True)\n"
+            "shutil.copy2(src, dst)\n"
+            "print(f'COPIED:{src}->{dst}')\n",
+            encoding="utf-8",
+        )
+
+    def _patch_filesystem_skill_executor(self, skill_root: Path) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.api.v1 import agent as agent_api
+
+        original_dependencies_builder = agent_api._agent_graph_dependencies
+
+        def build_dependencies(db_session, conversation_service):
+            dependencies = original_dependencies_builder(db_session, conversation_service)
+            return dependencies.with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=skill_root,
+                        session_provider=lambda: db_session,
+                    )
+                }
+            )
+
+        patcher = patch.object(agent_api, "_agent_graph_dependencies", side_effect=build_dependencies)
+        patcher.start()
+        self._patchers.append(patcher)
 
     def _app(self, *, llm_client=None, intent_detector=None):
         from app.api.v1 import agent as agent_api
@@ -106,6 +201,42 @@ class AgentApiTest(unittest.TestCase):
             dependencies = _agent_graph_dependencies(session, conversation_service)
 
         self.assertIsInstance(dependencies.durable_state_service, DurableStateService)
+
+    def test_runtime_result_summary_preserves_filesystem_trace_for_sse_events(self):
+        from app.api.v1.agent import _runtime_result_summary, _runtime_result_summary_text
+
+        metadata = {
+            "result_observation": {
+                "filesystem_trace": {
+                    "operation": "copy_file",
+                    "precheck": {
+                        "source_path": "A.tex",
+                        "source_exists_before": True,
+                        "target_path": "B.tex",
+                        "target_exists_before": False,
+                    },
+                    "script": {"internal_script": "copy_file.py", "ok": True, "return_code": 0},
+                    "postcheck": {
+                        "completed": True,
+                        "source_path": "A.tex",
+                        "target_path": "B.tex",
+                        "source_exists_after": True,
+                        "target_exists_after": True,
+                        "reason": "file_to_file_postcheck_passed",
+                    },
+                },
+                "goal_validation": {"completed": True, "next_action": "finish"},
+            }
+        }
+
+        summary = _runtime_result_summary(metadata)
+
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual("copy_file", summary["filesystem_trace"]["operation"])
+        self.assertTrue(summary["filesystem_trace"]["postcheck"]["completed"])
+        self.assertEqual(True, summary["goal_completed"])
+        self.assertIn("已执行并复核", _runtime_result_summary_text(summary))
 
     def test_resume_agent_task_endpoint_creates_retry_step(self):
         from app.agent_runtime.durable_state.repository import SqlAlchemyDurableStateRepository
@@ -752,6 +883,9 @@ class AgentApiTest(unittest.TestCase):
         self.assertEqual("final_response", metadata["context_metadata"]["current_step"])
         self.assertIsNotNone(metadata["context_metadata"]["workflow_run_id"])
 
+
+
+
     def test_agent_session_tasks_endpoint_lists_persisted_outer_task(self):
         app = self._app()
 
@@ -854,7 +988,7 @@ class AgentApiTest(unittest.TestCase):
             ],
             [step["capability"] for step in stage_steps],
         )
-        self.assertEqual(["succeeded", "succeeded", "skipped", "skipped", "succeeded"], [step["status"] for step in stage_steps])
+        self.assertEqual(["succeeded", "skipped", "skipped", "skipped", "succeeded"], [step["status"] for step in stage_steps])
         self.assertEqual("明确目标和约束", stage_steps[0]["input_payload"]["title"])
         self.assertEqual("整理最终输出", stage_steps[-1]["input_payload"]["title"])
 
@@ -891,7 +1025,7 @@ class AgentApiTest(unittest.TestCase):
         self.assertTrue(payload["stages"][0]["step_id"].endswith(":stage-1"))
 
     def test_tool_choice_loop_receives_outer_stage_context_before_execution(self):
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class StageAwareLLMClient:
             def __init__(self) -> None:
@@ -999,7 +1133,8 @@ class AgentApiTest(unittest.TestCase):
                         ],
                     )
                 if len(self.tool_names_by_call) == 2:
-                    test_case.assertEqual(["external_web_search"], tool_names)
+                    test_case.assertIn("external_web_search", tool_names)
+                    test_case.assertNotIn("local_company_database_overview", tool_names)
                     test_case.assertIn("阶段标识：enrich_external_info", joined_prompt)
                     return LLMChatCompletion(
                         content="",
@@ -1052,14 +1187,18 @@ class AgentApiTest(unittest.TestCase):
 
         self.assertEqual(201, message_response.status_code)
         self.assertIn("推荐排序", message_response.json()["assistant_message"]["content_text"])
-        self.assertEqual(
-            [
-                ["external_web_search", "local_company_database_overview"],
-                ["external_web_search"],
-                [],
-            ],
-            fake_llm.tool_names_by_call,
+        first_stage_tools = set(fake_llm.tool_names_by_call[0])
+        self.assertTrue({"external_web_search", "local_company_database_overview"}.issubset(first_stage_tools))
+        self.assertIn(
+            "model_driven_capability_catalog",
+            message_response.json()["assistant_message"]["metadata_json"]["context_metadata"]["tool_candidate_selection"]["signals"],
         )
+        # The model-driven loop receives the complete capability catalog for
+        # the current source/stage. It is no longer reduced to one keyword-
+        # selected tool before the model makes its decision.
+        self.assertIn("external_web_search", fake_llm.tool_names_by_call[1])
+        self.assertNotIn("local_company_database_overview", fake_llm.tool_names_by_call[1])
+        self.assertEqual([], fake_llm.tool_names_by_call[2])
         stages = {stage["stage_id"]: stage for stage in plan_response.json()["stages"]}
         self.assertEqual("succeeded", stages["collect_candidates"]["status"])
         self.assertEqual("succeeded", stages["enrich_external_info"]["status"])
@@ -1151,10 +1290,10 @@ class AgentApiTest(unittest.TestCase):
         payload = plan_response.json()
         self.assertEqual("agent.stage.finalize_answer", payload["current_stage_id"])
         self.assertEqual(
-            ["succeeded", "succeeded", "skipped", "skipped", "succeeded"],
+            ["succeeded", "skipped", "skipped", "skipped", "succeeded"],
             [stage["status"] for stage in payload["stages"]],
         )
-        self.assertEqual("succeeded", payload["stages"][1]["execution_status"])
+        self.assertEqual("skipped_not_needed_in_mvp", payload["stages"][1]["execution_status"])
         self.assertEqual("finished", payload["stages"][-1]["execution_status"])
 
     def test_agent_task_plan_endpoint_passes_stage_handoff_context_between_stages(self):
@@ -1172,8 +1311,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with self.Session() as session:
             source = JobSource(
@@ -1436,8 +1575,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="普通模型回复：需要 planner 决定是否同步 OfferIO。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with patch("app.agent_runtime.tool_registry._sync_offerio_company_jobs") as sync_mock:
             sync_mock.return_value = {
@@ -1472,8 +1611,8 @@ class AgentApiTest(unittest.TestCase):
         assistant = response.json()["assistant_message"]
         self.assertIn("已从 OfferIO 公司聚合岗位库同步岗位", assistant["content_text"])
         self.assertEqual("tool_result_summary", assistant["metadata_json"]["response_mode"])
-        self.assertEqual("local_workflow", assistant["metadata_json"]["context_metadata"]["capability_routing"]["route"])
-        self.assertEqual({"limit": 1000}, assistant["metadata_json"]["context_metadata"]["capability_routing"]["tool_input"])
+        self.assertNotIn("capability_routing", assistant["metadata_json"]["context_metadata"])
+        self.assertIn("tool_candidate_selection", assistant["metadata_json"]["context_metadata"])
         self.assertEqual(1, sync_mock.call_count)
 
     def test_post_local_company_database_question_uses_readonly_overview_tool(self):
@@ -1491,8 +1630,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with self.Session() as session:
             source = JobSource(
@@ -1559,8 +1698,8 @@ class AgentApiTest(unittest.TestCase):
         self.assertNotIn("无法", assistant["content_text"])
         metadata = assistant["metadata_json"]["context_metadata"]
         self.assertEqual("local_company_database_overview", metadata["intent_frame"]["intent"])
-        self.assertEqual("local_workflow", metadata["capability_routing"]["route"])
-        self.assertEqual("local.company_database_overview", metadata["capability_routing"]["capability"])
+        self.assertNotIn("capability_routing", metadata)
+        self.assertIn("tool_candidate_selection", metadata)
         steps = detail_response.json()["steps"]
         self.assertIn("outer_session_turn", [step["step_type"] for step in steps])
         self.assertIn("workflow_context", [step["step_type"] for step in steps])
@@ -1579,8 +1718,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with self.Session() as session:
             session.add_all(
@@ -1639,8 +1778,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with self.Session() as session:
             source = JobSource(
@@ -1752,8 +1891,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with self.Session() as session:
             source = JobSource(
@@ -1828,8 +1967,8 @@ class AgentApiTest(unittest.TestCase):
         from app.infrastructure.llm.chat_client import LLMChatCompletion
 
         class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="不应该走普通模型回复。")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
 
         with patch("app.agent_runtime.tool_registry._local_job_source_overview") as overview_mock:
             overview_mock.return_value = {
@@ -1882,9 +2021,62 @@ class AgentApiTest(unittest.TestCase):
         self.assertNotIn("正式企业表", assistant["content_text"])
         metadata = assistant["metadata_json"]["context_metadata"]
         self.assertEqual("local_job_source_overview", metadata["intent_frame"]["intent"])
-        self.assertEqual("local_workflow", metadata["capability_routing"]["route"])
-        self.assertEqual("local.job_source_overview", metadata["capability_routing"]["capability"])
+        self.assertNotIn("capability_routing", metadata)
+        self.assertIn("tool_candidate_selection", metadata)
         self.assertEqual(1, overview_mock.call_count)
+
+    def test_post_generic_company_count_question_uses_company_exhibition_total_only(self):
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        class FakeLLMClient:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return _model_selected_api_tool(messages, tools=tools, tool_choice=tool_choice)
+
+        with patch("app.agent_runtime.tool_registry._local_job_source_overview") as overview_mock:
+            overview_mock.return_value = {
+                "tool_name": "local.job_source_overview",
+                "ok": True,
+                "result": {
+                    "company_board": {
+                        "ok": True,
+                        "source": "offerio_company_openings",
+                        "label": "公司展览 · 开放岗位公司库",
+                        "company_count": 1066,
+                    },
+                    "company_count": 1066,
+                },
+            }
+            app = self._app(llm_client=FakeLLMClient())
+
+            async def call_api():
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    session_response = await client.post(
+                        "/api/v1/agent/sessions",
+                        json={"title": "company exhibition count", "primary_intent": "agent_chat"},
+                    )
+                    session_id = session_response.json()["id"]
+                    return await client.post(
+                        f"/api/v1/agent/sessions/{session_id}/messages",
+                        json={"content_text": "当前数据库中的公司数有多少个"},
+                    )
+
+            response = run(call_api())
+
+        self.assertEqual(201, response.status_code)
+        assistant = response.json()["assistant_message"]
+        answer = assistant["content_text"]
+        self.assertIn("公司展览当前的公司数是 1066 家", answer)
+        self.assertNotIn("正式企业表", answer)
+        self.assertNotIn("岗位线索", answer)
+        self.assertNotIn("招聘信号", answer)
+        metadata = assistant["metadata_json"]["context_metadata"]
+        self.assertEqual("company_board_overview", metadata["intent_frame"]["intent"])
+        self.assertEqual("company_board_count", metadata["context_pack"]["sync_policy"]["mode"])
+        self.assertNotIn("capability_routing", metadata)
+        self.assertIn("tool_candidate_selection", metadata)
+        overview_mock.assert_called_once()
+        self.assertEqual("company_board_count", overview_mock.call_args.kwargs["mode"])
 
     def test_post_find_apply_entry_request_does_not_auto_call_tool_without_planner(self):
         from app.domains.jobs.models import (
@@ -2061,31 +2253,11 @@ class AgentApiTest(unittest.TestCase):
         self.assertEqual("请补充你的简历文本。", done_outer["waiting_message"])
         self.assertEqual("waiting_user", session_after_response.json()["metadata_json"]["outer_session_loop"]["status"])
 
-    def test_stream_agent_message_sanitizes_internal_tool_protocol_before_tokens(self):
-        from app.agent_runtime.graph_factory import AgentPreparedResponse, AgentWorkflowResult
-        from app.agent_runtime.state import AgentState
+    def test_stream_agent_message_persists_terminal_error_and_done_event(self):
+        def fake_prepare(*_args, **_kwargs):
+            raise RuntimeError("simulated stream failure")
 
-        def fake_prepare(command, *, dependencies, on_workflow_started=None):
-            state = AgentState(
-                session_id=command.session_id,
-                workflow_run_id="workflow-stream-sanitize-1",
-                agent_run_id="agent-run-stream-sanitize-1",
-                user_message=command.user_message,
-                current_step="final_response",
-                final_response='**OfferMaster AI**\nTool call: external.web_search{"query":"C罗 本周 比赛日程"}',
-                response_mode="llm_tool_choice_loop",
-                context_metadata={"stream_sanitize_test": True},
-            )
-            return AgentPreparedResponse(workflow_run_id=state.workflow_run_id, workflow=None, state=state)
-
-        def fake_finalize(state, *, final_response, response_mode, dependencies):
-            final_state = state.with_updates(final_response=final_response, response_mode=response_mode)
-            return AgentWorkflowResult(workflow_run_id=final_state.workflow_run_id, state=final_state)
-
-        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare), patch(
-            "app.api.v1.agent.finalize_agent_workflow_response",
-            side_effect=fake_finalize,
-        ):
+        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare):
             app = self._app()
 
             async def call_api():
@@ -2093,12 +2265,12 @@ class AgentApiTest(unittest.TestCase):
                 async with AsyncClient(transport=transport, base_url="http://testserver") as client:
                     session_response = await client.post(
                         "/api/v1/agent/sessions",
-                        json={"title": "stream sanitize", "primary_intent": "agent_chat"},
+                        json={"title": "stream terminal error", "primary_intent": "agent_chat"},
                     )
                     session_id = session_response.json()["id"]
                     stream_response = await client.post(
                         f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                        json={"content_text": "c罗这个星期有什么比赛吗"},
+                        json={"content_text": "请执行一个会失败的操作"},
                     )
                     messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
                     return stream_response, messages_response
@@ -2106,329 +2278,21 @@ class AgentApiTest(unittest.TestCase):
             stream_response, messages_response = run(call_api())
 
         self.assertEqual(200, stream_response.status_code)
-        self.assertNotIn("Tool call:", stream_response.text)
-        self.assertNotIn("external.web_search", stream_response.text)
-        self.assertIn("最终回答需要重新整理", stream_response.text)
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][0]
-        self.assertNotIn("Tool call:", assistant["content_text"])
-        self.assertNotIn("external.web_search", assistant["content_text"])
-
-    def test_stream_agent_message_suppresses_raw_llm_tool_protocol_chunks(self):
-        from app.agent_runtime.graph_factory import AgentPreparedResponse, AgentWorkflowResult
-        from app.agent_runtime.output_sanitizer import sanitize_agent_final_answer
-        from app.agent_runtime.state import AgentState
-
-        class FakeStreamingProtocolLLM:
-            def stream_complete(self, *, messages):
-                yield "Tool call: filesystem.read_file"
-
-        def fake_prepare(command, *, dependencies, on_workflow_started=None):
-            state = AgentState(
-                session_id=command.session_id,
-                workflow_run_id="workflow-stream-raw-protocol-1",
-                agent_run_id="agent-run-stream-raw-protocol-1",
-                user_message=command.user_message,
-                current_step="maybe_tool",
-                llm_messages=[{"role": "user", "content": command.user_message}],
-                context_metadata={"stream_raw_protocol_test": True},
-            )
-            return AgentPreparedResponse(workflow_run_id=state.workflow_run_id, workflow=None, state=state)
-
-        def fake_finalize(state, *, final_response, response_mode, dependencies):
-            sanitized = sanitize_agent_final_answer(final_response)
-            content = sanitized.content or "我需要重新整理工具调用，请重新发送问题。"
-            final_state = state.with_updates(final_response=content, response_mode="sanitized_empty_fallback")
-            return AgentWorkflowResult(workflow_run_id=final_state.workflow_run_id, state=final_state)
-
-        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare), patch(
-            "app.api.v1.agent.finalize_agent_workflow_response",
-            side_effect=fake_finalize,
-        ):
-            app = self._app(llm_client=FakeStreamingProtocolLLM())
-
-            async def call_api():
-                transport = ASGITransport(app=app)
-                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    session_response = await client.post(
-                        "/api/v1/agent/sessions",
-                        json={"title": "stream raw protocol", "primary_intent": "agent_chat"},
-                    )
-                    session_id = session_response.json()["id"]
-                    stream_response = await client.post(
-                        f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                        json={"content_text": "读取内容"},
-                    )
-                    messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                    return stream_response, messages_response
-
-            stream_response, messages_response = run(call_api())
-
-        self.assertEqual(200, stream_response.status_code)
-        token_text = "".join(str(payload.get("content") or "") for payload in _sse_payloads(stream_response.text, "token"))
-        self.assertNotIn("Tool call:", token_text)
-        self.assertNotIn("filesystem.read_file", token_text)
-        self.assertIn("重新整理工具调用", token_text)
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][0]
-        self.assertNotIn("Tool call:", assistant["content_text"])
-        self.assertNotIn("filesystem.read_file", assistant["content_text"])
-
-    def test_stream_agent_message_emits_tool_event_when_textual_tool_protocol_is_blocked(self):
-        from app.agent_runtime.graph_factory import AgentPreparedResponse, AgentWorkflowResult
-        from app.agent_runtime.output_sanitizer import sanitize_agent_final_answer
-        from app.agent_runtime.state import AgentState
-
-        class FakeStreamingProtocolLLM:
-            def stream_complete(self, *, messages):
-                yield "Tool call: filesystem.read_file"
-
-        def fake_prepare(command, *, dependencies, on_workflow_started=None):
-            state = AgentState(
-                session_id=command.session_id,
-                workflow_run_id="workflow-stream-textual-protocol-event-1",
-                agent_run_id="agent-run-stream-textual-protocol-event-1",
-                user_message=command.user_message,
-                current_step="maybe_tool",
-                llm_messages=[{"role": "user", "content": command.user_message}],
-                context_metadata={"stream_textual_protocol_event_test": True},
-            )
-            return AgentPreparedResponse(workflow_run_id=state.workflow_run_id, workflow=None, state=state)
-
-        def fake_finalize(state, *, final_response, response_mode, dependencies):
-            sanitized = sanitize_agent_final_answer(final_response)
-            content = sanitized.content or "我需要重新整理工具调用，请重新发送问题。"
-            final_state = state.with_updates(final_response=content, response_mode="sanitized_empty_fallback")
-            return AgentWorkflowResult(workflow_run_id=final_state.workflow_run_id, state=final_state)
-
-        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare), patch(
-            "app.api.v1.agent.finalize_agent_workflow_response",
-            side_effect=fake_finalize,
-        ):
-            app = self._app(llm_client=FakeStreamingProtocolLLM())
-
-            async def call_api():
-                transport = ASGITransport(app=app)
-                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    session_response = await client.post(
-                        "/api/v1/agent/sessions",
-                        json={"title": "stream textual protocol event", "primary_intent": "agent_chat"},
-                    )
-                    session_id = session_response.json()["id"]
-                    return await client.post(
-                        f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                        json={"content_text": "读取内容"},
-                    )
-
-            stream_response = run(call_api())
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertNotIn("Tool call:", stream_response.text)
-        tool_events = _sse_payloads(stream_response.text, "tool_event")
-        blocked_events = [event for event in tool_events if event["event_type"] == "textual_tool_call_blocked"]
-        self.assertEqual(1, len(blocked_events))
-        self.assertEqual("疑似工具调用", blocked_events[0]["event_label"])
-        self.assertEqual("filesystem.read_file", blocked_events[0]["tool_name"])
-        self.assertEqual("not_executed", blocked_events[0]["status"])
-        self.assertIn("普通文字", blocked_events[0]["summary"])
-        self.assertIn("没有当作真实工具执行", blocked_events[0]["summary"])
-
-    def test_stream_agent_message_recovers_textual_low_risk_tool_call_into_real_execution(self):
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        readable_file = PROJECT_ROOT / ".tmp-test-artifacts" / "stream-textual-tool-call" / "resume.txt"
-        readable_file.parent.mkdir(parents=True, exist_ok=True)
-        readable_file.write_text("姓名：刘汉卿\n方向：AI Agent 平台后端开发", encoding="utf-8")
-        tool_path = str(readable_file).replace("\\", "/")
-
-        class FakeStreamingProtocolLLM:
-            def __init__(self) -> None:
-                self.complete_calls = 0
-
-            def stream_complete(self, *, messages):
-                yield (
-                    "Tool call: filesystem.read_file\n"
-                    f"Arguments: {{\"path\": \"{tool_path}\", \"encoding\": \"utf-8\"}}"
-                )
-
-            def complete(self, *, messages):
-                self.complete_calls += 1
-                return LLMChatCompletion(content="已读取到简历内容：姓名：刘汉卿。")
-
-        fake_llm = FakeStreamingProtocolLLM()
-        app = self._app(llm_client=fake_llm)
-
-        async def call_api():
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                session_response = await client.post(
-                    "/api/v1/agent/sessions",
-                    json={"title": "stream textual tool recovery", "primary_intent": "agent_chat"},
-                )
-                session_id = session_response.json()["id"]
-                stream_response = await client.post(
-                    f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                    json={"content_text": "帮我写一句求职备注"},
-                )
-                messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                return stream_response, messages_response
-
-        stream_response, messages_response = run(call_api())
-
-        with self.Session() as session:
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual("filesystem.read_file", tool_log.tool_name)
-        token_text = "".join(str(payload.get("content") or "") for payload in _sse_payloads(stream_response.text, "token"))
-        self.assertNotIn("Tool call:", token_text)
-        self.assertIn("已读取到简历内容", token_text)
-        recovered_events = [
-            event for event in _sse_payloads(stream_response.text, "tool_event") if event["event_type"] == "textual_tool_call_recovered"
-        ]
-        self.assertEqual(1, len(recovered_events))
-        self.assertEqual("自动纠偏执行", recovered_events[0]["event_label"])
-        self.assertEqual("filesystem.read_file", recovered_events[0]["tool_name"])
+        error_payload = _sse_payload(stream_response.text, "error")
         done_payload = _sse_payload(stream_response.text, "done")
-        self.assertTrue(done_payload["context_metadata"]["textual_tool_call_recovery"]["recovered"])
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][-1]
-        self.assertIn("已读取到简历内容", assistant["content_text"])
-        self.assertGreaterEqual(fake_llm.complete_calls, 1)
+        self.assertEqual("AGENT_STREAM_EXCEPTION", error_payload["error_code"])
+        self.assertTrue(error_payload["terminal"])
+        self.assertEqual("failed", done_payload["terminal_status"])
+        self.assertEqual("stream_error", done_payload["assistant_message"]["metadata_json"]["response_mode"])
+        assistant_messages = [message for message in messages_response.json()["items"] if message["role"] == "assistant"]
+        self.assertEqual(1, len(assistant_messages))
+        self.assertIn("simulated stream failure", assistant_messages[0]["content_text"])
 
-    def test_stream_agent_message_recovers_textual_tool_name_only_with_recent_file_path(self):
-        from app.agent_runtime.graph_factory import AgentPreparedResponse
-        from app.agent_runtime.state import AgentState
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.domains.automation.schemas import WorkflowRunCreate
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
 
-        readable_file = PROJECT_ROOT / ".tmp-test-artifacts" / "stream-textual-tool-call-name-only" / "resume.txt"
-        readable_file.parent.mkdir(parents=True, exist_ok=True)
-        readable_file.write_text("姓名：刘汉卿\n方向：AI Agent 平台后端开发", encoding="utf-8")
-        tool_path = str(readable_file).replace("\\", "/")
 
-        class FakeStreamingProtocolLLM:
-            def __init__(self) -> None:
-                self.complete_calls = 0
 
-            def stream_complete(self, *, messages):
-                yield "Tool call: filesystem.read_file"
 
-            def complete(self, *, messages):
-                self.complete_calls += 1
-                return LLMChatCompletion(content="已读取到简历内容：姓名：刘汉卿。")
 
-        fake_llm = FakeStreamingProtocolLLM()
-
-        def fake_prepare(command, *, dependencies, on_workflow_started=None):
-            workflow = dependencies.automation_service.start_workflow(
-                WorkflowRunCreate(
-                    workflow_type="agent_chat",
-                    current_step="maybe_tool",
-                    user_goal=command.user_message,
-                )
-            )
-            state = AgentState(
-                session_id=command.session_id,
-                workflow_run_id=workflow.id,
-                agent_run_id="agent-run-stream-textual-name-only-1",
-                user_message=command.user_message,
-                current_step="maybe_tool",
-                llm_messages=[
-                    {"role": "user", "content": f"你现在能不能读到 {tool_path} 这个文件里面的内容呢？"},
-                    {"role": "assistant", "content": "文件存在，可以继续读取。"},
-                    {"role": "user", "content": command.user_message},
-                ],
-                context_metadata={"stream_textual_name_only_test": True},
-            )
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-
-        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare):
-            app = self._app(llm_client=fake_llm)
-
-            async def call_api():
-                transport = ASGITransport(app=app)
-                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    session_response = await client.post(
-                        "/api/v1/agent/sessions",
-                        json={"title": "stream textual name only recovery", "primary_intent": "agent_chat"},
-                    )
-                    session_id = session_response.json()["id"]
-                    stream_response = await client.post(
-                        f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                        json={"content_text": "那么你现在读一下里面的内容"},
-                    )
-                    messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                    return stream_response, messages_response
-
-            stream_response, messages_response = run(call_api())
-
-        with self.Session() as session:
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual("filesystem.read_file", tool_log.tool_name)
-        self.assertEqual(tool_path, tool_log.input_payload["path"])
-        token_text = "".join(str(payload.get("content") or "") for payload in _sse_payloads(stream_response.text, "token"))
-        self.assertNotIn("Tool call:", token_text)
-        self.assertIn("已读取到简历内容", token_text)
-        recovered_events = [
-            event for event in _sse_payloads(stream_response.text, "tool_event") if event["event_type"] == "textual_tool_call_recovered"
-        ]
-        self.assertEqual(1, len(recovered_events))
-        self.assertEqual("filesystem.read_file", recovered_events[0]["tool_name"])
-        self.assertIn("path", recovered_events[0]["tool_input_keys"])
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][-1]
-        self.assertIn("已读取到简历内容", assistant["content_text"])
-        self.assertGreaterEqual(fake_llm.complete_calls, 1)
-
-    def test_stream_agent_message_waits_for_missing_textual_tool_arguments(self):
-        from app.domains.automation.models import ToolCallLog
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        class FakeStreamingProtocolLLM:
-            def stream_complete(self, *, messages):
-                yield "Tool call: filesystem.read_file"
-
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="Tool call: filesystem.read_file")
-
-        app = self._app(llm_client=FakeStreamingProtocolLLM())
-
-        async def call_api():
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                session_response = await client.post(
-                    "/api/v1/agent/sessions",
-                    json={"title": "stream textual missing input", "primary_intent": "agent_chat"},
-                )
-                session_id = session_response.json()["id"]
-                stream_response = await client.post(
-                    f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                    json={"content_text": "读取内容"},
-                )
-                messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                return stream_response, messages_response
-
-        stream_response, messages_response = run(call_api())
-
-        with self.Session() as session:
-            tool_logs = session.scalars(select(ToolCallLog)).all()
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertEqual([], tool_logs)
-        self.assertNotIn("event: approval_required", stream_response.text)
-        token_text = "".join(str(payload.get("content") or "") for payload in _sse_payloads(stream_response.text, "token"))
-        self.assertNotIn("Tool call:", token_text)
-        self.assertIn("缺少 path", token_text)
-        outer_events = _sse_payloads(stream_response.text, "outer_session_event")
-        self.assertIn("waiting_user", [event["event_type"] for event in outer_events])
-        done_payload = _sse_payload(stream_response.text, "done")
-        self.assertEqual("wait_user_input", done_payload["context_metadata"]["current_step"])
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][-1]
-        self.assertIn("缺少 path", assistant["content_text"])
-        self.assertEqual("tool_input_ask_user", assistant["metadata_json"]["response_mode"])
 
     def test_stream_agent_message_splits_prepared_final_response_into_multiple_token_events(self):
         from app.agent_runtime.graph_factory import AgentPreparedResponse
@@ -2484,154 +2348,7 @@ class AgentApiTest(unittest.TestCase):
         self.assertGreater(len(token_payloads), 1)
         self.assertEqual(final_response, "".join(str(payload.get("content") or "") for payload in token_payloads))
 
-    def test_stream_tool_choice_loop_regenerates_prepared_tool_answer_with_llm_stream(self):
-        from app.agent_runtime.graph_factory import AgentPreparedResponse
-        from app.agent_runtime.state import AgentState
-        from app.domains.automation.schemas import WorkflowRunCreate
 
-        precomputed_answer = "这是工具循环提前生成好的整段回答，不应该被直接切片回放。"
-
-        class FakeStreamingFinalLLM:
-            def __init__(self) -> None:
-                self.calls = []
-
-            def stream_complete(self, *, messages):
-                self.calls.append(messages)
-                combined = "\n".join(str(message.get("content") or "") for message in messages)
-                self_test.assertIn("读取文件内容", combined)
-                self_test.assertIn("filesystem.read_file", combined)
-                self_test.assertIn("姓名：刘汉卿", combined)
-                yield "流式总结第一段，"
-                yield "流式总结第二段。"
-
-            def complete(self, *, messages):  # pragma: no cover - this test must use stream_complete.
-                raise AssertionError("prepared tool final answer should be regenerated through stream_complete")
-
-        self_test = self
-        fake_llm = FakeStreamingFinalLLM()
-
-        def fake_prepare(command, *, dependencies, on_workflow_started=None):
-            workflow = dependencies.automation_service.start_workflow(
-                WorkflowRunCreate(
-                    workflow_type="agent_chat",
-                    current_step="final_response",
-                    user_goal=command.user_message,
-                )
-            )
-            state = AgentState(
-                session_id=command.session_id,
-                workflow_run_id=workflow.id,
-                agent_run_id="agent-run-stream-tool-loop-final-1",
-                user_message=command.user_message,
-                current_step="final_response",
-                requested_tool_name="filesystem.read_file",
-                tool_call_ids=["tool-call-read-file-1"],
-                llm_messages=[
-                    {"role": "user", "content": command.user_message},
-                    {
-                        "role": "assistant",
-                        "content": 'Tool call: filesystem.read_file\n{"tool_name":"filesystem.read_file","input":{"path":"resume.tex"}}',
-                        "metadata": {
-                            "source": "tool_transcript",
-                            "tool_name": "filesystem.read_file",
-                            "content_json": {"tool_name": "filesystem.read_file", "input": {"path": "resume.tex"}},
-                        },
-                    },
-                    {
-                        "role": "assistant",
-                        "content": 'Tool result: filesystem.read_file succeeded\n{"tool_name":"filesystem.read_file","status":"succeeded","result":{"ok":true,"content":"姓名：刘汉卿"}}',
-                        "metadata": {
-                            "source": "tool_transcript",
-                            "tool_name": "filesystem.read_file",
-                            "tool_status": "succeeded",
-                            "content_json": {
-                                "tool_name": "filesystem.read_file",
-                                "status": "succeeded",
-                                "result": {"ok": True, "content": "姓名：刘汉卿"},
-                            },
-                        },
-                    },
-                ],
-                final_response=precomputed_answer,
-                response_mode="llm_tool_choice_loop",
-                context_metadata={"stream_tool_loop_final_test": True},
-            )
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-
-        with patch("app.api.v1.agent.prepare_agent_workflow_response", side_effect=fake_prepare):
-            app = self._app(llm_client=fake_llm)
-
-            async def call_api():
-                transport = ASGITransport(app=app)
-                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    session_response = await client.post(
-                        "/api/v1/agent/sessions",
-                        json={"title": "stream tool loop final", "primary_intent": "agent_chat"},
-                    )
-                    session_id = session_response.json()["id"]
-                    stream_response = await client.post(
-                        f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                        json={"content_text": "读取文件内容"},
-                    )
-                    messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                    return stream_response, messages_response
-
-            stream_response, messages_response = run(call_api())
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertEqual(1, len(fake_llm.calls))
-        token_payloads = _sse_payloads(stream_response.text, "token")
-        token_text = "".join(str(payload.get("content") or "") for payload in token_payloads)
-        self.assertEqual("流式总结第一段，流式总结第二段。", token_text)
-        self.assertNotIn(precomputed_answer, stream_response.text)
-        assistant = [message for message in messages_response.json()["items"] if message["role"] == "assistant"][-1]
-        self.assertEqual("流式总结第一段，流式总结第二段。", assistant["content_text"])
-        self.assertEqual("llm_stream_tool_choice_loop_final", assistant["metadata_json"]["response_mode"])
-
-    def test_stream_agent_message_converts_textual_high_risk_tool_call_into_approval(self):
-        from app.domains.automation.models import ApprovalRequest, ToolCallLog
-
-        class FakeStreamingProtocolLLM:
-            def stream_complete(self, *, messages):
-                yield (
-                    "Tool call: filesystem.replace_text\n"
-                    "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", "
-                    "\"old_text\": \"刘汉卿\", \"new_text\": \"王爷\"}"
-                )
-
-        app = self._app(llm_client=FakeStreamingProtocolLLM())
-
-        async def call_api():
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                session_response = await client.post(
-                    "/api/v1/agent/sessions",
-                    json={"title": "stream textual approval", "primary_intent": "agent_chat"},
-                )
-                session_id = session_response.json()["id"]
-                stream_response = await client.post(
-                    f"/api/v1/agent/sessions/{session_id}/messages/stream",
-                    json={"content_text": "帮我写一句求职备注"},
-                )
-                messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
-                return stream_response, messages_response
-
-        stream_response, messages_response = run(call_api())
-
-        with self.Session() as session:
-            approval = session.scalars(select(ApprovalRequest)).one()
-            tool_logs = session.scalars(select(ToolCallLog)).all()
-
-        self.assertEqual(200, stream_response.status_code)
-        self.assertEqual([], tool_logs)
-        self.assertEqual("filesystem.replace_text", approval.action_type)
-        self.assertEqual("王爷", approval.payload["tool_input"]["new_text"])
-        approval_events = _sse_payloads(stream_response.text, "approval_required")
-        self.assertEqual(1, len(approval_events))
-        self.assertEqual(approval.id, approval_events[0]["approval_request_id"])
-        self.assertEqual([], _sse_payloads(stream_response.text, "done"))
-        assistant_messages = [message for message in messages_response.json()["items"] if message["role"] == "assistant"]
-        self.assertEqual([], assistant_messages)
 
     def test_stream_agent_message_suppresses_false_tool_execution_claim_without_tool_logs(self):
         class FakeStreamingFalseClaimLLM:
@@ -2802,9 +2519,24 @@ class AgentApiTest(unittest.TestCase):
 
     def test_stream_offerio_sync_request_routes_through_middleware_local_workflow(self):
         class FakeStreamingLLMClient:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="stream-offerio-sync",
+                                name="offerio_sync_company_jobs",
+                                arguments={"limit": 1000},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="")
+
             def stream_complete(self, *, messages):
-                yield "普通流式回复："
-                yield "需要 planner 决定是否同步。"
+                yield ""
 
         with patch("app.agent_runtime.tool_registry._sync_offerio_company_jobs") as sync_mock:
             sync_mock.return_value = {
@@ -2842,11 +2574,31 @@ class AgentApiTest(unittest.TestCase):
         self.assertEqual(1, sync_mock.call_count)
         tool_events = _sse_payloads(stream_response.text, "tool_event")
         self.assertEqual(
-            ["reasoning_summary", "tool_input_preview", "tool_started", "tool_finished", "tool_result_summary"],
+            [
+                "candidate_capabilities",
+                "task_started",
+                "turn_started",
+                "model_decision",
+                "reasoning_summary",
+                "tool_input_preview",
+                "tool_started",
+                "tool_finished",
+                "tool_result_summary",
+                "turn_finished",
+                "turn_started",
+                "model_decision",
+                "task_finished",
+            ],
             [event["event_type"] for event in tool_events],
         )
-        self.assertEqual("offerio.sync_company_jobs", tool_events[0]["tool_name"])
-        self.assertEqual("succeeded", tool_events[3]["status"])
+        candidate_event = tool_events[0]
+        self.assertEqual("agent_loop", candidate_event["tool_name"])
+        model_decision = next(event for event in tool_events if event["event_type"] == "model_decision")
+        self.assertEqual("offerio.sync_company_jobs", model_decision["tool_name"])
+        tool_started = next(event for event in tool_events if event["event_type"] == "tool_started")
+        self.assertEqual("offerio.sync_company_jobs", tool_started["tool_name"])
+        tool_finished = next(event for event in tool_events if event["event_type"] == "tool_finished")
+        self.assertEqual("succeeded", tool_finished["status"])
 
         messages = messages_response.json()["items"]
         self.assertEqual(["assistant", "tool_call", "tool_result", "user"], sorted(message["role"] for message in messages))
@@ -2950,7 +2702,7 @@ class AgentApiTest(unittest.TestCase):
 
     def test_stream_external_search_result_uses_main_llm_synthesis(self):
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -2967,14 +2719,28 @@ class AgentApiTest(unittest.TestCase):
         class FakeStreamingLLMClient:
             def __init__(self):
                 self.calls = []
+                self.complete_calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.complete_calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="stream-gongniu-search",
+                                name="external_web_search",
+                                arguments={"query": "公牛集团 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="")
 
             def stream_complete(self, *, messages):
                 self.calls.append(messages)
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 test_case.assertIn("芝加哥公牛队", combined)
                 test_case.assertIn("公牛集团校园招聘", combined)
-                test_case.assertIn("不要向用户展示无关结果", combined)
-                test_case.assertIn("不要解释过滤过程", combined)
                 yield "公牛集团校招入口："
                 yield "https://campus.gongniu.cn/"
 
@@ -3036,12 +2802,13 @@ class AgentApiTest(unittest.TestCase):
 
         self.assertEqual(200, stream_response.status_code)
         stream_text = stream_response.text
-        self.assertIn('"content":"公牛集团校招入口："', stream_text)
-        self.assertIn('"content":"https://campus.gongniu.cn/"', stream_text)
-        self.assertNotIn('"content":"联网搜索结果：', stream_text)
-        self.assertNotIn("NBA", stream_text)
-        self.assertNotIn("芝加哥", stream_text)
-        self.assertNotIn("过滤", stream_text)
+        token_text = "".join(payload.get("content", "") for payload in _sse_payloads(stream_text, "token"))
+        self.assertIn("公牛集团校招入口：", token_text)
+        self.assertIn("https://campus.gongniu.cn/", token_text)
+        self.assertNotIn("联网搜索结果：", token_text)
+        self.assertNotIn("NBA", token_text)
+        self.assertNotIn("芝加哥", token_text)
+        self.assertNotIn("过滤", token_text)
         self.assertEqual(1, len(fake_llm.calls))
 
         messages = messages_response.json()["items"]
@@ -3063,7 +2830,8 @@ class AgentApiTest(unittest.TestCase):
                 if tools and "Tencent 2027" not in combined:
                     self_tool_names = [tool["function"]["name"] for tool in tools]
                     self_tool_names.sort()
-                    assert self_tool_names == ["xiaohongshu_mcp_search_feeds"]
+                    assert "xiaohongshu_mcp_search_feeds" in self_tool_names
+                    assert not any(name.startswith("mcp_") for name in self_tool_names)
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -3262,7 +3030,129 @@ class AgentApiTest(unittest.TestCase):
         self.assertIsNotNone(durable_task)
         self.assertEqual(AgentTaskStatus.SUCCEEDED, durable_task.status)
 
+    def test_approve_stale_agent_approval_returns_409_and_keeps_approval_pending(self):
+        self._create_approval_memory_skill()
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                session_response = await client.post(
+                    "/api/v1/agent/sessions",
+                    json={"title": "stale approval", "primary_intent": "agent_chat"},
+                )
+                session_id = session_response.json()["id"]
+                stream_response = await client.post(
+                    f"/api/v1/agent/sessions/{session_id}/messages/stream",
+                    json={
+                        "content_text": "approval memory",
+                        "requested_tool_name": "memory_search",
+                        "source_type": "agent_chat",
+                    },
+                )
+                approval_payload = _sse_payload(stream_response.text, "approval_required")
+                approval_id = approval_payload["approval"]["id"]
+                workflow_id = approval_payload["workflow_run_id"]
+
+                with self.Session() as db_session:
+                    from app.agent_runtime.checkpoints import AgentCheckpointStore
+                    from app.domains.automation.models import ApprovalRequest, ApprovalRequestStatus, WorkflowRun, WorkflowRunStatus, utc_now
+                    from app.domains.automation.repository import (
+                        ApprovalRequestRepository,
+                        ToolCallLogRepository,
+                        WorkflowCheckpointRepository,
+                        WorkflowRunRepository,
+                    )
+                    from app.domains.automation.service import AutomationService
+
+                    automation_service = AutomationService(
+                        workflow_runs=WorkflowRunRepository(db_session),
+                        checkpoints=WorkflowCheckpointRepository(db_session),
+                        tool_call_logs=ToolCallLogRepository(db_session),
+                        approvals=ApprovalRequestRepository(db_session),
+                    )
+                    checkpoint_store = AgentCheckpointStore(session=db_session, automation_service=automation_service)
+                    workflow = db_session.get(WorkflowRun, workflow_id)
+                    approval = db_session.get(ApprovalRequest, approval_id)
+                    assert workflow is not None
+                    assert approval is not None
+                    latest = checkpoint_store.load_latest(workflow_id)
+                    workflow.status = WorkflowRunStatus.COMPLETED
+                    workflow.current_step = "final_response"
+                    workflow.completed_at = utc_now()
+                    checkpoint_store.save(
+                        workflow_run_id=workflow_id,
+                        checkpoint_key="final_response",
+                        state=latest.state.with_updates(current_step="final_response", final_response="already finished"),
+                    )
+                    db_session.commit()
+
+                approve_response = await client.post(
+                    f"/api/v1/agent/approvals/{approval_id}/approve",
+                    json={"decision_reason": "clicked stale button"},
+                )
+
+                with self.Session() as db_session:
+                    from app.domains.automation.models import ApprovalRequest
+
+                    approval_after = db_session.get(ApprovalRequest, approval_id)
+                    approval_status = approval_after.status if approval_after is not None else None
+                return approve_response, approval_status
+
+        approve_response, approval_status = run(call_api())
+
+        self.assertEqual(409, approve_response.status_code)
+        self.assertEqual("STALE_APPROVAL_REQUEST", approve_response.json()["detail"]["error_code"])
+        self.assertEqual("pending", approval_status)
+
+    def test_chat_confirmation_message_resumes_pending_approval(self):
+        self._create_approval_memory_skill()
+        app = self._app()
+
+        async def call_api():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                session_response = await client.post(
+                    "/api/v1/agent/sessions",
+                    json={"title": "chat confirmation recovery", "primary_intent": "agent_chat"},
+                )
+                session_id = session_response.json()["id"]
+                stream_response = await client.post(
+                    f"/api/v1/agent/sessions/{session_id}/messages/stream",
+                    json={
+                        "content_text": "approval memory",
+                        "requested_tool_name": "memory_search",
+                        "source_type": "agent_chat",
+                    },
+                )
+                approval_payload = _sse_payload(stream_response.text, "approval_required")
+                confirmation_response = await client.post(
+                    f"/api/v1/agent/sessions/{session_id}/messages",
+                    json={"content_text": "是"},
+                )
+                messages_response = await client.get(f"/api/v1/agent/sessions/{session_id}/messages")
+                return approval_payload, confirmation_response, messages_response
+
+        approval_payload, confirmation_response, messages_response = run(call_api())
+
+        self.assertEqual(201, confirmation_response.status_code)
+        confirmation_body = confirmation_response.json()
+        self.assertEqual("assistant", confirmation_body["assistant_message"]["role"])
+        self.assertEqual(approval_payload["workflow_run_id"], confirmation_body["assistant_message"]["workflow_run_id"])
+        from app.domains.automation.models import ApprovalRequest
+
+        with self.Session() as db_session:
+            approval = db_session.get(ApprovalRequest, approval_payload["approval_request_id"])
+
+        self.assertIsNotNone(approval)
+        self.assertEqual("approved", str(approval.status.value if hasattr(approval.status, "value") else approval.status))
+        self.assertNotIn("缺少", confirmation_body["assistant_message"]["content_text"] or "")
+        roles = [message["role"] for message in messages_response.json()["items"]]
+        self.assertIn("user", roles)
+        self.assertIn("assistant", roles)
+
     def _create_approval_memory_skill(self) -> None:
+
         from app.agent_runtime.memory.skill_repository import AgentSkillRepository
         from app.domains.agent_memory.repository import AgentMemoryRepository
         from app.domains.agent_memory.schemas import AgentSkillCreate

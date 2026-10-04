@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent_runtime.routing.schemas import RouteDecision
+from app.agent_runtime.skills.filesystem_operation_catalog import get_filesystem_operation_spec
 from app.agent_runtime.tool_input import requested_sample_limit_from_text
 from app.agent_runtime.tool_registry import (
     APPLICATION_FIND_APPLY_ENTRY_TOOL,
@@ -12,6 +13,12 @@ from app.agent_runtime.tool_registry import (
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
     OFFERIO_COMPANY_JOBS_TOOL,
 )
+
+
+# Keep this local to the routing layer to avoid importing agent_as_tool while
+# agent_as_tool is still importing routing schemas during startup.
+FILESYSTEM_SKILL_CAPABILITY = "skill.filesystem"
+DBX_READONLY_AGENT_CAPABILITY = "agent.dbx_readonly"
 
 
 class CapabilityRoutingMiddleware:
@@ -28,6 +35,34 @@ class CapabilityRoutingMiddleware:
         risk_level = _text(intent_frame.get("risk_level") or context_pack.get("risk_level") or "low")
         allowed_capabilities = _string_list(context_pack.get("allowed_capabilities"))
         excluded_capabilities = _string_list(context_pack.get("excluded_capabilities"))
+        required_capability = _text(context_pack.get("required_capability") or intent_frame.get("required_capability"))
+
+        # An explicit source constraint outranks semantic shortcuts such as
+        # the default Company Exhibition route. If the requested child agent
+        # is unavailable, fail closed instead of silently using local data.
+        if required_capability:
+            if bool(context_pack.get("missing_required_capability")) or required_capability not in allowed_capabilities:
+                return RouteDecision(
+                    route="block",
+                    executor_type="runtime_guard",
+                    confidence=1.0,
+                    reason=f"required capability is unavailable: {required_capability}",
+                    allowed_capabilities=allowed_capabilities,
+                    blocked_capabilities=excluded_capabilities,
+                    metadata={"required_capability": required_capability, "fail_closed": True},
+                )
+            return RouteDecision(
+                route="local_tool",
+                capability=required_capability,
+                executor_type="agent",
+                executor_name=required_capability,
+                confidence=1.0,
+                reason=f"explicit required capability selected: {required_capability}",
+                allowed_capabilities=allowed_capabilities,
+                blocked_capabilities=excluded_capabilities,
+                tool_input={"task": user_message},
+                metadata={"required_capability": True, "source_constraint": required_capability},
+            )
 
         if risk_level in {"critical"}:
             return RouteDecision(
@@ -40,7 +75,8 @@ class CapabilityRoutingMiddleware:
                 requires_confirmation=True,
             )
 
-        if risk_level == "high":
+        filesystem_skill_allowed = intent == "filesystem_operation" and FILESYSTEM_SKILL_CAPABILITY in allowed_capabilities
+        if risk_level == "high" and not filesystem_skill_allowed:
             return RouteDecision(
                 route="ask_user",
                 executor_type="human_approval",
@@ -70,6 +106,36 @@ class CapabilityRoutingMiddleware:
                 reason=f"{intent} without executable routed capability",
                 allowed_capabilities=allowed_capabilities,
                 blocked_capabilities=excluded_capabilities,
+            )
+
+        if filesystem_skill_allowed:
+            # Route only to the coarse filesystem Skill. The Skill executor is
+            # responsible for choosing the cataloged inner filesystem action and for
+            # requesting confirmation before high-risk writes. If context
+            # already resolved the current file action, pass that structured
+            # frame through so the executor does not re-guess terse follow-ups.
+            tool_input = _filesystem_skill_tool_input(user_message, intent_frame, context_pack)
+            operation = str(tool_input.get("operation") or "").strip()
+            return RouteDecision(
+                route="local_workflow",
+                capability=FILESYSTEM_SKILL_CAPABILITY,
+                executor_type="skill_executor",
+                executor_name="filesystem_skill",
+                confidence=1.0,
+                reason="filesystem_operation is handled by the high-level filesystem Skill executor",
+                allowed_capabilities=allowed_capabilities,
+                blocked_capabilities=excluded_capabilities,
+                tool_input=tool_input,
+                metadata={
+                    "intent": intent,
+                    "skill": "filesystem",
+                    "structured_operation": operation or None,
+                    "structured_operation_intent": bool(tool_input.get("operation_intent")),
+                    # The router chooses only the filesystem capability. An
+                    # absent inner operation is recoverable model work, not a
+                    # user clarification and never a reason to guess a filename.
+                    "structured_operation_required": not bool(operation),
+                },
             )
 
         if intent == "campus_recruiting_search" and EXTERNAL_WEB_SEARCH_TOOL in allowed_capabilities:
@@ -151,6 +217,20 @@ class CapabilityRoutingMiddleware:
                 metadata={"read_only": True, "sync_policy": dict(sync_policy)},
             )
 
+        if intent == "company_board_overview" and LOCAL_JOB_SOURCE_OVERVIEW_TOOL in allowed_capabilities:
+            return RouteDecision(
+                route="local_workflow",
+                capability=LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
+                executor_type="local_workflow",
+                executor_name="company_board_overview",
+                confidence=1.0,
+                reason="company count defaults to the Company Exhibition external company board",
+                allowed_capabilities=allowed_capabilities,
+                blocked_capabilities=excluded_capabilities,
+                tool_input={"mode": "company_board_count"},
+                metadata={"read_only": True, "company_board": "offerio_company_openings"},
+            )
+
         if intent == "application_entry_discovery" and APPLICATION_FIND_APPLY_ENTRY_TOOL in allowed_capabilities:
             job_id = _first_entity_value(intent_frame, context_pack, "job_ids")
             return RouteDecision(
@@ -199,6 +279,38 @@ def _campus_search_tool_input(
     else:
         query = _text(user_message)
     return {"query": query, "max_results": 5}
+
+
+def _filesystem_skill_tool_input(
+    user_message: str,
+    intent_frame: dict[str, Any],
+    context_pack: dict[str, Any],
+) -> dict[str, Any]:
+    """Provide only the user task; inner file semantics stay with the model.
+
+    The capability router is deliberately coarse. It must not copy the
+    intent detector's guessed operation or filename intent into the first
+    execution request, because that turns a multi-step task into a one-step
+    read and prevents the native model loop from choosing the write action.
+    """
+    return {"user_task": _text(user_message)}
+
+
+def _copy_catalog_source_arg(*, tool_input: dict[str, Any], operation: str, path: str) -> None:
+    spec = get_filesystem_operation_spec(operation)
+    if spec is None or spec.goal_kind != "file_to_file" or not spec.required_args:
+        return
+    # File-to-file operations share the same source path semantics. The concrete
+    # argument name still comes from the operation catalog, not a copy/rename if-chain.
+    tool_input.setdefault(spec.required_args[0], path)
+
+
+def _copy_catalog_target_arg(*, tool_input: dict[str, Any], operation: str, target_path: str) -> None:
+    spec = get_filesystem_operation_spec(operation)
+    if spec is None or spec.goal_kind != "file_to_file" or not spec.result_path_arg:
+        return
+    # The catalog declares which argument represents the destination/result path.
+    tool_input.setdefault(spec.result_path_arg, target_path)
 
 
 def _clarification_decision(

@@ -9,6 +9,236 @@ sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
 
 
 class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
+    def test_runner_exposes_read_file_content_as_direct_model_evidence(self) -> None:
+        from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        def fake_filesystem(_session, **arguments):
+            if arguments.get("operation") == "read_file":
+                return {
+                    "ok": True,
+                    "operation": "read_file",
+                    "result": {"result": {"content": "姓名：刘汉卿\n方向：AI Agent 平台研发"}},
+                }
+            return {"ok": True, "operation": "copy_file", "result": {"copied": True}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="skill.filesystem",
+                    description="执行受运行时治理的文件操作。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["operation"],
+                        "properties": {
+                            "operation": {"type": "string"},
+                            "path": {"type": "string"},
+                            "src": {"type": "string"},
+                            "dst": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_filesystem,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-content",
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": "C:/resume.tex"},
+                            )
+                        ],
+                    )
+                tool_text = "\n".join(
+                    str(message.get("content") or "")
+                    for message in messages
+                    if message.get("role") == "tool"
+                )
+                assert "文件真实内容（可用于后续判断）" in tool_text
+                assert "姓名：刘汉卿" in tool_text
+                return LLMChatCompletion(content="已读取到刘汉卿的 AI Agent 平台研发简历。")
+
+        ToolChoiceLoopRunner(registry=registry, llm_client=FakeLLM()).run(
+            LoopAgentTask(
+                user_message="读取简历真实内容并根据内容继续处理",
+                available_capabilities=("skill.filesystem",),
+                source_type="agent_chat",
+            ),
+            max_steps=2,
+        )
+
+    def test_filesystem_read_does_not_advance_unrelated_stage_plan(self) -> None:
+        from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentStageContext, LoopAgentTask, ToolChoiceLoopRunner
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        def fake_filesystem(_session, **arguments):
+            operation = arguments.get("operation")
+            return {"ok": True, "operation": operation, "result": {"result": {"content": "简历内容"}}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="skill.filesystem",
+                    description="执行文件操作。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["operation"],
+                        "properties": {"operation": {"type": "string"}, "path": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_filesystem,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                offered_names = {tool["function"]["name"] for tool in tools or []}
+                if self.calls == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-stage-read",
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": "C:/resume.tex"},
+                            )
+                        ],
+                    )
+                assert "skill_filesystem" in offered_names
+                return LLMChatCompletion(content="继续执行文件操作。")
+
+        stage_context = LoopAgentStageContext(
+            stage_id="clarify_goal",
+            title="明确目标",
+            tool_strategy={"mode": "inherit"},
+            handoff_payload={},
+        )
+        stage_context_dict = {
+            **stage_context.to_metadata_dict(),
+            "stage_plan": [
+                stage_context.to_metadata_dict(),
+                {
+                    "stage_id": "collect_candidates",
+                    "title": "收集本地候选信息",
+                    "allowed_capabilities": ["local.company_database_overview"],
+                    "tool_strategy": {"mode": "allowlist"},
+                },
+            ],
+        }
+        ToolChoiceLoopRunner(registry=registry, llm_client=FakeLLM()).run(
+            LoopAgentTask(
+                user_message="读取并继续处理这个文件",
+                available_capabilities=("skill.filesystem",),
+                source_type="agent_chat",
+                stage_context=stage_context_dict,
+            ),
+            max_steps=2,
+        )
+
+    def test_runner_returns_missing_model_argument_to_model_for_recovery(self) -> None:
+        from app.agent_runtime.loop_agent.schemas import LoopAgentStopReason
+        from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        executed_paths: list[str] = []
+
+        def fake_read_file(_session, *, path: str):
+            executed_paths.append(path)
+            return {"ok": True, "result": {"content": "姓名：刘汉卿"}}
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.read_file",
+                    description="读取一个本地文件。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_read_file,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-missing-path",
+                                name="filesystem.read_file",
+                                arguments={},
+                            )
+                        ],
+                    )
+                self.assert_tool_error_was_returned(messages)
+                return LLMChatCompletion(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-read-after-recovery",
+                            name="filesystem.read_file",
+                            arguments={"path": "C:/简历/resume.tex"},
+                        )
+                    ],
+                )
+
+            @staticmethod
+            def assert_tool_error_was_returned(messages) -> None:
+                tool_messages = [message for message in messages if message.get("role") == "tool"]
+                self_text = "\n".join(str(message.get("content") or "") for message in tool_messages)
+                assert "missing_required_fields" in self_text
+                assert "path" in self_text
+                assert "continue_model_loop" in self_text
+
+        llm = FakeLLM()
+        result = ToolChoiceLoopRunner(registry=registry, llm_client=llm).run(
+            LoopAgentTask(
+                user_message="读取这份简历",
+                available_capabilities=("filesystem.read_file",),
+            ),
+            max_steps=2,
+        )
+
+        self.assertEqual(LoopAgentStopReason.BUDGET_EXHAUSTED, result.stop_reason)
+        self.assertEqual(2, llm.calls)
+        self.assertEqual(["C:/简历/resume.tex"], executed_paths)
+        self.assertEqual("filesystem.read_file", result.trace[-1].capability)
+        self.assertEqual("succeeded", result.trace[-1].observation_status)
+
     def test_runner_prompt_prefers_exact_replace_tool_for_preserve_file_edits(self) -> None:
         from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
         from app.agent_runtime.tool_registry import AgentToolRegistry
@@ -452,7 +682,7 @@ class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
         self.assertEqual("failed", result.trace[0].observation_status)
         self.assertEqual("TOOL_NOT_OFFERED", result.trace[0].metadata["observation"]["metadata"]["error_code"])
 
-    def test_runner_converts_textual_tool_call_into_real_tool_execution(self) -> None:
+    def test_runner_keeps_inline_tool_text_as_final_answer(self) -> None:
         from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
         from app.agent_runtime.loop_agent.schemas import LoopAgentStopReason
         from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
@@ -511,20 +741,10 @@ class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(LoopAgentStopReason.MODEL_FINAL, result.stop_reason)
-        self.assertEqual(1, len(executed_inputs))
-        self.assertEqual(5, executed_inputs[0]["max_results"])
-        self.assertIn("C罗", executed_inputs[0]["query"])
-        self.assertIn("this week", executed_inputs[0]["query"])
-        self.assertIn("Cristiano Ronaldo", executed_inputs[0]["query"])
-        self.assertIn("Al Nassr", executed_inputs[0]["query"])
-        self.assertIn("football fixtures", executed_inputs[0]["query"])
-        self.assertIn(date.today().isoformat(), executed_inputs[0]["query"])
-        self.assertNotIn("你看一下", executed_inputs[0]["query"])
-        self.assertNotIn("2024年10月", executed_inputs[0]["query"])
-        self.assertEqual("external.web_search", result.trace[0].capability)
-        self.assertEqual("succeeded", result.trace[0].observation_status)
+        self.assertEqual([], executed_inputs)
+        self.assertIn("Tool call: external.web_search", result.final_answer or "")
 
-    def test_runner_converts_multiline_textual_tool_call_into_real_tool_execution(self) -> None:
+    def test_runner_keeps_multiline_tool_text_as_final_answer(self) -> None:
         from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
         from app.agent_runtime.loop_agent.schemas import LoopAgentStopReason
         from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
@@ -587,20 +807,10 @@ class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(LoopAgentStopReason.MODEL_FINAL, result.stop_reason)
-        self.assertEqual(
-            [
-                {
-                    "path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex",
-                    "encoding": "utf-8",
-                }
-            ],
-            executed_inputs,
-        )
-        self.assertEqual("filesystem.read_file", result.trace[0].capability)
-        self.assertEqual("succeeded", result.trace[0].observation_status)
-        self.assertNotIn("Tool call:", result.final_answer or "")
+        self.assertEqual([], executed_inputs)
+        self.assertIn("Tool call: filesystem.read_file", result.final_answer or "")
 
-    def test_runner_prefers_arguments_line_when_textual_tool_call_has_explanation_text(self) -> None:
+    def test_runner_keeps_explanatory_tool_text_as_final_answer(self) -> None:
         from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
         from app.agent_runtime.loop_agent.schemas import LoopAgentStopReason
         from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
@@ -656,12 +866,8 @@ class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(LoopAgentStopReason.MODEL_FINAL, result.stop_reason)
-        self.assertEqual(
-            [{"path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex", "encoding": "utf-8"}],
-            executed_inputs,
-        )
-        self.assertEqual("filesystem.read_file", result.trace[0].capability)
-        self.assertEqual("succeeded", result.trace[0].observation_status)
+        self.assertEqual([], executed_inputs)
+        self.assertIn("Tool call: filesystem.read_file", result.final_answer or "")
 
     def test_runner_retries_filesystem_read_when_content_looks_garbled(self) -> None:
         from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
@@ -795,6 +1001,50 @@ class LoopAgentToolChoiceRunnerTest(unittest.TestCase):
         self.assertEqual("waiting_user", result.trace[0].observation_status)
         self.assertIn("缺少 query", result.trace[0].observation_summary)
         self.assertEqual("TOOL_INPUT_INVALID", result.trace[0].metadata["observation"]["metadata"]["error_code"])
+
+    def test_runner_does_not_execute_plain_text_tool_call(self) -> None:
+        from app.agent_runtime.loop_agent.schemas import LoopAgentStopReason
+        from app.agent_runtime.loop_agent.tool_choice_runner import LoopAgentTask, ToolChoiceLoopRunner
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.infrastructure.llm.chat_client import LLMChatCompletion
+
+        executed_queries: list[str] = []
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="external.web_search",
+                    description="查询公开网页资料。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=lambda _session, *, query: executed_queries.append(query) or {"ok": True},
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            ]
+        )
+
+        class FakeLLM:
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return LLMChatCompletion(
+                    content='Tool call: external.web_search {"query":"不应该执行"}',
+                )
+
+        result = ToolChoiceLoopRunner(registry=registry, llm_client=FakeLLM()).run(
+            LoopAgentTask(
+                user_message="查询公开资料",
+                available_capabilities=("external.web_search",),
+                source_type="agent_chat",
+            ),
+            max_steps=2,
+        )
+
+        self.assertEqual(LoopAgentStopReason.MODEL_FINAL, result.stop_reason)
+        self.assertEqual([], executed_queries)
+        self.assertIn("Tool call: external.web_search", result.final_answer or "")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@ from pathlib import PureWindowsPath
 import re
 from typing import Any
 
+from app.agent_runtime.context.file_context import complete_copy_file_arguments, complete_move_file_arguments
+from app.agent_runtime.context.filename_intent import is_placeholder_filename
+
 
 LOCAL_FILE_REFERENCE_RE = re.compile(
     r"[A-Za-z]:[\\/][^\r\n`\"<>]*?\.(?:tex|md|txt|pdf|docx|json|csv|yaml|yml)",
@@ -51,6 +54,52 @@ def complete_tool_input(
             filled_fields.append("path")
             sources["path"] = "recent_user_context"
 
+    if tool_name == "filesystem.move_file":
+        move_completed = complete_move_file_arguments(
+            tool_input=completed,
+            user_message=user_message,
+            recent_user_context=recent_user_context,
+            context=context,
+        )
+        if is_placeholder_filename(str(completed.get("dst") or "")) and "dst" not in move_completed:
+            completed.pop("dst", None)
+        schema_fields = _schema_field_names(schema)
+        for field_name in ("src", "dst", "overwrite"):
+            if field_name not in schema_fields or field_name not in move_completed:
+                continue
+            if _field_is_missing(completed, field_name) or (
+                field_name == "dst" and is_placeholder_filename(str(completed.get(field_name) or ""))
+            ):
+                completed[field_name] = move_completed[field_name]
+                filled_fields.append(field_name)
+                sources[field_name] = (
+                    "model_operation_intent"
+                    if field_name == "dst" and isinstance(completed.get("operation_intent"), dict)
+                    else "active_file_context"
+                )
+
+    if tool_name == "filesystem.copy_file":
+        # Copy needs its own completion path because dst may be generated from a
+        # saved policy, not copied literally from the latest user message.
+        copy_completed = complete_copy_file_arguments(
+            tool_input=completed,
+            user_message=user_message,
+            recent_user_context=recent_user_context,
+            context=context,
+        )
+        schema_fields = _schema_field_names(schema)
+        for field_name in ("src", "dst", "overwrite"):
+            if field_name not in schema_fields or field_name not in copy_completed:
+                continue
+            if _field_is_missing(completed, field_name):
+                completed[field_name] = copy_completed[field_name]
+                filled_fields.append(field_name)
+                sources[field_name] = (
+                    "model_operation_intent"
+                    if field_name == "dst" and isinstance(completed.get("operation_intent"), dict)
+                    else "pending_or_active_file_context"
+                )
+
     if tool_name == "filesystem.replace_text":
         replacement = _replacement_pair(
             user_message=user_message,
@@ -77,7 +126,13 @@ def complete_tool_input(
             filled_fields.append("query")
             sources["query"] = "user_message_with_recent_context"
 
-    missing_required = tuple(field for field in required_fields if _field_is_missing(completed, field))
+    missing_required_values = [field for field in required_fields if _field_is_missing(completed, field)]
+    if tool_name == "filesystem.copy_file" and _field_is_missing(completed, "dst"):
+        # The direct copy tool accepts either a concrete dst or a structured
+        # operation_intent that runtime can normalize into dst.
+        if "dst" not in missing_required_values:
+            missing_required_values.append("dst")
+    missing_required = tuple(missing_required_values)
     return ToolInputCompletionResult(
         tool_input=completed,
         filled_fields=tuple(_dedupe(filled_fields)),

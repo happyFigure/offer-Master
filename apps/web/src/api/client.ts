@@ -91,6 +91,15 @@ function resolveApiMessage(details: unknown, status: number, fallback: string): 
     if (typeof detail === "string") {
       return detail;
     }
+    if (typeof detail === "object" && detail !== null) {
+      const nestedDetail = detail as { message?: unknown; error_code?: unknown };
+      if (typeof nestedDetail.message === "string" && nestedDetail.message.trim()) {
+        return nestedDetail.message;
+      }
+      if (typeof nestedDetail.error_code === "string" && nestedDetail.error_code.trim()) {
+        return nestedDetail.error_code;
+      }
+    }
   }
 
   return fallback || `HTTP ${status} request failed`;

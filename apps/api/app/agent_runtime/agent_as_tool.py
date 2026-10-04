@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass
+import logging
 import time
 from typing import Any, Protocol
 
@@ -9,9 +10,29 @@ from app.agent_runtime.reflection.schemas import CapabilityResultEvaluationSpec,
 from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 
 
+logger = logging.getLogger(__name__)
+
+
 TOOL_REGISTRY_EXECUTOR_ID = "agent_tool_registry"
 CLAUDE_SDK_AGENT_EXECUTOR_ID = "claude-sdk-agent"
 OPENAI_SDK_AGENT_EXECUTOR_ID = "openai-sdk-agent"
+OPENAI_SDK_QQ_MAIL_AGENT_EXECUTOR_ID = "openai-sdk-qq-mail-agent"
+FILESYSTEM_SKILL_CAPABILITY = "skill.filesystem"
+FILESYSTEM_SKILL_EXECUTOR_ID = "skill_executor.filesystem"
+LEGACY_FILESYSTEM_CAPABILITIES = frozenset(
+    {
+        "filesystem.list_dir",
+        "filesystem.path_exists",
+        "filesystem.path_stat",
+        "filesystem.read_file",
+        "filesystem.write_text",
+        "filesystem.replace_text",
+        "filesystem.copy_file",
+        "filesystem.move_file",
+        "filesystem.delete_path",
+        "filesystem.make_dir",
+    }
+)
 
 
 _SPECIALIZED_RESULT_ENVELOPE_CAPABILITIES = {
@@ -21,10 +42,11 @@ _SPECIALIZED_RESULT_ENVELOPE_CAPABILITIES = {
 
 
 DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY: dict[str, tuple[str, ...]] = {
+    FILESYSTEM_SKILL_CAPABILITY: ("filesystem_operation",),
     "external.web_search": ("campus_recruiting_search", "external_agent_task"),
     "local.company_database_overview": ("local_company_database_overview",),
     "database.company_list": ("local_company_database_list",),
-    "local.job_source_overview": ("local_job_source_overview",),
+    "local.job_source_overview": ("local_job_source_overview", "company_board_overview"),
     "offerio.sync_company_jobs": ("offerio_company_jobs_sync",),
     "applications.find_apply_entry": ("application_entry_discovery",),
     "resume.tailor": ("resume_tailoring",),
@@ -42,12 +64,15 @@ class AgentCapabilityDefinition:
     executor_id: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    kind: str = "tool"
     risk_level: str = "low"
     supported_intents: tuple[str, ...] = field(default_factory=tuple)
+    always_available: bool = False
     requires_confirmation: bool = False
     allowed_source_types: frozenset[str] = field(default_factory=frozenset)
     result_evaluation: CapabilityResultEvaluationSpec | None = None
     candidate_profile: Any | None = None
+    semantic_profile: Any | None = None
 
     def __post_init__(self) -> None:
         if not self.capability_id.strip():
@@ -58,6 +83,7 @@ class AgentCapabilityDefinition:
             raise ValueError(f"Agent capability description is required: {self.capability_id}")
         if not self.executor_id.strip():
             raise ValueError(f"Agent capability executor id is required: {self.capability_id}")
+        object.__setattr__(self, "kind", str(self.kind or "tool").strip() or "tool")
         object.__setattr__(self, "supported_intents", tuple(str(item) for item in self.supported_intents))
         object.__setattr__(
             self,
@@ -91,12 +117,14 @@ class AgentCapabilityDefinition:
             executor_id=executor_id,
             input_schema=dict(tool_definition.input_schema),
             output_schema=dict(tool_definition.output_schema),
+            kind="tool",
             risk_level=risk_value,
             supported_intents=supported_intents,
             requires_confirmation=bool(getattr(tool_definition, "requires_confirmation", False)),
             allowed_source_types=frozenset(getattr(tool_definition, "allowed_source_types", frozenset())),
             result_evaluation=getattr(tool_definition, "result_evaluation", None),
             candidate_profile=getattr(tool_definition, "candidate_profile", None),
+            semantic_profile=getattr(tool_definition, "semantic_profile", None),
         )
 
 
@@ -161,11 +189,17 @@ class AgentRuntimeContext:
     namespace: str | None = None
     permission_scope: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    capability_id: str | None = None
+    agent_name: str | None = None
+    event_sink: Callable[[dict[str, Any]], None] | None = field(default=None, compare=False, repr=False)
+    executor_id: str | None = None
 
 
 @dataclass(frozen=True)
 class StandardAgentResult:
     status: str
+    # Runtime/frontend trace only. User-facing final answers must be generated
+    # from AnswerContract + ToolObservation, not copied from this short summary.
     summary: str
     observation: str = ""
     evidence: list[dict[str, Any]] = field(default_factory=list)
@@ -222,6 +256,34 @@ class AgentRuntime:
 
     def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
         definition = self._registry.get(task.capability_id)
+        if (
+            task.capability_id in LEGACY_FILESYSTEM_CAPABILITIES
+            and definition is not None
+            and definition.executor_id == TOOL_REGISTRY_EXECUTOR_ID
+        ):
+            logger.warning(
+                "Blocked legacy filesystem capability: capability=%s session_id=%s run_id=%s",
+                task.capability_id,
+                context.session_id,
+                context.run_id,
+            )
+            return StandardAgentResult(
+                status="failed",
+                summary=(
+                    f"旧 filesystem 能力 {task.capability_id} 已被 runtime 阻断；"
+                    f"请改用 {FILESYSTEM_SKILL_CAPABILITY}，由模型选择内部文件操作。"
+                ),
+                missing_information=[FILESYSTEM_SKILL_CAPABILITY],
+                next_actions=["continue_model_loop"],
+                raw_result={
+                    "tool_name": task.capability_id,
+                    "ok": False,
+                    "error_code": "LEGACY_FILESYSTEM_ROUTE_BLOCKED",
+                    "recoverable": True,
+                    "next_action": "continue_model_loop",
+                    "redirect_capability": FILESYSTEM_SKILL_CAPABILITY,
+                },
+            )
         if definition is None:
             return StandardAgentResult(
                 status="failed",
@@ -607,11 +669,109 @@ def create_default_agent_capability_registry(
         **DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY,
         **(supported_intents_by_capability or {}),
     }
-    return AgentCapabilityRegistry.from_tool_registry(
+    registry = AgentCapabilityRegistry.from_tool_registry(
         tool_registry,
         default_executor_id=default_executor_id,
         executor_id_by_capability=executor_id_by_capability,
         supported_intents_by_capability=supported_intents,
+    )
+    if registry.get(FILESYSTEM_SKILL_CAPABILITY) is None:
+        registry.register(filesystem_skill_capability_definition())
+    return registry
+
+
+def filesystem_skill_capability_definition(
+    *,
+    executor_id: str = FILESYSTEM_SKILL_EXECUTOR_ID,
+) -> AgentCapabilityDefinition:
+    from app.agent_runtime.tool_registry import AgentToolCandidateProfile
+
+    # Skill capabilities stay coarse-grained. The runtime can bind the same
+    # filesystem Skill to the local executor or to an SDK child agent without
+    # changing what the main model sees in the capability list.
+    return AgentCapabilityDefinition(
+        capability_id=FILESYSTEM_SKILL_CAPABILITY,
+        name="Filesystem Skill",
+        description=(
+            "Use the filesystem Skill for local file reading, path existence checks, writing, renaming, copying, deleting, "
+            "and directory tasks. Internal scripts stay inside the Skill executor and are not exposed "
+            "as separate main-agent choices. Choose the inner operation and all semantic arguments from the user's task "
+            "and previous tool observations. For content-based naming, read the source first, then issue a new structured "
+            "copy_file or rename_file call with the model-selected name_intent or concrete dst. Do not stop at prose "
+            "while a requested filesystem mutation is still pending; write operations will pause for runtime approval."
+        ),
+        executor_id=executor_id,
+        input_schema={
+            "type": "object",
+            "required": ["user_task"],
+            "properties": {
+                "user_task": {"type": "string", "description": "The user's original filesystem request."},
+                "context_metadata": {"type": "object", "additionalProperties": True},
+                "operation": {
+                    "type": "string",
+                    "enum": ["read_file", "path_exists", "copy_file", "rename_file", "replace_text"],
+                    "description": "The filesystem action selected for this tool call.",
+                },
+                "src": {"type": "string", "description": "Concrete source path when the selected action reads, copies, or renames a file."},
+                "dst": {"type": "string", "description": "Concrete destination path when the selected action copies or renames a file."},
+                "path": {"type": "string", "description": "Concrete file path for path_exists, read_file, or replace_text."},
+                "overwrite": {"type": "boolean", "description": "Whether an existing destination may be overwritten, if the runtime policy permits it."},
+                "name_intent": {
+                    "type": "object",
+                    "description": "Model-selected semantic filename after observing the source content.",
+                    "properties": {
+                        "filename_stem": {"type": "string"},
+                        "filename": {"type": "string"},
+                        "display_name": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "operation_intent": {
+                    "type": "object",
+                    "description": "Structured destination and naming intent selected by the model; runtime only normalizes and validates it.",
+                    "properties": {
+                        "destination": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["file", "directory"]},
+                                "path": {"type": "string"},
+                            },
+                            "required": ["kind", "path"],
+                            "additionalProperties": False,
+                        },
+                        "name_intent": {"type": "object", "additionalProperties": True},
+                        "name_policy": {"type": "string", "enum": ["content_based"]},
+                        "source_path": {"type": "string"},
+                        "avoid_conflict": {"type": "boolean"},
+                    },
+                    "additionalProperties": False,
+                },
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "encoding": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "count": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        },
+        output_schema={"type": "object", "additionalProperties": True},
+        kind="skill",
+        risk_level="medium",
+        supported_intents=DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY[FILESYSTEM_SKILL_CAPABILITY],
+        requires_confirmation=False,
+        allowed_source_types=frozenset({"agent_chat"}),
+        candidate_profile=AgentToolCandidateProfile(
+            categories=frozenset({"skill_filesystem", "filesystem_operation"}),
+            keywords=frozenset({"文件", "目录", "文件名", "重命名", "读取文件", "复制文件", "备份文件", "是否存在", "filesystem"}),
+            examples=("读一下这个本地 tex 文件", "看下这个文件是否存在", "把刚才这个文件名改成新的名字", "复制一份简历作为备份"),
+            use_when=("用户要处理本地文件、目录、文件名、路径存在性或文件内容",),
+            do_not_use_when=("用户只是做普通聊天、网页搜索或数据库查询",),
+            positive_examples=("把这个文件名改成刘汉卿-后端开发-AI-Agent.tex",),
+            negative_examples=("查一下 2026 年 Java 后端岗位常见面试题",),
+            disambiguation_notes=("主 Agent 只选择 filesystem Skill；read/move/replace 等动作由 Skill executor 内部判断。",),
+        ),
     )
 
 
@@ -665,15 +825,17 @@ def _missing_required_inputs(input_schema: dict[str, Any], input_payload: dict[s
 
 
 def _with_default_namespace(context: AgentRuntimeContext, definition: AgentCapabilityDefinition) -> AgentRuntimeContext:
-    if context.namespace:
-        return context
     return AgentRuntimeContext(
         session_id=context.session_id,
         run_id=context.run_id,
         task_id=context.task_id,
-        namespace=definition.executor_id,
+        namespace=context.namespace or definition.executor_id,
         permission_scope=dict(context.permission_scope),
         metadata=dict(context.metadata),
+        capability_id=context.capability_id or definition.capability_id,
+        agent_name=context.agent_name,
+        event_sink=context.event_sink,
+        executor_id=context.executor_id,
     )
 
 
@@ -880,9 +1042,11 @@ __all__ = [
     "CapabilityDeclaringAgent",
     "DEFAULT_SUPPORTED_INTENTS_BY_CAPABILITY",
     "OPENAI_SDK_AGENT_EXECUTOR_ID",
+    "OPENAI_SDK_QQ_MAIL_AGENT_EXECUTOR_ID",
     "StandardAgentResult",
     "TOOL_REGISTRY_EXECUTOR_ID",
     "ToolRegistryAgentExecutor",
     "build_agent_runtime_bundle",
     "create_default_agent_capability_registry",
+    "filesystem_skill_capability_definition",
 ]

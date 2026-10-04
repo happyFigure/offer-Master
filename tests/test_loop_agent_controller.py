@@ -125,6 +125,37 @@ class LoopAgentControllerTest(unittest.TestCase):
         self.assertEqual("已找到腾讯校招官网入口", result.final_answer)
         self.assertEqual("reflection", result.trace[0].metadata["observation"]["suggested_next_decision"]["metadata"]["source"])
 
+    def test_controller_stops_before_repeating_exact_same_tool_call_too_many_times(self) -> None:
+        from app.agent_runtime.loop_agent.controller import LoopAgentController
+        from app.agent_runtime.loop_agent.schemas import LoopAgentAction, LoopAgentDecision, LoopAgentObservation, LoopAgentStopReason
+
+        executed_inputs = []
+        repeated_decision = LoopAgentDecision(
+            action=LoopAgentAction.CALL_TOOL,
+            capability="skill.filesystem",
+            tool_input={"operation": "rename_file", "src": "A.tex", "dst": "B.tex"},
+            reason="Repeat the same recovery step.",
+        )
+
+        def decide(_trace):
+            return repeated_decision
+
+        def execute(decision):
+            executed_inputs.append(dict(decision.tool_input))
+            return LoopAgentObservation(
+                status="partial",
+                summary="目标还没完成，建议继续同一步。",
+                suggested_next_decision=repeated_decision,
+            )
+
+        result = LoopAgentController(max_steps=5).run(decide_next_step=decide, execute_step=execute)
+
+        self.assertEqual(2, len(executed_inputs))
+        self.assertEqual(LoopAgentStopReason.REPLAN_REQUIRED, result.stop_reason)
+        self.assertEqual(repeated_decision, result.pending_decision)
+        self.assertEqual("dead_loop_detector", result.metadata["loop_intervention"]["detector"])
+        self.assertIn("重复工具调用", result.metadata["loop_intervention"]["reason"])
+
     def test_controller_records_lifecycle_events_for_each_loop_step(self) -> None:
         from app.agent_runtime.loop_agent.controller import LoopAgentController
         from app.agent_runtime.loop_agent.events import LoopAgentEventType

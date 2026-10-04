@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Iterator
 from datetime import datetime
@@ -26,11 +27,15 @@ from app.agent_runtime.graph_factory import (
     LOOP_RUNNER_STAGE_CONTEXT_METADATA_KEY,
     continue_agent_workflow_after_approval,
     external_web_search_synthesis_messages,
+    filesystem_answer_synthesis_messages,
     finalize_agent_workflow_response,
+    _grounded_filesystem_mutation_response,
     prepare_agent_workflow_response,
     run_agent_workflow,
+    StaleApprovalContinuationError,
     tool_result_summary_response,
 )
+from app.agent_runtime.final_answer.synthesis import complete_tool_observation_final_answer
 from app.agent_runtime.guardrails import AgentToolRuntimeGuard
 from app.agent_runtime.loop_agent.outer_session import (
     OuterSessionLoopController,
@@ -47,6 +52,7 @@ from app.agent_runtime.external_tasks.configured import (
 )
 from app.agent_runtime.memory.compaction import CompactionConfig
 from app.agent_runtime.memory.consolidation import MemoryConsolidationCommand, MemoryConsolidationService
+from app.agent_runtime.memory.context_builder import ContextBuildConfig
 from app.agent_runtime.memory.summary_provider import (
     DeterministicSummaryProvider,
     HybridSummaryProvider,
@@ -81,10 +87,10 @@ from app.domains.automation.repository import (
     WorkflowCheckpointRepository,
     WorkflowRunRepository,
 )
-from app.domains.automation.models import ApprovalRequest, ToolCallLog, utc_now
+from app.domains.automation.models import ApprovalRequest, ApprovalRequestStatus, ToolCallLog, utc_now
 from app.domains.automation.schemas import ApprovalRequestRead
 from app.domains.automation.service import AutomationService
-from app.domains.conversations.models import AgentMessageRole
+from app.domains.conversations.models import AgentMessage, AgentMessageRole
 from app.domains.conversations.repository import ConversationRepository
 from app.domains.conversations.schemas import (
     AgentCompactRequest,
@@ -105,9 +111,103 @@ from app.infrastructure.llm.chat_client import LLMChatClient
 from app.infrastructure.llm.client import build_intent_llm_runtime_config, build_llm_runtime_config
 from app.mcp_gateway.content_source_client import ContentSourceMCPClient
 from app.mcp_gateway.client import HttpMCPGatewayClient
+from app.mcp_gateway.configured import configured_mcp_tool_names, create_configured_mcp_client
 
 
 router = APIRouter(prefix="/api/v1/agent", tags=["agent"])
+logger = logging.getLogger(__name__)
+
+_APPROVAL_CONFIRMATION_WORDS = frozenset({"是", "确认", "同意", "可以", "执行", "好的", "好", "yes", "y", "approve", "approved", "confirm"})
+_APPROVAL_REJECTION_WORDS = frozenset({"否", "不", "拒绝", "取消", "不要", "不执行", "no", "n", "reject", "rejected", "cancel"})
+
+
+def _approval_decision_from_chat_message(content_text: str) -> str | None:
+    """Classify only explicit approval controls; never infer file paths here."""
+    normalized = re.sub(r"\s+", "", str(content_text or "")).strip().lower()
+    if not normalized:
+        return None
+    if normalized in _APPROVAL_CONFIRMATION_WORDS or normalized.startswith(("确认", "同意", "执行")):
+        return "approved"
+    if normalized in _APPROVAL_REJECTION_WORDS or normalized.startswith(("拒绝", "取消", "不要", "不执行")):
+        return "rejected"
+    return None
+
+
+def _latest_pending_approval_for_session(session_id: str, session: Session) -> ApprovalRequest | None:
+    """Find the latest real checkpoint linked to this conversation."""
+    workflow_ids = (
+        select(AgentMessage.workflow_run_id)
+        .where(AgentMessage.session_id == session_id)
+        .where(AgentMessage.workflow_run_id.is_not(None))
+        .distinct()
+    )
+    statement = (
+        select(ApprovalRequest)
+        .where(ApprovalRequest.status == ApprovalRequestStatus.PENDING.value)
+        .where(ApprovalRequest.workflow_run_id.in_(workflow_ids))
+        .order_by(ApprovalRequest.created_at.desc(), ApprovalRequest.id.desc())
+    )
+    return session.scalars(statement).first()
+
+
+def _resume_pending_approval_chat_turn(
+    session_id: str,
+    request: AgentUserMessageRequest,
+    *,
+    session: Session,
+    conversation_service: ConversationService,
+) -> AgentChatTurnResponse | None:
+    """Resume a frozen approval instead of opening a second planning loop."""
+    decision = _approval_decision_from_chat_message(request.content_text)
+    approval = _latest_pending_approval_for_session(session_id, session)
+    if decision is None or approval is None:
+        return None
+
+    logger.info(
+        "Routing chat approval decision: session_id=%s approval_id=%s workflow_run_id=%s decision=%s",
+        session_id,
+        approval.id,
+        approval.workflow_run_id,
+        decision,
+    )
+    user_message = conversation_service.append_message(
+        session_id,
+        AgentMessageCreate(
+            role=AgentMessageRole.USER,
+            content_text=request.content_text,
+            visible_content_text=request.content_text,
+            workflow_run_id=approval.workflow_run_id,
+            metadata_json=request.metadata_json,
+        ),
+    )
+    dependencies = _agent_graph_dependencies(session, conversation_service)
+    workflow_result = continue_agent_workflow_after_approval(
+        approval.id,
+        approved=decision == "approved",
+        decision_reason=f"chat confirmation: {request.content_text.strip()}",
+        dependencies=dependencies,
+    )
+    workflow_result = _complete_outer_session_after_approval(
+        workflow_result,
+        dependencies=dependencies,
+        conversation_service=conversation_service,
+    )
+    assistant_message = _append_assistant_message_from_state(conversation_service, workflow_result.state)
+    refreshed_approval = session.get(ApprovalRequest, approval.id)
+    if refreshed_approval is None:
+        raise ValueError(f"Approval request not found: {approval.id}")
+    _apply_approval_decision_for_response(refreshed_approval, status=decision, decision=request.content_text.strip())
+    session.flush()
+    logger.info(
+        "Chat approval decision completed: approval_id=%s status=%s current_step=%s",
+        refreshed_approval.id,
+        refreshed_approval.status,
+        workflow_result.state.current_step,
+    )
+    return AgentChatTurnResponse(
+        user_message=AgentMessageRead.model_validate(user_message),
+        assistant_message=AgentMessageRead.model_validate(assistant_message),
+    )
 
 ASSISTANT_STUB_REPLY = "我已经记录这条消息。下一步会在记忆系统接入后构建上下文。"
 OUTER_SESSION_METADATA_KEY = "outer_session_loop"
@@ -197,6 +297,18 @@ class AgentApprovalDecisionResponse(BaseModel):
     approval: ApprovalRequestRead
     assistant_message: AgentMessageRead
     context_metadata: dict[str, object]
+
+
+class AgentPendingApprovalResponse(BaseModel):
+    approval: ApprovalRequestRead
+    approval_request_id: str
+    workflow_run_id: str
+    tool_name: str
+    reason: str | None = None
+    user_message: str | None = None
+    permission_decision: str | None = None
+    skill_ids: list[str] = Field(default_factory=list)
+    context_metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class AgentTaskStepRead(BaseModel):
@@ -538,6 +650,16 @@ def create_agent_message(
 ) -> AgentChatTurnResponse:
     service = _conversation_service(session)
     try:
+        approval_turn = _resume_pending_approval_chat_turn(
+            session_id,
+            request,
+            session=session,
+            conversation_service=service,
+        )
+        if approval_turn is not None:
+            session.commit()
+            return approval_turn
+
         dependencies = _agent_graph_dependencies(session, service)
         workflow_result = _run_agent_workflow_with_outer_session(
             _agent_run_command_from_request(session_id, request),
@@ -556,20 +678,11 @@ def create_agent_message(
                 metadata_json=request.metadata_json,
             ),
         )
-        assistant_message = service.append_message(
-            session_id,
-            AgentMessageCreate(
-                role=AgentMessageRole.ASSISTANT,
-                content_text=assistant_content,
-                visible_content_text=assistant_content,
-                parent_message_id=user_message.id,
-                agent_run_id=workflow_result.state.agent_run_id,
-                workflow_run_id=workflow_result.workflow_run_id,
-                metadata_json={
-                    "response_mode": workflow_result.state.response_mode,
-                    "context_metadata": _context_metadata_from_state(workflow_result.state),
-                },
-            ),
+        assistant_message = _append_assistant_message_from_state(
+            service,
+            workflow_result.state,
+            parent_message_id=user_message.id,
+            assistant_content=assistant_content,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -719,7 +832,12 @@ def _run_agent_message_stream_worker(
                 return
 
             chunks: list[str] = []
-            if prepared.state.final_response and prepared.state.response_mode != "deterministic_stub":
+            grounded_filesystem_response = _grounded_filesystem_mutation_response(prepared.state)
+            if (
+                prepared.state.final_response
+                and prepared.state.response_mode != "deterministic_stub"
+                and grounded_filesystem_response is None
+            ):
                 prepared_state, sanitized_response, response_mode = _sanitize_stream_final_response_before_tokens(
                     prepared.state,
                     final_response=prepared.state.final_response,
@@ -740,6 +858,9 @@ def _run_agent_message_stream_worker(
                     chunk_iterable = dependencies.llm_client.stream_complete(messages=synthesis_messages)
                 else:
                     chunk_iterable = _iter_visible_response_chunks(sanitized_response)
+            elif grounded_filesystem_response is not None:
+                assistant_content, response_mode = grounded_filesystem_response
+                chunk_iterable = _iter_visible_response_chunks(assistant_content)
             else:
                 synthesis_messages = external_web_search_synthesis_messages(prepared.state)
                 if synthesis_messages is not None and dependencies.llm_client is not None and hasattr(dependencies.llm_client, "stream_complete"):
@@ -749,19 +870,38 @@ def _run_agent_message_stream_worker(
                     response_mode = "llm_tool_result_summary"
                     chunk_iterable = _iter_visible_response_chunks(dependencies.llm_client.complete(messages=synthesis_messages).content)
                 else:
-                    tool_response = tool_result_summary_response(prepared.state, dependencies=dependencies)
-                    if tool_response is not None:
-                        assistant_content, response_mode = tool_response
+                    generic_tool_answer = complete_tool_observation_final_answer(prepared.state, llm_client=dependencies.llm_client)
+                    if generic_tool_answer is not None:
+                        assistant_content, response_mode = generic_tool_answer
                         chunk_iterable = _iter_visible_response_chunks(assistant_content)
-                    elif dependencies.llm_client is None:
-                        response_mode = "deterministic_stub"
-                        chunk_iterable = _iter_visible_response_chunks(ASSISTANT_STUB_REPLY)
-                    elif hasattr(dependencies.llm_client, "stream_complete"):
-                        response_mode = "llm_stream"
-                        chunk_iterable = dependencies.llm_client.stream_complete(messages=prepared.state.llm_messages)
                     else:
-                        response_mode = "llm"
-                        chunk_iterable = _iter_visible_response_chunks(dependencies.llm_client.complete(messages=prepared.state.llm_messages).content)
+                        filesystem_synthesis_messages = filesystem_answer_synthesis_messages(prepared.state)
+                        if (
+                            filesystem_synthesis_messages is not None
+                            and dependencies.llm_client is not None
+                            and hasattr(dependencies.llm_client, "stream_complete")
+                        ):
+                            response_mode = "llm_stream_filesystem_answer_synthesis"
+                            chunk_iterable = dependencies.llm_client.stream_complete(messages=filesystem_synthesis_messages)
+                        elif filesystem_synthesis_messages is not None and dependencies.llm_client is not None:
+                            response_mode = "llm_filesystem_answer_synthesis"
+                            chunk_iterable = _iter_visible_response_chunks(dependencies.llm_client.complete(messages=filesystem_synthesis_messages).content)
+                        else:
+                            # Formatter output is still useful as deterministic fallback and
+                            # frontend trace text, but only after synthesis is unavailable.
+                            tool_response = tool_result_summary_response(prepared.state, dependencies=dependencies)
+                            if tool_response is not None:
+                                assistant_content, response_mode = tool_response
+                                chunk_iterable = _iter_visible_response_chunks(assistant_content)
+                            elif dependencies.llm_client is None:
+                                response_mode = "deterministic_stub"
+                                chunk_iterable = _iter_visible_response_chunks(ASSISTANT_STUB_REPLY)
+                            elif hasattr(dependencies.llm_client, "stream_complete"):
+                                response_mode = "llm_stream"
+                                chunk_iterable = dependencies.llm_client.stream_complete(messages=prepared.state.llm_messages)
+                            else:
+                                response_mode = "llm"
+                                chunk_iterable = _iter_visible_response_chunks(dependencies.llm_client.complete(messages=prepared.state.llm_messages).content)
 
             suppressed_internal_protocol = _emit_visible_token_chunks(event_queue, chunk_iterable, chunks, state=prepared.state)
 
@@ -813,20 +953,11 @@ def _run_agent_message_stream_worker(
                 workflow_run_id=workflow_result.workflow_run_id,
                 state=_state_with_outer_session_metadata(workflow_result.state, outer_store, turn_result),
             )
-            assistant_message = service.append_message(
-                session_id,
-                AgentMessageCreate(
-                    role=AgentMessageRole.ASSISTANT,
-                    content_text=assistant_content,
-                    visible_content_text=assistant_content,
-                    parent_message_id=user_message.id,
-                    agent_run_id=workflow_result.state.agent_run_id,
-                    workflow_run_id=workflow_result.workflow_run_id,
-                    metadata_json={
-                        "response_mode": workflow_result.state.response_mode,
-                        "context_metadata": _context_metadata_from_state(workflow_result.state),
-                    },
-                ),
+            assistant_message = _append_assistant_message_from_state(
+                service,
+                workflow_result.state,
+                parent_message_id=user_message.id,
+                assistant_content=assistant_content,
             )
             worker_session.commit()
             event_queue.put(
@@ -850,12 +981,84 @@ def _run_agent_message_stream_worker(
             )
         except ValueError as exc:
             worker_session.rollback()
-            event_queue.put(_sse_event("error", {"message": str(exc)}))
+            _emit_stream_failure_terminal(
+                service=service,
+                db_session=worker_session,
+                event_queue=event_queue,
+                session_id=session_id,
+                user_message=user_message,
+                error_message=str(exc),
+                error_code="AGENT_STREAM_VALUE_ERROR",
+            )
         except Exception as exc:  # pragma: no cover - defensive streaming boundary.
             worker_session.rollback()
-            event_queue.put(_sse_event("error", {"message": f"Agent stream failed: {exc}"}))
+            _emit_stream_failure_terminal(
+                service=service,
+                db_session=worker_session,
+                event_queue=event_queue,
+                session_id=session_id,
+                user_message=user_message,
+                error_message=f"Agent stream failed: {exc}",
+                error_code="AGENT_STREAM_EXCEPTION",
+            )
         finally:
             event_queue.put(STREAM_QUEUE_DONE)
+
+
+def _emit_stream_failure_terminal(
+    *,
+    service: ConversationService,
+    db_session: Session,
+    event_queue: Queue[object],
+    session_id: str,
+    user_message: object | None,
+    error_message: str,
+    error_code: str,
+) -> None:
+    """Persist and expose a terminal assistant error instead of ending silently."""
+
+    visible_message = f"这次操作没有完成：{error_message}"
+    assistant_message = service.append_message(
+        session_id,
+        AgentMessageCreate(
+            role=AgentMessageRole.ASSISTANT,
+            content_text=visible_message,
+            visible_content_text=visible_message,
+            parent_message_id=getattr(user_message, "id", None),
+            metadata_json={
+                "response_mode": "stream_error",
+                "terminal_status": "failed",
+                "error_code": error_code,
+                "error_message": error_message,
+            },
+        ),
+    )
+    db_session.commit()
+    assistant_payload = AgentMessageRead.model_validate(assistant_message).model_dump(mode="json")
+    event_queue.put(
+        _sse_event(
+            "error",
+            {
+                "message": error_message,
+                "error_code": error_code,
+                "terminal": True,
+            },
+        )
+    )
+    event_queue.put(
+        _sse_event(
+            "done",
+            {
+                "assistant_message": assistant_payload,
+                "context_metadata": {
+                    "current_step": "final_response",
+                    "terminal_status": "failed",
+                    "error_code": error_code,
+                },
+                "terminal_status": "failed",
+            },
+        )
+    )
 
 
 def _emit_stream_started_events(
@@ -1149,6 +1352,33 @@ def _sanitize_stream_final_response_before_tokens(state, *, final_response: str,
     )
 
 
+@router.get("/sessions/{session_id}/approvals/pending", response_model=AgentPendingApprovalResponse | None)
+def get_pending_agent_approval(
+    session_id: str,
+    session: Session = Depends(get_db_session),
+) -> AgentPendingApprovalResponse | None:
+    service = _conversation_service(session)
+    try:
+        service.get_session(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    approval = _latest_pending_approval_for_session(session_id, session)
+    if approval is None:
+        return None
+    try:
+        dependencies = _agent_graph_dependencies(session, service)
+        snapshot = dependencies.checkpoint_store.load_latest(approval.workflow_run_id)
+    except Exception as exc:
+        logger.exception(
+            "Pending approval checkpoint unavailable: session_id=%s approval_id=%s workflow_run_id=%s",
+            session_id,
+            approval.id,
+            approval.workflow_run_id,
+        )
+        raise HTTPException(status_code=409, detail="待确认操作的执行检查点不可恢复。") from exc
+    return AgentPendingApprovalResponse.model_validate(_approval_required_payload(approval, snapshot.state))
+
+
 @router.post("/approvals/{approval_request_id}/approve", response_model=AgentApprovalDecisionResponse)
 def approve_agent_approval(
     approval_request_id: str,
@@ -1177,7 +1407,11 @@ def approve_agent_approval(
         _apply_approval_decision_for_response(approval, status="approved", decision=request.decision_reason)
         session.flush()
         session.refresh(approval)
+    except StaleApprovalContinuationError as exc:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.to_payload()) from exc
     except ValueError as exc:
+        session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     session.commit()
@@ -1216,7 +1450,11 @@ def reject_agent_approval(
         _apply_approval_decision_for_response(approval, status="rejected", decision=request.decision_reason)
         session.flush()
         session.refresh(approval)
+    except StaleApprovalContinuationError as exc:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.to_payload()) from exc
     except ValueError as exc:
+        session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     session.commit()
@@ -2519,6 +2757,7 @@ def _tool_event_payloads_from_tool_logs(state, db_session: Session) -> list[dict
         tool_name = str(getattr(tool_log, "tool_name", None) or state.requested_tool_name or "unknown_tool")
         input_payload = tool_log.input_payload if tool_log is not None and isinstance(tool_log.input_payload, dict) else {}
         output_payload = tool_log.output_payload if tool_log is not None and isinstance(tool_log.output_payload, dict) else {}
+        executor_id = _tool_log_executor_id(output_payload)
         status = _enum_value(getattr(tool_log, "status", None) or "unknown")
         error = str(getattr(tool_log, "error", None) or "") or None
         events.append(
@@ -2531,6 +2770,7 @@ def _tool_event_payloads_from_tool_logs(state, db_session: Session) -> list[dict
                 status="running",
                 summary=f"开始调用工具：{tool_name}。",
                 tool_input_keys=sorted(str(key) for key in input_payload.keys()),
+                executor_id=executor_id,
             )
         )
         events.append(
@@ -2543,6 +2783,7 @@ def _tool_event_payloads_from_tool_logs(state, db_session: Session) -> list[dict
                 status=status,
                 summary=_tool_log_summary(tool_name, status=status, output_payload=output_payload, error=error),
                 tool_input_keys=sorted(str(key) for key in input_payload.keys()),
+                executor_id=executor_id,
             )
         )
     return events
@@ -2563,6 +2804,7 @@ def _tool_event_payload(
     input_preview: dict[str, object] | None = None,
     result_summary: dict[str, object] | None = None,
     evidence: list[dict[str, object]] | None = None,
+    executor_id: str | None = None,
 ) -> dict[str, object]:
     labels = {
         "reasoning_summary": "思考摘要",
@@ -2582,6 +2824,7 @@ def _tool_event_payload(
         "agent_run_id": state.agent_run_id,
         "step_index": step_index,
         "tool_name": tool_name,
+        "executor_id": executor_id,
         "tool_call_id": tool_call_id,
         "status": status,
         "summary": summary,
@@ -2598,6 +2841,15 @@ def _tool_event_payload(
     if evidence is not None:
         payload["evidence"] = [dict(item) for item in evidence]
     return payload
+
+
+def _tool_log_executor_id(output_payload: dict[str, object]) -> str | None:
+    agent_runtime = output_payload.get("agent_runtime")
+    if not isinstance(agent_runtime, dict):
+        return None
+    raw_executor_id = agent_runtime.get("executor_id")
+    executor_id = str(raw_executor_id or "").strip()
+    return executor_id or None
 
 
 def _runtime_input_preview(metadata: dict[str, object]) -> dict[str, object] | None:
@@ -2622,6 +2874,8 @@ def _runtime_result_summary(metadata: dict[str, object]) -> dict[str, object] | 
     if not isinstance(summary, dict):
         return None
     clean: dict[str, object] = {}
+    filesystem_trace = _runtime_filesystem_trace(summary)
+    goal_validation = summary.get("goal_validation") if isinstance(summary.get("goal_validation"), dict) else None
     for key in ("result_count", "source_count"):
         value = summary.get(key)
         if isinstance(value, int):
@@ -2632,7 +2886,53 @@ def _runtime_result_summary(metadata: dict[str, object]) -> dict[str, object] | 
     evidence = summary.get("evidence")
     if isinstance(evidence, list):
         clean["evidence"] = [item for item in (_clean_evidence_item(raw) for raw in evidence) if item]
+    if isinstance(goal_validation, dict):
+        # Keep the after-tool outcome visible in SSE replayed events. Without
+        # this, the frontend can only say "finished" and loses why the runtime
+        # accepted, retried, or rejected a tool result.
+        clean["goal_validation"] = dict(goal_validation)
+        clean["goal_completed"] = bool(goal_validation.get("completed"))
+        clean["goal_next_action"] = goal_validation.get("next_action")
+    if filesystem_trace is not None:
+        clean["filesystem_trace"] = filesystem_trace
     return clean or None
+
+
+def _runtime_filesystem_trace(summary: dict[str, object]) -> dict[str, object] | None:
+    trace = summary.get("filesystem_trace")
+    if not isinstance(trace, dict):
+        return None
+    return {
+        "operation": trace.get("operation"),
+        "precheck": _compact_filesystem_trace_section(trace.get("precheck")),
+        "script": _compact_filesystem_trace_section(trace.get("script")),
+        "postcheck": _compact_filesystem_trace_section(trace.get("postcheck")),
+    }
+
+
+def _compact_filesystem_trace_section(section: object) -> dict[str, object]:
+    if not isinstance(section, dict):
+        return {}
+    allowed = {
+        "completed",
+        "reason",
+        "source_path",
+        "target_path",
+        "path",
+        "source_exists_before",
+        "target_exists_before",
+        "source_exists_after",
+        "target_exists_after",
+        "path_exists_after",
+        "internal_tool",
+        "internal_script",
+        "ok",
+        "error",
+        "return_code",
+    }
+    # Mirror graph_factory's compact trace contract: enough proof for the UI,
+    # but no file contents, raw stdout, or large debug blobs in SSE events.
+    return {str(key): value for key, value in section.items() if key in allowed}
 
 
 def _runtime_evidence_from_result_summary(result_summary: dict[str, object] | None) -> list[dict[str, object]]:
@@ -2664,6 +2964,11 @@ def _runtime_input_preview_summary(input_preview: dict[str, object]) -> str:
 
 
 def _runtime_result_summary_text(result_summary: dict[str, object]) -> str:
+    filesystem_trace = result_summary.get("filesystem_trace") if isinstance(result_summary.get("filesystem_trace"), dict) else None
+    if filesystem_trace is not None:
+        text = _filesystem_trace_summary_text(filesystem_trace)
+        if text:
+            return text
     result_count = result_summary.get("result_count")
     source_count = result_summary.get("source_count")
     domains = result_summary.get("source_domains") if isinstance(result_summary.get("source_domains"), list) else []
@@ -2675,6 +2980,21 @@ def _runtime_result_summary_text(result_summary: dict[str, object]) -> str:
     if domains:
         parts.append("来源包括 " + "、".join(str(domain) for domain in domains[:3]))
     return "，".join(parts) + "。" if parts else "工具结果已整理为可观察摘要。"
+
+
+def _filesystem_trace_summary_text(filesystem_trace: dict[str, object]) -> str:
+    operation = str(filesystem_trace.get("operation") or "文件操作").strip()
+    postcheck = filesystem_trace.get("postcheck") if isinstance(filesystem_trace.get("postcheck"), dict) else {}
+    source = str(postcheck.get("source_path") or "").strip()
+    target = str(postcheck.get("target_path") or "").strip()
+    path_text = f"{source} -> {target}" if source and target else str(postcheck.get("path") or "").strip()
+    reason = str(postcheck.get("reason") or "").strip()
+    if postcheck.get("completed") is False:
+        suffix = f"，原因：{reason}" if reason else ""
+        return f"文件动作复核失败：{operation}，{path_text}{suffix}。" if path_text else f"文件动作复核失败：{operation}{suffix}。"
+    if postcheck.get("completed") is True:
+        return f"文件动作已执行并复核：{operation}，{path_text}。" if path_text else f"文件动作已执行并复核：{operation}。"
+    return ""
 
 
 def _runtime_evidence_summary(evidence: list[dict[str, object]]) -> str:
@@ -2840,19 +3160,26 @@ def _loop_decision_from_metadata(payload: object) -> LoopAgentDecision | None:
     )
 
 
-def _append_assistant_message_from_state(service: ConversationService, state) -> object:
-    assistant_content = _assistant_content_from_state(state)
+def _append_assistant_message_from_state(
+    service: ConversationService,
+    state,
+    *,
+    parent_message_id: str | None = None,
+    assistant_content: str | None = None,
+) -> object:
+    assistant_content = assistant_content or _assistant_content_from_state(state)
     return service.append_message(
         state.session_id,
         AgentMessageCreate(
             role=AgentMessageRole.ASSISTANT,
             content_text=assistant_content,
             visible_content_text=assistant_content,
+            parent_message_id=parent_message_id,
             agent_run_id=state.agent_run_id,
             workflow_run_id=state.workflow_run_id,
             metadata_json={
                 "response_mode": state.response_mode,
-                "context_metadata": _context_metadata_from_state(state),
+                "context_metadata": _context_metadata_from_state(state, assistant_content=assistant_content),
             },
         ),
     )
@@ -2940,10 +3267,11 @@ def _agent_graph_dependencies(session: Session, conversation_service: Conversati
     automation_service = _automation_service(session)
     settings = get_settings()
     memory_repository = AgentMemoryRepository(session)
-    mcp_client = HttpMCPGatewayClient(server_url=settings.mcp_server_url) if settings.mcp_enabled and settings.mcp_server_url else None
+    content_mcp_client = HttpMCPGatewayClient(server_url=settings.mcp_server_url) if settings.mcp_enabled and settings.mcp_server_url else None
+    runtime_mcp_client = create_configured_mcp_client(settings, discover=True)
     registry = create_default_agent_tool_registry(
         content_source_client=ContentSourceMCPClient(
-            mcp_client=mcp_client,
+            mcp_client=content_mcp_client,
             xiaohongshu_base_url=settings.xiaohongshu_mcp_base_url,
             xiaohongshu_auth_token=(
                 settings.xiaohongshu_mcp_auth_token.get_secret_value() if settings.xiaohongshu_mcp_auth_token else None
@@ -2952,14 +3280,18 @@ def _agent_graph_dependencies(session: Session, conversation_service: Conversati
         external_task_dispatcher=build_external_task_dispatcher_callback(settings),
         external_web_search_executor=build_external_web_search_callback(settings),
     )
-    if settings.mcp_enabled and settings.mcp_server_url:
+    if runtime_mcp_client is not None:
         registry.register_many(
             create_mcp_agent_tool_definitions(
-                mcp_client,
-                allowed_tool_names=settings.allowed_mcp_tools,
+                runtime_mcp_client,
+                allowed_tool_names=configured_mcp_tool_names(runtime_mcp_client, fallback=settings.allowed_mcp_tools),
             )
         )
-    agent_executors, capability_executor_ids = build_agent_runtime_executor_bundle(settings)
+    agent_executors, capability_executor_ids = build_agent_runtime_executor_bundle(
+        settings,
+        tool_registry=registry,
+        session_provider=lambda _context: session,
+    )
     return AgentGraphDependencies(
         automation_service=automation_service,
         checkpoint_store=AgentCheckpointStore(session=session, automation_service=automation_service),
@@ -2976,6 +3308,7 @@ def _agent_graph_dependencies(session: Session, conversation_service: Conversati
         durable_state_service=DurableStateService(SqlAlchemyDurableStateRepository(session)),
         agent_executors=agent_executors,
         capability_executor_ids=capability_executor_ids,
+        context_build_config=ContextBuildConfig(context_window=settings.resolved_agent_context_window),
     )
 
 
@@ -3528,8 +3861,16 @@ def _build_agent_execution_planner(settings) -> HybridExecutionPlanner | None:
     return HybridExecutionPlanner(llm_client=planner_llm_client)
 
 
-def _context_metadata_from_state(state) -> dict[str, object]:
+def _context_metadata_from_state(state, *, assistant_content: str | None = None) -> dict[str, object]:
     metadata = dict(getattr(state, "context_metadata", {}) or {})
+    # Structured filesystem intent is persisted from the model/runtime state.
+    # Ordinary assistant prose is intentionally never reparsed into dst or a
+    # filename proposal here.
+    intent_frame = metadata.get("intent_frame") if isinstance(metadata.get("intent_frame"), dict) else {}
+    if "filesystem_operation" not in metadata and intent_frame.get("filesystem_operation"):
+        metadata["filesystem_operation"] = intent_frame["filesystem_operation"]
+    if "operation_intent" not in metadata and isinstance(intent_frame.get("operation_intent"), dict):
+        metadata["operation_intent"] = dict(intent_frame["operation_intent"])
     metadata.update(
         {
         "summary_id": state.latest_summary_id,

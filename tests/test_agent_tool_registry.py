@@ -11,6 +11,9 @@ class AgentToolRegistryTest(TestCase):
         self.assertEqual(
             [
                 "applications.find_apply_entry",
+                "applications.find_for_mail_notification",
+                "applications.sync_mail_application",
+                "artifact.export",
                 "database.company_list",
                 "database.company_profile",
                 "database.company_search",
@@ -36,6 +39,10 @@ class AgentToolRegistryTest(TestCase):
                 "offerio.sync_company_jobs",
                 "sessions_history",
                 "sessions_search",
+                "skill_call",
+                "skill_list",
+                "skill_list_actions",
+                "skill_read",
                 "weixin-articles-mcp.read_article",
                 "xiaohongshu-mcp.get_feed_detail",
                 "xiaohongshu-mcp.search_feeds",
@@ -50,6 +57,89 @@ class AgentToolRegistryTest(TestCase):
         self.assertFalse(registry.get("database.source_search").requires_confirmation)
         self.assertTrue(registry.get("database.company_update").requires_confirmation)
         self.assertTrue(registry.get("database.job_lead_delete").requires_confirmation)
+        self.assertTrue(registry.get("skill_call").requires_confirmation)
+        self.assertFalse(registry.get("skill_list").requires_confirmation)
+
+    def test_dbx_mcp_definitions_expose_readonly_query_schemas(self) -> None:
+        from app.agent_runtime.tool_registry import create_mcp_agent_tool_definitions
+
+        definitions = create_mcp_agent_tool_definitions(
+            object(),
+            allowed_tool_names=[
+                "dbx.dbx_list_connections",
+                "dbx.dbx_list_databases",
+                "dbx.dbx_list_tables",
+                "dbx.dbx_get_schema_context",
+                "dbx.dbx_describe_table",
+                "dbx.dbx_execute_query",
+                "dbx.dbx_commit",
+            ],
+        )
+        by_name = {definition.name: definition for definition in definitions}
+
+        self.assertNotIn("mcp.dbx.dbx_commit", by_name)
+        self.assertEqual(["sql"], by_name["mcp.dbx.dbx_execute_query"].input_schema["required"])
+        self.assertIn("connection_name", by_name["mcp.dbx.dbx_execute_query"].input_schema["properties"])
+        self.assertEqual(["table"], by_name["mcp.dbx.dbx_describe_table"].input_schema["required"])
+        self.assertIn("read-only", by_name["mcp.dbx.dbx_execute_query"].description)
+
+    def test_dbx_execute_query_rejects_write_sql_before_gateway_call(self) -> None:
+        from app.agent_runtime.tool_registry import create_mcp_agent_tool_definitions
+
+        calls = []
+
+        class FakeClient:
+            def call_tool(self, *, tool_name, arguments):
+                calls.append((tool_name, arguments))
+                return {"tool_name": tool_name, "ok": True}
+
+        definition = next(
+            definition
+            for definition in create_mcp_agent_tool_definitions(
+                FakeClient(),
+                allowed_tool_names=["dbx.dbx_execute_query"],
+            )
+            if definition.name == "mcp.dbx.dbx_execute_query"
+        )
+
+        result = definition.handler(None, sql="DELETE FROM companies")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("DBX_READ_ONLY_POLICY", result.error)
+        self.assertEqual([], calls)
+
+    def test_copy_file_schema_exposes_structured_operation_intent(self) -> None:
+        from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
+
+        definition = next(
+            definition
+            for definition in create_filesystem_agent_tool_definitions()
+            if definition.name == "filesystem.copy_file"
+        )
+
+        self.assertIn("operation_intent", definition.input_schema["properties"])
+        self.assertNotIn("operation_intent", definition.input_schema["required"])
+        self.assertEqual(["src"], definition.input_schema["required"])
+
+        intent = definition.input_schema["properties"]["operation_intent"]
+        self.assertEqual(["content_based"], intent["properties"]["name_policy"]["enum"])
+        self.assertNotIn("user_delegated_name", intent["properties"])
+
+    def test_move_file_schema_exposes_structured_name_intent(self) -> None:
+        from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
+
+        definition = next(
+            definition
+            for definition in create_filesystem_agent_tool_definitions()
+            if definition.name == "filesystem.move_file"
+        )
+
+        intent = definition.input_schema["properties"]["operation_intent"]
+        self.assertIn("name_intent", intent["properties"])
+        self.assertIn("filename_stem", intent["properties"]["name_intent"]["properties"])
+        self.assertEqual(["content_based"], intent["properties"]["name_policy"]["enum"])
+        self.assertNotIn("user_delegated_name", intent["properties"])
+        self.assertNotIn("operation_intent", definition.input_schema["required"])
 
     def test_external_web_search_normalizes_cristiano_ronaldo_alias_before_executor(self) -> None:
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, create_external_web_search_agent_tool_definitions
@@ -670,6 +760,96 @@ class AgentToolRegistryTest(TestCase):
         self.assertIn("| 正式企业 | Tencent | 企业档案、正式岗位 | 1 条岗位 | 可用于推荐 |", response)
         self.assertIn("| 岗位线索企业 | ByteDance | 岗位线索 | 1 条线索 | 待补全企业档案 |", response)
 
+    def test_company_board_overview_returns_only_selected_company_board_total(self) -> None:
+        from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL, create_local_job_source_agent_tool_definitions
+        from app.domains.jobs.providers.offerio import OfferIOPage
+
+        calls = []
+
+        class FakeOfferIOProvider:
+            def list_company_openings(self, **kwargs):
+                calls.append(("openings", kwargs))
+                return OfferIOPage(items=[], page=kwargs["page"], page_size=kwargs["page_size"], total=1066, total_pages=54)
+
+            def list_companies(self, **kwargs):
+                calls.append(("companies", kwargs))
+                raise AssertionError("default company count must not fall back to the other board")
+
+        definition = next(
+            item for item in create_local_job_source_agent_tool_definitions(offerio_provider_factory=FakeOfferIOProvider)
+            if item.name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL
+        )
+        result = definition.handler(None, mode="company_board_count")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("offerio_company_openings", result["result"]["company_board"]["source"])
+        self.assertEqual(1066, result["result"]["company_board"]["company_count"])
+        self.assertEqual(
+            [("openings", {"page": 1, "page_size": 1, "batch": "秋招", "target": "2027届"})],
+            calls,
+        )
+
+    def test_company_board_overview_reports_provider_failure_without_fake_zero(self) -> None:
+        from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL, create_local_job_source_agent_tool_definitions
+
+        class FailingOfferIOProvider:
+            def list_company_openings(self, **kwargs):
+                raise TimeoutError("board unavailable")
+
+            def list_companies(self, **kwargs):
+                raise AssertionError("must not query an unrelated board")
+
+        definition = next(
+            item for item in create_local_job_source_agent_tool_definitions(offerio_provider_factory=FailingOfferIOProvider)
+            if item.name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL
+        )
+        result = definition.handler(None, mode="company_board_count")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("COMPANY_BOARD_UNAVAILABLE", result["error"])
+
+    def test_company_board_count_summary_does_not_append_legacy_local_counts(self) -> None:
+        from app.agent_runtime.graph_factory import _company_board_count_summary_response
+
+        response = _company_board_count_summary_response(
+            {
+                "status": "succeeded",
+                "result": {
+                    "ok": True,
+                    "result": {
+                        "company_board": {
+                            "source": "offerio_company_openings",
+                            "label": "公司展览 · 开放岗位公司库",
+                            "company_count": 1066,
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertIn("1066", response)
+        self.assertIn("公司展览", response)
+        self.assertNotIn("正式企业表", response)
+        self.assertNotIn("岗位线索", response)
+
+    def test_company_board_count_summary_reports_unavailable_instead_of_zero(self) -> None:
+        from app.agent_runtime.graph_factory import _company_board_count_summary_response
+
+        response = _company_board_count_summary_response(
+            {
+                "status": "failed",
+                "error": "COMPANY_BOARD_UNAVAILABLE",
+                "result": {
+                    "ok": False,
+                    "error": "COMPANY_BOARD_UNAVAILABLE",
+                    "result": {"message": "company board timeout"},
+                },
+            }
+        )
+
+        self.assertIn("暂时无法读取", response)
+        self.assertNotIn("0 家", response)
+
     def test_local_job_source_overview_tool_reads_local_sources_and_offerio_board_totals(self) -> None:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -745,6 +925,35 @@ class AgentToolRegistryTest(TestCase):
         self.assertEqual(1247, result["result"]["external_job_board"]["offerio_company_openings_total"])
         self.assertEqual(987, result["result"]["external_job_board"]["offerio_company_jobs_total"])
         self.assertEqual("official_api", result["result"]["sample_sources"][0]["source_type"])
+
+    def test_company_board_count_uses_company_exhibition_default_filters(self) -> None:
+        from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL, create_local_job_source_agent_tool_definitions
+        from app.domains.jobs.providers.offerio import OfferIOPage
+
+        calls = []
+
+        class FakeOfferIOProvider:
+            def list_company_openings(self, **kwargs):
+                calls.append(dict(kwargs))
+                return OfferIOPage(items=[], page=1, page_size=1, total=3141, total_pages=3141)
+
+        definition = next(
+            item
+            for item in create_local_job_source_agent_tool_definitions(offerio_provider_factory=FakeOfferIOProvider)
+            if item.name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL
+        )
+
+        result = definition.handler(
+            None,
+            mode="company_board_count",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(3141, result["result"]["company_board"]["company_count"])
+        self.assertEqual(
+            [{"page": 1, "page_size": 1, "batch": "秋招", "target": "2027届"}],
+            calls,
+        )
 
     def test_application_find_apply_entry_tool_queues_external_task(self) -> None:
         from sqlalchemy import create_engine, select

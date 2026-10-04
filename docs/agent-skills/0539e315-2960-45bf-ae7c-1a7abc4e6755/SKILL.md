@@ -36,6 +36,71 @@ explain what you will do, and avoid destructive actions unless explicitly reques
     - delete first with `delete_path` (use `--force` for files), then write, or
     - write with `write_text --overwrite` when explicitly allowed
 
+## Copy Intent
+
+When a copy request refers to a directory from an earlier turn, says "same
+directory/current directory", or delegates the new name, keep the meaning in
+the structured `operation_intent` field instead of turning the phrase into
+`dst` text. Use this shape when calling `skill.filesystem` or
+`filesystem.copy_file`:
+
+```json
+{
+  "operation_intent": {
+    "destination": {
+      "kind": "directory",
+      "path": "C:/path/to/the/explicit/directory",
+      "reference": "previous_turn_explicit_directory"
+    },
+    "name_policy": "auto_generate_copy_name",
+    "user_delegated_name": true,
+    "avoid_conflict": true
+  }
+}
+```
+
+Rules:
+
+- `destination.path` must be the actual path resolved from conversation
+  context, never a natural-language phrase such as `同目录下啊`.
+- Use `kind: "file"` only when the user or context provides the concrete
+  destination filename.
+- Use `kind: "directory"` when the destination is a folder; let runtime create
+  the concrete copy filename and show it in the confirmation request.
+- `dst` remains supported for legacy calls, but do not invent a filename from
+  filler words when `operation_intent` can express the meaning.
+
+## Rename Intent
+
+When the user asks to rename a file using a name that the model selected from
+the file content or prior conversation, include a structured `name_intent`
+inside `operation_intent`. The supported fields are:
+
+```json
+{
+  "operation_intent": {
+    "destination": {
+      "kind": "directory",
+      "path": "C:/path/to/the/source-directory",
+      "reference": "same_directory"
+    },
+    "name_policy": "content_based",
+    "user_delegated_name": true,
+    "name_intent": {
+      "mode": "model_proposed",
+      "display_name": "Agent-First 工程师简历：AI 智能体平台研发 × 高可靠后端实践",
+      "filename_stem": "Agent-First_工程师简历_AI_智能体平台研发_高可靠后端实践",
+      "extension_policy": "preserve_source",
+      "source_basis": "file_content"
+    }
+  }
+}
+```
+
+The runtime owns filename safety, extension preservation, directory boundaries,
+approval, and post-execution checks. Never send conversational placeholders such
+as “你起的名字” as `dst`.
+
 ## Scripts
 
 Run from the skill directory (or use absolute script paths):

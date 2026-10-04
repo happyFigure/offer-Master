@@ -153,6 +153,72 @@ class AgentSkillPackageParserTest(unittest.TestCase):
 
         self.assertIn("description 缺失", "\n".join(package.import_report["blocking_errors"]))
 
+    def test_parse_openclaw_action_metadata_and_external_action_schemas(self) -> None:
+        from app.agent_runtime.memory.skill_package_parser import SkillPackageParser
+
+        skill_dir = self.tmp_root / "article-fetcher"
+        (skill_dir / "scripts").mkdir(parents=True)
+        (skill_dir / "references").mkdir()
+        (skill_dir / "scripts" / "fetch_article.py").write_text("print('fetch')\n", encoding="utf-8")
+        (skill_dir / "scripts" / "draft_secret.py").write_text("print('secret')\n", encoding="utf-8")
+        (skill_dir / "scripts" / "_helper.py").write_text("print('helper')\n", encoding="utf-8")
+        (skill_dir / "references" / "action-schemas.json").write_text(
+            textwrap.dedent(
+                """
+                {
+                  "fetch_article": {
+                    "description": "读取一篇文章并输出结构化正文。",
+                    "required": ["url"],
+                    "properties": {
+                      "url": {"type": "string", "description": "文章 URL"},
+                      "limit": {"type": "integer", "default": 20}
+                    },
+                    "additionalProperties": false
+                  },
+                  "draft_secret": {
+                    "description": "不应该暴露给模型的内部动作。",
+                    "required": [],
+                    "properties": {},
+                    "additionalProperties": false
+                  }
+                }
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+        (skill_dir / "SKILL.md").write_text(
+            textwrap.dedent(
+                """
+                ---
+                name: article-fetcher
+                description: When the user provides an article URL and wants extracted article content as JSON without modifying files.
+                metadata: {"openclaw":{"actions":{"modelAllow":["fetch_article"],"modelDeny":["draft_secret"],"executeAllow":["fetch_article"],"executeDeny":["draft_secret"],"actionSchemasFile":"references/action-schemas.json"}}}
+                ---
+                # Article Fetcher
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        package = SkillPackageParser().parse(skill_dir)
+        report = package.import_report
+        details = {item["action"]: item for item in report["action_details"]}
+
+        self.assertEqual(["fetch_article"], report["actions"])
+        self.assertEqual({"fetch_article": "scripts/fetch_article.py"}, report["action_map"])
+        self.assertEqual("references/action-schemas.json", report["action_schemas_file"])
+        self.assertEqual(["fetch_article"], report["model_allowed_actions"])
+        self.assertEqual(["draft_secret"], report["model_denied_actions"])
+        self.assertEqual(["fetch_article"], report["execute_allowed_actions"])
+        self.assertEqual(["draft_secret"], report["execute_denied_actions"])
+        self.assertIn("fetch_article", details)
+        self.assertNotIn("draft_secret", details)
+        self.assertNotIn("_helper", details)
+        self.assertEqual("scripts/fetch_article.py", details["fetch_article"]["script_path"])
+        self.assertEqual(["url"], details["fetch_article"]["required"])
+        self.assertEqual(["url", "limit"], details["fetch_article"]["parameter_names"])
+        self.assertFalse(details["fetch_article"]["input_schema"]["additionalProperties"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -141,15 +141,28 @@ export interface AgentStreamOuterSessionEvent {
   [key: string]: unknown;
 }
 
+export interface RuntimeFilesystemTrace {
+  operation?: string | null;
+  precheck?: Record<string, unknown>;
+  script?: Record<string, unknown>;
+  postcheck?: Record<string, unknown>;
+}
+
 export interface AgentStreamToolEvent {
   event_type: string;
   event_label: string;
   session_id: string;
   workflow_run_id?: string | null;
   agent_run_id?: string | null;
+  delegation_id?: string | null;
   step_index?: number;
   tool_name?: string | null;
   capability?: string | null;
+  capability_kind?: string | null;
+  executor_id?: string | null;
+  parent_capability?: string | null;
+  parent_agent_name?: string | null;
+  subagent_name?: string | null;
   tool_call_id?: string | null;
   status?: string | null;
   summary?: string | null;

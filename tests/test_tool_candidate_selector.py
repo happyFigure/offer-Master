@@ -8,6 +8,17 @@ sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
 
 
 class ToolCandidateSelectorTest(unittest.TestCase):
+    def test_model_capability_catalog_does_not_depend_on_current_message_keywords(self) -> None:
+        from app.agent_runtime.graph_factory import model_capability_catalog_for_agent_chat
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, create_default_agent_tool_registry
+
+        capabilities = model_capability_catalog_for_agent_chat(
+            create_default_agent_tool_registry()
+        )
+
+        self.assertIn(EXTERNAL_WEB_SEARCH_TOOL, capabilities)
+        self.assertNotEqual((), capabilities)
+
     def test_selects_web_search_for_realtime_public_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, create_default_agent_tool_registry
@@ -29,6 +40,16 @@ class ToolCandidateSelectorTest(unittest.TestCase):
 
         self.assertIn(EXTERNAL_WEB_SEARCH_TOOL, selection.capabilities)
         self.assertIn("realtime_public_information", selection.signals)
+
+    def test_plain_specific_company_lookup_uses_public_web_not_local_database(self) -> None:
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import DATABASE_COMPANY_LIST_TOOL, EXTERNAL_WEB_SEARCH_TOOL, create_default_agent_tool_registry
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select("你查一下京东")
+
+        self.assertEqual((EXTERNAL_WEB_SEARCH_TOOL,), selection.capabilities)
+        self.assertIn("public_web_information", selection.signals)
+        self.assertNotIn(DATABASE_COMPANY_LIST_TOOL, selection.capabilities)
 
     def test_selects_local_company_database_for_local_company_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
@@ -126,6 +147,42 @@ class ToolCandidateSelectorTest(unittest.TestCase):
         self.assertEqual(("resume.tailor",), selection.capabilities)
         self.assertIn("resume_tailoring", selection.signals)
 
+    def test_includes_always_available_agent_capabilities_without_lexical_signals(self) -> None:
+        from app.agent_runtime.agent_as_tool import AgentCapabilityDefinition, AgentCapabilityRegistry
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+
+        registry = AgentCapabilityRegistry(
+            [
+                AgentCapabilityDefinition(
+                    capability_id="agent.google_chrome",
+                    name="Google Chrome 浏览器 Agent",
+                    description="处理用户委派的浏览器任务。",
+                    executor_id="openai-sdk-agent",
+                    input_schema={"type": "object", "required": ["task"]},
+                    output_schema={"type": "object"},
+                    kind="agent",
+                    always_available=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                ),
+                AgentCapabilityDefinition(
+                    capability_id="agent.dbx_readonly",
+                    name="DBX 只读数据库 Agent",
+                    description="处理用户委派的只读数据库任务。",
+                    executor_id="openai-sdk-agent",
+                    input_schema={"type": "object", "required": ["task"]},
+                    output_schema={"type": "object"},
+                    kind="agent",
+                    always_available=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                ),
+            ]
+        )
+
+        selection = ToolCandidateSelector(registry).select("你好")
+
+        self.assertEqual(("agent.dbx_readonly", "agent.google_chrome"), selection.capabilities)
+        self.assertEqual((), selection.signals)
+
     def test_does_not_force_tool_for_plain_writing_request(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import create_default_agent_tool_registry
@@ -146,44 +203,68 @@ class ToolCandidateSelectorTest(unittest.TestCase):
     def test_selects_filesystem_read_tool_for_user_provided_file_path(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
 
         selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
             "请读取 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex",
             auto_executable_only=False,
         )
 
-        self.assertIn("filesystem.read_file", selection.capabilities)
+        self.assertIn(FILESYSTEM_SKILL_CAPABILITY, selection.capabilities)
         self.assertIn("filesystem_read", selection.signals)
+        self.assertNotIn("filesystem.read_file", selection.capabilities)
 
     def test_selects_filesystem_read_tool_for_can_you_read_path_question(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
 
         selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
             "你现在能不能读到 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 这个文件呢？",
             auto_executable_only=False,
         )
 
-        self.assertIn("filesystem.read_file", selection.capabilities)
+        self.assertIn(FILESYSTEM_SKILL_CAPABILITY, selection.capabilities)
         self.assertIn("filesystem_read", selection.signals)
+        self.assertNotIn("filesystem.read_file", selection.capabilities)
 
     def test_selects_filesystem_read_and_write_for_exact_file_text_replacement(self) -> None:
         from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
         from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
 
         selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
             "请把 C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 里的刘汉卿替换为王爷，其他不要动",
             auto_executable_only=False,
         )
 
-        self.assertIn("filesystem.read_file", selection.capabilities)
-        self.assertIn("filesystem.write_text", selection.capabilities)
-        self.assertIn("filesystem.replace_text", selection.capabilities)
+        self.assertIn(FILESYSTEM_SKILL_CAPABILITY, selection.capabilities)
         self.assertIn("filesystem_read", selection.signals)
         self.assertIn("filesystem_write", selection.signals)
         self.assertIn("filesystem_replace", selection.signals)
+        self.assertNotIn("filesystem.read_file", selection.capabilities)
+        self.assertNotIn("filesystem.write_text", selection.capabilities)
+        self.assertNotIn("filesystem.replace_text", selection.capabilities)
         self.assertNotIn("filesystem.delete_path", selection.capabilities)
         self.assertNotIn("filesystem.move_file", selection.capabilities)
+
+    def test_selects_filesystem_skill_for_contextual_filename_rename(self) -> None:
+        """Filename rename stays inside the coarse filesystem Skill boundary."""
+        from app.agent_runtime.tool_candidate_selector import ToolCandidateSelector
+        from app.agent_runtime.tool_registry import create_default_agent_tool_registry
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+
+        selection = ToolCandidateSelector(create_default_agent_tool_registry()).select(
+            "把名字改成刘汉卿-后端开发-AI-Agent\n\n上文用户消息：\n"
+            "刚才查看这个文件的名字：C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent平台简历.tex",
+            auto_executable_only=False,
+        )
+
+        self.assertIn(FILESYSTEM_SKILL_CAPABILITY, selection.capabilities)
+        # Fine-grained rename-vs-replace semantics belong to the model's
+        # structured filesystem operation, not to the routing signal list.
+        self.assertNotIn("filesystem.replace_text", selection.capabilities)
+        self.assertNotIn("filesystem.read_file", selection.capabilities)
 
 
 if __name__ == "__main__":

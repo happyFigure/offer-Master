@@ -60,6 +60,16 @@ class SkillProgressiveLoadingTest(unittest.TestCase):
                         "allowed_tools": ["weixin-articles-mcp.read_article", "ocr.extract_text"],
                         "ask_tools": ["browser.open"],
                         "disallowed_tools": ["submit_application"],
+                        "actions": ["fetch_article"],
+                        "action_details": [
+                            {
+                                "action": "fetch_article",
+                                "description": "读取公众号文章并输出结构化正文。",
+                                "required": ["url"],
+                                "parameter_names": ["url"],
+                                "script_path": "scripts/fetch_article.py",
+                            }
+                        ],
                         "security_risk_level": "medium",
                         "auto_trigger_state": "enabled",
                         "description_quality_score": 9,
@@ -88,9 +98,12 @@ class SkillProgressiveLoadingTest(unittest.TestCase):
         self.assertTrue(card.protected)
         self.assertTrue(card.auto_load_enabled)
         self.assertEqual(9, card.description_quality_score)
+        self.assertEqual(1, card.actions_count)
+        self.assertEqual(("fetch_article",), card.actions_preview)
         self.assertIn("公众号文章链接", card.when_to_use)
         self.assertNotIn("先读取文章，再抽取招聘信号", card.summary_text)
         self.assertIn("微信公众号招聘导入", card.summary_text)
+        self.assertIn("可用动作：fetch_article", card.summary_text)
         self.assertIn("适用场景", card.summary_text)
         self.assertIn("工具边界", card.summary_text)
 

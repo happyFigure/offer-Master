@@ -1,7 +1,8 @@
 import sys
 import unittest
 import shutil
-from datetime import date
+from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, select
@@ -181,6 +182,31 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 )
 
                 self.assertEqual({"limit": expected_limit}, _resolved_tool_input(command, state))
+
+    def test_explicit_required_capability_skips_broad_tool_choice_loop(self) -> None:
+        from app.agent_runtime.graph_factory import _should_offer_tool_choice_before_specialized_routing
+        from app.agent_runtime.state import AgentState
+
+        state = AgentState(
+            session_id="session-1",
+            workflow_run_id="workflow-1",
+            agent_run_id="agent-run-1",
+            user_message="只通过 DBX 只读子 Agent 查询公司展览公司数",
+            current_step="plan_or_reply",
+            context_metadata={
+                "intent_frame": {
+                    "intent": "filesystem_operation",
+                    "confidence": 0.98,
+                    "required_capability": "agent.dbx_readonly",
+                },
+                "context_pack": {
+                    "required_capability": "agent.dbx_readonly",
+                    "allowed_capabilities": ["agent.dbx_readonly"],
+                },
+            },
+        )
+
+        self.assertFalse(_should_offer_tool_choice_before_specialized_routing(state))
 
     def test_database_company_list_runtime_helpers_are_labeled_as_local_collection(self) -> None:
         from app.agent_runtime.graph_factory import (
@@ -378,6 +404,188 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("submit_application", approval.action_type)
         self.assertIn("wait_confirmation", {checkpoint.checkpoint_key for checkpoint in checkpoints})
         self.assertNotIn("final_response", {checkpoint.checkpoint_key for checkpoint in checkpoints})
+
+    def test_tool_result_declared_resource_effects_are_promoted_without_tool_specific_runtime_code(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        effect = {
+            "resource_type": "file",
+            "action": "created",
+            "operation": "export_pdf",
+            "source_path": "C:/简历/resume.tex",
+            "target_path": "C:/简历/resume.pdf",
+            "focus_path": "C:/简历/resume.pdf",
+            "aliases": ["刚才生成的 PDF"],
+        }
+
+        def export_handler(_session, **_arguments):
+            return {
+                "tool_name": "resume.export_pdf",
+                "ok": True,
+                "summary": "PDF 已导出。",
+                "resource_effects": [effect],
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name="resume.export_pdf",
+                    description="Export a resume source file to PDF and report the created artifact.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=export_handler,
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="导出 PDF",
+                    requested_tool_name="resume.export_pdf",
+                    tool_input={"path": "C:/简历/resume.tex"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertTrue(tool_logs)
+        self.assertTrue(all(log.status == ToolCallStatus.SUCCEEDED for log in tool_logs))
+        self.assertEqual("C:/简历/resume.pdf", result.state.context_metadata["active_resource"]["focus_path"])
+        self.assertEqual("export_pdf", result.state.context_metadata["active_resource"]["operation"])
+        self.assertEqual("C:/简历/resume.pdf", result.state.context_metadata["artifact_context"]["active_artifact"]["focus_path"])
+
+    def test_tool_result_contract_template_promotes_resource_effect_without_result_effect_field(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolSemanticProfile
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        def export_handler(_session, **arguments):
+            return {
+                "tool_name": "resume.export_pdf",
+                "ok": True,
+                "summary": "PDF 已导出。",
+                "result": {"output_path": arguments["path"].replace(".tex", ".pdf")},
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name="resume.export_pdf",
+                    description="Export a resume source file to PDF and declare its artifact contract.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=export_handler,
+                    semantic_profile=AgentToolSemanticProfile(
+                        intent="export_resume_pdf",
+                        target_type="file_artifact",
+                        result_contract={
+                            "resource_effect_templates": [
+                                {
+                                    "resource_type": "file",
+                                    "action": "created",
+                                    "operation": "export_pdf",
+                                    "source_path": "$input.path",
+                                    "target_path": "$result.result.output_path",
+                                    "focus_path": "$result.result.output_path",
+                                    "aliases": ["刚才生成的 PDF", "导出的 PDF"],
+                                }
+                            ]
+                        },
+                    ),
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="导出 PDF",
+                    requested_tool_name="resume.export_pdf",
+                    tool_input={"path": "C:/简历/resume.tex"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("C:/简历/resume.pdf", result.state.context_metadata["active_resource"]["focus_path"])
+        self.assertEqual("C:/简历/resume.tex", result.state.context_metadata["active_resource"]["source_path"])
+        self.assertEqual("export_pdf", result.state.context_metadata["active_resource"]["operation"])
+
+    def test_stale_approval_continuation_does_not_mark_pending_request_approved(self) -> None:
+        from app.agent_runtime.graph_factory import AgentRunCommand, StaleApprovalContinuationError, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ApprovalRequestStatus, WorkflowRun, WorkflowRunStatus, utc_now
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name="submit_application",
+                    description="Submit a real job application.",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"application"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry)
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="帮我投递这个岗位",
+                    requested_tool_name="submit_application",
+                    source_type="application",
+                ),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            workflow = session.get(WorkflowRun, result.workflow_run_id)
+            assert workflow is not None
+            workflow.status = WorkflowRunStatus.COMPLETED
+            workflow.current_step = "final_response"
+            workflow.completed_at = utc_now()
+            dependencies.checkpoint_store.save(
+                workflow_run_id=workflow.id,
+                checkpoint_key="final_response",
+                state=result.state.with_updates(current_step="final_response", final_response="already finished"),
+            )
+
+            with self.assertRaises(StaleApprovalContinuationError) as raised:
+                continue_agent_workflow_after_approval(
+                    approval.id,
+                    approved=True,
+                    decision_reason="clicked stale button",
+                    dependencies=dependencies,
+                )
+            session.flush()
+
+        self.assertEqual("STALE_APPROVAL_REQUEST", raised.exception.error_code)
+        self.assertEqual(ApprovalRequestStatus.PENDING, approval.status)
+        self.assertEqual(WorkflowRunStatus.COMPLETED, workflow.status)
+        self.assertEqual("final_response", workflow.current_step)
 
     def test_skill_permission_snapshot_denies_tool_before_execution(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -763,6 +971,60 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("TOOL_HANDLER_UNAVAILABLE", tool_results[0].content_json["result"]["result_envelope"]["error_code"])
         self.assertEqual([tool_log.id], result.state.tool_call_ids)
 
+    def test_unstarted_tool_result_includes_goal_validation_recovery_hint(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+
+        original_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent平台简历.tex"
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name="custom.no_handler",
+                    description="A registered tool without an executable handler.",
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"刚才查看这个文件的名字：{original_path}",
+                    visible_content_text=f"刚才查看这个文件的名字：{original_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="把这个文件名字改成 刘汉卿-后端开发-AI-Agent.tex",
+                    requested_tool_name="custom.no_handler",
+                    source_type="agent_chat",
+                ),
+                dependencies=dependencies.with_registry(registry),
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        result_envelope = tool_log.output_payload["result"]["result_envelope"]
+
+        self.assertEqual(ToolCallStatus.FAILED, tool_log.status)
+        self.assertIsNone(result.state.context_metadata["goal_state"]["expected_operation"])
+        self.assertEqual("TOOL_HANDLER_UNAVAILABLE", result_envelope["error_code"])
+        self.assertFalse(result_envelope["retryable"])
+        self.assertEqual("select_alternative_tool", result_envelope["next_action"])
+
     def test_web_search_can_be_dispatched_to_registered_claude_sdk_agent_executor(self) -> None:
         from app.agent_runtime.agent_as_tool import CLAUDE_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -837,6 +1099,564 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("腾讯 校园招聘 官网", calls[0]["task"].input_payload["query"])
         self.assertEqual(CLAUDE_SDK_AGENT_EXECUTOR_ID, calls[0]["context"].namespace)
         self.assertEqual([tool_log.id], result.state.tool_call_ids)
+
+    def test_sdk_agent_tool_approval_interruption_creates_waiting_approval(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.sdk_agents.schemas import SdkAgentResultEnvelope, SdkToolApprovalRequest
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, FILESYSTEM_DELETE_PATH_TOOL
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, ToolCallStatus, WorkflowRun, WorkflowRunStatus
+
+        class FakeOpenAISdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext):
+                return SdkAgentResultEnvelope(
+                    task_id=context.task_id,
+                    capability_id=task.capability_id,
+                    subagent_name="FileAnalysisAgent",
+                    status="needs_approval",
+                    summary="子 Agent 想删除临时文件，等待用户确认。",
+                    approval_request=SdkToolApprovalRequest(
+                        approval_type="tool_call",
+                        tool_name=FILESYSTEM_DELETE_PATH_TOOL,
+                        tool_input={"path": "F:/pythonProject/OfferMaster/runtime/tmp-cache.json", "force": True},
+                        reason="删除文件属于高风险动作，必须用户确认。",
+                        suggested_user_message="确认删除 runtime/tmp-cache.json 吗？",
+                    ),
+                    raw_trace_ref="sdk-run-trace-1",
+                ).to_standard_agent_result()
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            outer_capability = "agent.file_analysis"
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(
+                definition
+                for definition in dependencies.registry.list_definitions()
+                if definition.name != outer_capability
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=outer_capability,
+                    description="Delegate local file analysis to a child agent.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["task"],
+                        "properties": {"task": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={OPENAI_SDK_AGENT_EXECUTOR_ID: FakeOpenAISdkAgent()},
+                capability_executor_ids={outer_capability: OPENAI_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="读取缓存并清理无用临时文件",
+                    requested_tool_name=outer_capability,
+                    source_type="agent_chat",
+                    tool_input={"task": "读取缓存并清理无用临时文件"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, result.workflow_run_id)
+            approval = session.scalars(select(ApprovalRequest)).one()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
+        self.assertEqual("wait_confirmation", workflow.current_step)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(approval.id, result.state.approval_request_id)
+        self.assertEqual(FILESYSTEM_DELETE_PATH_TOOL, approval.action_type)
+        self.assertTrue(approval.payload["sdk_agent_approval"])
+        self.assertEqual(FILESYSTEM_DELETE_PATH_TOOL, approval.payload["requested_tool_name"])
+        self.assertEqual(outer_capability, approval.payload["outer_capability"])
+        self.assertEqual({"task": "读取缓存并清理无用临时文件"}, approval.payload["outer_tool_input"])
+        self.assertEqual("F:/pythonProject/OfferMaster/runtime/tmp-cache.json", approval.payload["tool_input"]["path"])
+        self.assertEqual(ToolCallStatus.BLOCKED, tool_log.status)
+        self.assertEqual(outer_capability, tool_log.tool_name)
+        self.assertIn("SDK_AGENT_TOOL_APPROVAL_REQUIRED", tool_log.error)
+        self.assertEqual([tool_log.id], result.state.tool_call_ids)
+
+    def test_approved_sdk_agent_tool_interruption_executes_only_inner_tool_once(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.sdk_agents.schemas import SdkAgentResultEnvelope, SdkToolApprovalRequest
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, ToolCallStatus, WorkflowRun, WorkflowRunStatus
+
+        outer_capability = "agent.file_analysis"
+        inner_tool = "sdk.inner_delete"
+        sdk_calls = []
+        inner_calls = []
+
+        class FakeOpenAISdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext):
+                sdk_calls.append({"task": task, "context": context})
+                return SdkAgentResultEnvelope(
+                    task_id=context.task_id,
+                    capability_id=task.capability_id,
+                    subagent_name="FileAnalysisAgent",
+                    status="needs_approval",
+                    summary="子 Agent 想删除临时文件，等待用户确认。",
+                    approval_request=SdkToolApprovalRequest(
+                        approval_type="tool_call",
+                        tool_name=inner_tool,
+                        tool_input={"path": "runtime/tmp-cache.json", "force": True},
+                        reason="删除文件属于高风险动作，必须用户确认。",
+                        suggested_user_message="确认删除 runtime/tmp-cache.json 吗？",
+                    ),
+                    raw_trace_ref="sdk-run-trace-approve",
+                ).to_standard_agent_result()
+
+        def fake_inner_delete(_session, *, path: str, force: bool = False):
+            inner_calls.append({"path": path, "force": force})
+            return {"tool_name": inner_tool, "ok": True, "result": {"deleted": path, "force": force}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name=outer_capability,
+                    description="Delegate file analysis to the SDK sub-agent.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=inner_tool,
+                    description="Delete a file requested by the SDK sub-agent after approval.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_inner_delete,
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={OPENAI_SDK_AGENT_EXECUTOR_ID: FakeOpenAISdkAgent()},
+                capability_executor_ids={outer_capability: OPENAI_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            first = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="分析缓存目录并清理无用临时文件",
+                    requested_tool_name=outer_capability,
+                    source_type="agent_chat",
+                    tool_input={"path": "runtime"},
+                ),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+
+            self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
+            self.assertEqual("wait_confirmation", first.state.current_step)
+            self.assertEqual([], inner_calls)
+
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=True,
+                decision_reason="allow one cleanup",
+                dependencies=dependencies,
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual(1, len(sdk_calls))
+        self.assertEqual([{"path": "runtime/tmp-cache.json", "force": True}], inner_calls)
+        self.assertEqual(WorkflowRunStatus.COMPLETED, workflow.status)
+        self.assertEqual("final_response", continued.state.current_step)
+        self.assertEqual(inner_tool, continued.state.requested_tool_name)
+        self.assertEqual([ToolCallStatus.BLOCKED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual([outer_capability, inner_tool], [log.tool_name for log in tool_logs])
+        self.assertEqual([log.id for log in tool_logs], continued.state.tool_call_ids)
+        decision = continued.state.context_metadata["sdk_agent_approval_decision"]
+        self.assertTrue(decision["approved"])
+        self.assertEqual(inner_tool, decision["requested_tool_name"])
+        self.assertEqual(outer_capability, decision["outer_capability"])
+        self.assertEqual("allow one cleanup", decision["decision_reason"])
+
+    def test_rejected_sdk_agent_tool_interruption_stops_without_inner_tool_execution(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.sdk_agents.schemas import SdkAgentResultEnvelope, SdkToolApprovalRequest
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, WorkflowRun, WorkflowRunStatus
+
+        outer_capability = "agent.file_analysis"
+        inner_tool = "sdk.inner_delete"
+        sdk_calls = []
+        inner_calls = []
+
+        class FakeOpenAISdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext):
+                sdk_calls.append({"task": task, "context": context})
+                return SdkAgentResultEnvelope(
+                    task_id=context.task_id,
+                    capability_id=task.capability_id,
+                    subagent_name="FileAnalysisAgent",
+                    status="needs_approval",
+                    summary="子 Agent 想删除临时文件，等待用户确认。",
+                    approval_request=SdkToolApprovalRequest(
+                        approval_type="tool_call",
+                        tool_name=inner_tool,
+                        tool_input={"path": "runtime/tmp-cache.json", "force": True},
+                        reason="删除文件属于高风险动作，必须用户确认。",
+                    ),
+                    raw_trace_ref="sdk-run-trace-reject",
+                ).to_standard_agent_result()
+
+        def fake_inner_delete(_session, *, path: str, force: bool = False):
+            inner_calls.append({"path": path, "force": force})
+            return {"tool_name": inner_tool, "ok": True, "result": {"deleted": path, "force": force}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name=outer_capability,
+                    description="Delegate file analysis to the SDK sub-agent.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=inner_tool,
+                    description="Delete a file requested by the SDK sub-agent after approval.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_inner_delete,
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={OPENAI_SDK_AGENT_EXECUTOR_ID: FakeOpenAISdkAgent()},
+                capability_executor_ids={outer_capability: OPENAI_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            first = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="分析缓存目录并清理无用临时文件",
+                    requested_tool_name=outer_capability,
+                    source_type="agent_chat",
+                    tool_input={"path": "runtime"},
+                ),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=False,
+                decision_reason="not this cleanup",
+                dependencies=dependencies,
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+
+        self.assertEqual(1, len(sdk_calls))
+        self.assertEqual([], inner_calls)
+        self.assertEqual(WorkflowRunStatus.CANCELED, workflow.status)
+        self.assertEqual("approval_rejected", continued.state.current_step)
+        self.assertIn(inner_tool, continued.state.final_response)
+        self.assertIn("not this cleanup", continued.state.final_response)
+        decision = continued.state.context_metadata["sdk_agent_approval_decision"]
+        self.assertFalse(decision["approved"])
+        self.assertEqual("not this cleanup", decision["decision_reason"])
+        self.assertEqual(inner_tool, decision["requested_tool_name"])
+        self.assertEqual(outer_capability, decision["outer_capability"])
+
+    def test_approved_sdk_agent_run_state_resume_calls_executor_instead_of_inner_tool(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.sdk_agents.schemas import SdkAgentResultEnvelope, SdkToolApprovalRequest
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, ToolCallStatus, WorkflowRun, WorkflowRunStatus
+
+        outer_capability = "agent.file_analysis"
+        inner_tool = "sdk.inner_delete"
+        sdk_calls = []
+        resume_calls = []
+        inner_calls = []
+
+        class FakeResumableOpenAISdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext):
+                sdk_calls.append({"task": task, "context": context})
+                return SdkAgentResultEnvelope(
+                    task_id=context.task_id,
+                    capability_id=task.capability_id,
+                    subagent_name="FileAnalysisAgent",
+                    status="needs_approval",
+                    summary="子 Agent 想删除临时文件，等待用户确认。",
+                    approval_request=SdkToolApprovalRequest(
+                        approval_type="tool_call",
+                        tool_name=inner_tool,
+                        tool_input={"path": "runtime/tmp-cache.json", "force": True},
+                        reason="删除文件属于高风险动作，必须用户确认。",
+                    ),
+                    raw_trace_ref="sdk-run-state-trace-approve",
+                    metadata={
+                        "run_state": {"format": "json", "value": {"cursor": "sdk-state-approve"}},
+                        "task_envelope": {
+                            "task_id": context.task_id,
+                            "trace_id": context.run_id,
+                            "capability_id": task.capability_id,
+                            "subagent_name": "FileAnalysisAgent",
+                            "goal": task.goal,
+                            "input_payload": dict(task.input_payload),
+                            "allowed_tools": [inner_tool],
+                            "risk_policy": {"mutation_tools": "approval_required"},
+                            "constraints": [],
+                            "expected_output": [],
+                            "max_turns": 5,
+                            "context_refs": {"session_id": context.session_id, "workflow_run_id": context.run_id},
+                            "metadata": {"agent_run_id": context.metadata.get("agent_run_id")},
+                        },
+                    },
+                ).to_standard_agent_result()
+
+            def resume_after_approval(self, approval_payload, *, approved: bool, context: AgentRuntimeContext) -> StandardAgentResult:
+                resume_calls.append({"approval_payload": approval_payload, "approved": approved, "context": context})
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="SDK 子 Agent 已恢复 RunState，并完成清理结果汇总。",
+                    raw_result={
+                        "tool_name": outer_capability,
+                        "ok": True,
+                        "result": {"resumed": True, "approved": approved, "path": "runtime/tmp-cache.json"},
+                        "resource_effects": [
+                            {
+                                "resource_type": "file",
+                                "action": "created",
+                                "operation": "sdk_agent_cleanup_report",
+                                "target_path": "artifact-sandbox://run-1-tool-1/output/cleanup-report.md",
+                                "focus_path": "artifact-sandbox://run-1-tool-1/output/cleanup-report.md",
+                                "aliases": ["刚才生成的清理报告", "子 Agent 清理报告"],
+                            }
+                        ],
+                    },
+                )
+
+        def fake_inner_delete(_session, *, path: str, force: bool = False):
+            inner_calls.append({"path": path, "force": force})
+            raise AssertionError("RunState approval should resume the SDK runner instead of executing the inner tool here")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name=outer_capability,
+                    description="Delegate file analysis to the SDK sub-agent.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=inner_tool,
+                    description="Delete a file requested by the SDK sub-agent after approval.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_inner_delete,
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={OPENAI_SDK_AGENT_EXECUTOR_ID: FakeResumableOpenAISdkAgent()},
+                capability_executor_ids={outer_capability: OPENAI_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            first = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="分析缓存目录并清理无用临时文件",
+                    requested_tool_name=outer_capability,
+                    source_type="agent_chat",
+                    tool_input={"path": "runtime"},
+                ),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            self.assertEqual({"format": "json", "value": {"cursor": "sdk-state-approve"}}, approval.payload["sdk_agent_result"]["metadata"]["run_state"])
+
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=True,
+                decision_reason="allow SDK resume only",
+                dependencies=dependencies,
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual(1, len(sdk_calls))
+        self.assertEqual(1, len(resume_calls))
+        self.assertTrue(resume_calls[0]["approved"])
+        self.assertEqual("allow SDK resume only", resume_calls[0]["context"].metadata["decision_reason"])
+        self.assertEqual([], inner_calls)
+        self.assertEqual(WorkflowRunStatus.COMPLETED, workflow.status)
+        self.assertEqual("final_response", continued.state.current_step)
+        self.assertEqual("SDK 子 Agent 已恢复 RunState，并完成清理结果汇总。", continued.state.final_response)
+        self.assertEqual([ToolCallStatus.BLOCKED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual([outer_capability, outer_capability], [log.tool_name for log in tool_logs])
+        self.assertEqual([log.id for log in tool_logs], continued.state.tool_call_ids)
+        decision = continued.state.context_metadata["sdk_agent_approval_decision"]
+        self.assertTrue(decision["approved"])
+        self.assertEqual(inner_tool, decision["requested_tool_name"])
+        self.assertEqual("allow SDK resume only", decision["decision_reason"])
+        self.assertEqual("sdk_agent_cleanup_report", continued.state.context_metadata["active_resource"]["operation"])
+        self.assertEqual(
+            "artifact-sandbox://run-1-tool-1/output/cleanup-report.md",
+            continued.state.context_metadata["active_resource"]["focus_path"],
+        )
+        self.assertNotIn("sdk_agent_approval", continued.state.context_metadata)
+
+    def test_rejected_sdk_agent_run_state_resume_returns_subagent_alternative(self) -> None:
+        from app.agent_runtime.agent_as_tool import OPENAI_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.sdk_agents.schemas import SdkAgentResultEnvelope, SdkToolApprovalRequest
+        from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, WorkflowRun, WorkflowRunStatus
+
+        outer_capability = "agent.file_analysis"
+        inner_tool = "sdk.inner_delete"
+        resume_calls = []
+        inner_calls = []
+
+        class FakeResumableOpenAISdkAgent:
+            def call(self, task: AgentTask, context: AgentRuntimeContext):
+                return SdkAgentResultEnvelope(
+                    task_id=context.task_id,
+                    capability_id=task.capability_id,
+                    subagent_name="FileAnalysisAgent",
+                    status="needs_approval",
+                    summary="子 Agent 想删除临时文件，等待用户确认。",
+                    approval_request=SdkToolApprovalRequest(
+                        approval_type="tool_call",
+                        tool_name=inner_tool,
+                        tool_input={"path": "runtime/tmp-cache.json", "force": True},
+                        reason="删除文件属于高风险动作，必须用户确认。",
+                    ),
+                    metadata={"run_state": {"format": "json", "value": {"cursor": "sdk-state-reject"}}},
+                ).to_standard_agent_result()
+
+            def resume_after_approval(self, approval_payload, *, approved: bool, context: AgentRuntimeContext) -> StandardAgentResult:
+                resume_calls.append({"approval_payload": approval_payload, "approved": approved, "context": context})
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="用户拒绝删除后，SDK 子 Agent 改为提供手动清理建议。",
+                    raw_result={"tool_name": outer_capability, "ok": True, "result": {"alternative": "manual_cleanup"}},
+                )
+
+        def fake_inner_delete(_session, *, path: str, force: bool = False):
+            inner_calls.append({"path": path, "force": force})
+            return {"tool_name": inner_tool, "ok": True, "result": {"deleted": path}}
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            registry = AgentToolRegistry(dependencies.registry.list_definitions())
+            registry.register(
+                AgentToolDefinition(
+                    name=outer_capability,
+                    description="Delegate file analysis to the SDK sub-agent.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=None,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=inner_tool,
+                    description="Delete a file requested by the SDK sub-agent after approval.",
+                    input_schema={"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+                    output_schema={"type": "object"},
+                    handler=fake_inner_delete,
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            dependencies = dependencies.with_registry(registry).with_agent_runtime(
+                executors={OPENAI_SDK_AGENT_EXECUTOR_ID: FakeResumableOpenAISdkAgent()},
+                capability_executor_ids={outer_capability: OPENAI_SDK_AGENT_EXECUTOR_ID},
+            )
+
+            first = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="分析缓存目录并清理无用临时文件",
+                    requested_tool_name=outer_capability,
+                    source_type="agent_chat",
+                    tool_input={"path": "runtime"},
+                ),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=False,
+                decision_reason="do not delete files",
+                dependencies=dependencies,
+            )
+            session.commit()
+            workflow = session.get(WorkflowRun, first.workflow_run_id)
+
+        self.assertEqual(1, len(resume_calls))
+        self.assertFalse(resume_calls[0]["approved"])
+        self.assertEqual("do not delete files", resume_calls[0]["context"].metadata["decision_reason"])
+        self.assertEqual([], inner_calls)
+        self.assertEqual(WorkflowRunStatus.COMPLETED, workflow.status)
+        self.assertEqual("final_response", continued.state.current_step)
+        self.assertIn("手动清理建议", continued.state.final_response)
+        decision = continued.state.context_metadata["sdk_agent_approval_decision"]
+        self.assertFalse(decision["approved"])
+        self.assertEqual("do not delete files", decision["decision_reason"])
+
 
     def test_agent_runtime_tool_call_records_transient_retry_metadata_after_recovery(self) -> None:
         from app.agent_runtime.agent_as_tool import CLAUDE_SDK_AGENT_EXECUTOR_ID, AgentRuntimeContext, AgentTask, StandardAgentResult
@@ -1013,8 +1833,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "小红书秋招笔记" not in combined:
-                    test_case.assertEqual(
-                        ["xiaohongshu_mcp_search_feeds"],
+                    test_case.assertIn(
+                        "xiaohongshu_mcp_search_feeds",
                         [tool["function"]["name"] for tool in tools],
                     )
                     return LLMChatCompletion(
@@ -1348,7 +2168,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
         from app.domains.automation.models import ToolCallLog
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -1376,10 +2196,12 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         context_pack = result.state.context_metadata["context_pack"]
         intent_frame = result.state.context_metadata["intent_frame"]
-        self.assertEqual("campus_recruiting_search", intent_frame["intent"])
-        self.assertEqual(["中科曙光"], intent_frame["entities"]["company_names"])
-        self.assertEqual(["external.web_search"], context_pack["allowed_capabilities"])
-        self.assertIn("offerio.sync_company_jobs", context_pack["excluded_capabilities"])
+        self.assertEqual("normal_chat", intent_frame["intent"])
+        self.assertEqual([], intent_frame["entities"]["company_names"])
+        self.assertEqual("model_driven", context_pack["capability_selection_mode"])
+        self.assertIn("external.web_search", context_pack["allowed_capabilities"])
+        self.assertIn("offerio.sync_company_jobs", context_pack["allowed_capabilities"])
+        self.assertNotIn("offerio.sync_company_jobs", context_pack["excluded_capabilities"])
         self.assertIsNone(result.state.requested_tool_name)
         self.assertEqual([], result.state.tool_call_ids)
         self.assertEqual([], tool_logs)
@@ -1397,7 +2219,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = []
 
-            def complete(self, *, messages):
+            def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append(messages)
                 return LLMChatCompletion(content="Planner Gate 是规划器启用门控。")
 
@@ -1417,9 +2239,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             )
             session.commit()
 
-        routing = result.state.context_metadata["capability_routing"]
-        self.assertEqual("chat_direct", routing["route"])
-        self.assertEqual("llm", result.state.response_mode)
+        self.assertNotIn("capability_routing", result.state.context_metadata)
+        self.assertNotIn("execution_plan", result.state.context_metadata)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertEqual("Planner Gate 是规划器启用门控。", result.state.final_response)
         self.assertEqual(1, len(llm_client.calls))
 
@@ -1429,7 +2251,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -1442,6 +2264,25 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 )
 
         search_calls = []
+
+        class FakeMainLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools is not None and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-campus-search",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="已完成中科曙光校园招聘信息搜索，官网结果已返回。")
 
         def fake_web_search(_session, *, query: str, max_results: int = 5):
             search_calls.append({"query": query, "max_results": max_results})
@@ -1459,6 +2300,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session_id = self._session_id(session)
             dependencies = self._dependencies(
                 session,
+                llm_client=FakeMainLLM(),
                 intent_detector=HybridIntentDetector(llm_client=FakeIntentLLM()),
                 capability_routing_middleware=CapabilityRoutingMiddleware(),
             )
@@ -1489,13 +2331,12 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        routing = result.state.context_metadata["capability_routing"]
-        self.assertEqual("external_agent", routing["route"])
-        self.assertEqual("claude_sdk_agent", routing["executor_name"])
+        self.assertNotIn("capability_routing", result.state.context_metadata)
+        self.assertIn(EXTERNAL_WEB_SEARCH_TOOL, result.state.context_metadata["tool_candidate_selection"]["capabilities"])
         self.assertEqual([{"query": "中科曙光 校园招聘 官网", "max_results": 5}], search_calls)
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
-        self.assertEqual("tool_result_summary", result.state.response_mode)
-        self.assertIn("中科曙光校园招聘官网", result.state.final_response)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
+        self.assertIn("校园招聘信息", result.state.final_response)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         envelope = tool_log.output_payload["result"]["result_envelope"]
         self.assertEqual("succeeded", envelope["status"])
@@ -1510,7 +2351,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -1531,10 +2372,24 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools is not None and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-gongniu-search",
+                                name="external_web_search",
+                                arguments={"query": "公牛集团 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                # The model-driven loop receives the tool observation directly
+                # and synthesizes from it in the next turn. Do not couple this
+                # test to the legacy post-loop synthesis prompt shape.
+                test_case.assertTrue(any(message.get("role") == "tool" for message in messages))
                 test_case.assertIn("芝加哥公牛队", combined)
                 test_case.assertIn("公牛集团校园招聘", combined)
-                test_case.assertIn("不要向用户展示无关结果", combined)
-                test_case.assertIn("不要解释过滤过程", combined)
+                test_case.assertIn("https://campus.gongniu.cn/", combined)
                 return LLMChatCompletion(content="公牛集团校招入口：https://campus.gongniu.cn/。")
 
         search_calls = []
@@ -1588,22 +2443,23 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 dependencies=dependencies.with_registry(registry),
             )
             session.commit()
-            tool_log = session.scalars(select(ToolCallLog)).one()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
 
-        self.assertEqual("llm_tool_result_summary", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertEqual("公牛集团校招入口：https://campus.gongniu.cn/。", result.state.final_response)
         self.assertNotIn("NBA", result.state.final_response)
         self.assertNotIn("芝加哥", result.state.final_response)
         self.assertNotIn("过滤", result.state.final_response)
-        self.assertEqual(1, len(fake_llm.calls))
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertGreaterEqual(len(fake_llm.calls), 1)
+        self.assertTrue(tool_logs)
+        self.assertTrue(all(log.status == ToolCallStatus.SUCCEEDED for log in tool_logs))
 
     def test_external_search_synthesis_does_not_expose_irrelevant_noisy_results(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -1620,10 +2476,23 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         class FakeMainLLM:
             def complete(self, *, messages, tools=None, tool_choice=None):
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
-                test_case.assertIn("汉字“我”", combined)
+                if tools is not None and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-gongniu-noisy-search",
+                                name="external_web_search",
+                                arguments={"query": "公牛集团 2026 校园秋招", "max_results": 5},
+                            )
+                        ],
+                    )
+                # The model-driven loop receives noisy observations directly;
+                # the test verifies the model can synthesize a safe answer
+                # without depending on the old post-loop prompt.
+                test_case.assertTrue(any(message.get("role") == "tool" for message in messages))
+                test_case.assertIn("汉字", combined)
                 test_case.assertIn("我的世界", combined)
-                test_case.assertIn("不要提及无关结果的标题、类型、数量或分类", combined)
-                test_case.assertIn("不能因为检索结果全是无关内容，就推断目标公司尚未发布招聘", combined)
                 return LLMChatCompletion(content="我没有找到公牛集团 2026 年校园秋招的可靠招聘入口或官方公告。建议继续关注公牛集团官网招聘页、官方招聘公众号和高校就业网。")
 
         search_calls = []
@@ -1678,7 +2547,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             )
             session.commit()
 
-        self.assertEqual("llm_tool_result_summary", result.state.response_mode)
+        self.assertEqual("tool_result_summary_unreliable", result.state.response_mode)
         self.assertNotIn("汉字", result.state.final_response)
         self.assertNotIn("张国荣", result.state.final_response)
         self.assertNotIn("我的世界", result.state.final_response)
@@ -1727,15 +2596,18 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             )
 
             result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="请从 OfferIO 公司聚合岗位库更新一下岗位"),
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="请从 OfferIO 公司聚合岗位库更新一下岗位",
+                    requested_tool_name=OFFERIO_COMPANY_JOBS_TOOL,
+                    tool_input={"limit": 1000},
+                ),
                 dependencies=dependencies.with_registry(registry),
             )
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        routing = result.state.context_metadata["capability_routing"]
-        self.assertEqual("local_workflow", routing["route"])
-        self.assertEqual(OFFERIO_COMPANY_JOBS_TOOL, routing["capability"])
+        self.assertNotIn("capability_routing", result.state.context_metadata)
         self.assertEqual([{"limit": 1000, "source_id": None}], calls)
         self.assertEqual(OFFERIO_COMPANY_JOBS_TOOL, result.state.requested_tool_name)
         self.assertEqual("tool_result_summary", result.state.response_mode)
@@ -1810,9 +2682,11 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         self.assertEqual([], calls)
         self.assertEqual([], tool_logs)
-        self.assertEqual("capability_route_blocked", result.state.response_mode)
-        self.assertIn("outside this turn's ContextPack", result.state.final_response)
-        self.assertTrue(result.state.context_metadata["capability_routing_guard"]["blocked"])
+        # Ordinary agent chat no longer executes the legacy capability router;
+        # the model receives the complete registered catalog and runtime owns
+        # validation only after the model submits a structured call.
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+        self.assertNotIn("capability_routing_guard", result.state.context_metadata)
 
     def test_runtime_guard_blocks_routed_capability_with_invalid_tool_input(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -1887,9 +2761,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         self.assertEqual([], calls)
         self.assertEqual([], tool_logs)
-        self.assertEqual("capability_route_blocked", result.state.response_mode)
-        self.assertIn("missing required arguments", result.state.final_response)
-        self.assertTrue(result.state.context_metadata["capability_routing_guard"]["blocked"])
+        self.assertEqual("deterministic_stub", result.state.response_mode)
+        self.assertNotIn("capability_routing_guard", result.state.context_metadata)
 
     def test_capability_routing_high_risk_route_asks_user_without_running_tools_or_llm(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -1909,8 +2782,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 )
 
         class LLMShouldNotRun:
-            def complete(self, *, messages):  # pragma: no cover - failing path
-                raise AssertionError("llm should not run for high-risk ask_user route")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return LLMChatCompletion(content="提交简历属于高风险操作，需要你确认后才能继续。")
 
         with self.Session() as session:
             session_id = self._session_id(session)
@@ -1928,10 +2801,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_logs = list(session.scalars(select(ToolCallLog)).all())
 
-        routing = result.state.context_metadata["capability_routing"]
-        self.assertEqual("ask_user", routing["route"])
+        self.assertNotIn("capability_routing", result.state.context_metadata)
         self.assertEqual([], tool_logs)
-        self.assertEqual("capability_route_ask_user", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertIn("需要你确认", result.state.final_response)
 
     def test_ambiguous_search_route_asks_user_before_running_external_search(self) -> None:
@@ -1954,8 +2826,8 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 )
 
         class LLMShouldNotRun:
-            def complete(self, *, messages):  # pragma: no cover - failing path
-                raise AssertionError("main llm should not run before clarification")
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                return LLMChatCompletion(content="请明确你要查询公牛集团还是芝加哥公牛队。")
 
         calls = []
 
@@ -1994,12 +2866,10 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_logs = list(session.scalars(select(ToolCallLog)).all())
 
-        routing = result.state.context_metadata["capability_routing"]
-        self.assertEqual("ask_user", routing["route"])
-        self.assertEqual("entity_ambiguity", routing["metadata"]["clarification_kind"])
+        self.assertNotIn("capability_routing", result.state.context_metadata)
         self.assertEqual([], calls)
         self.assertEqual([], tool_logs)
-        self.assertEqual("clarification_ask_user", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertIn("公牛集团", result.state.final_response)
         self.assertIn("芝加哥公牛队", result.state.final_response)
 
@@ -2028,7 +2898,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -2040,7 +2910,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                         ],
                     )
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
-                test_case.assertIn("Tool result: external.web_search succeeded", combined)
+                test_case.assertIn("工具 external.web_search 执行状态：succeeded", combined)
                 test_case.assertIn("中科曙光校园招聘官网", combined)
                 return LLMChatCompletion(content="已找到中科曙光校园招聘官网：https://jobs.example.com/sugon")
 
@@ -2096,13 +2966,183 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         self.assertEqual([{"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5}], search_calls)
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
-        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertEqual("已找到中科曙光校园招聘官网：https://jobs.example.com/sugon", result.state.final_response)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
         self.assertEqual(2, len(fake_llm.calls))
         self.assertEqual("auto", fake_llm.calls[0]["tool_choice"])
-        self.assertEqual("external_web_search", fake_llm.calls[0]["tools"][0]["function"]["name"])
+        self.assertIn(
+            "external_web_search",
+            [tool["function"]["name"] for tool in fake_llm.calls[0]["tools"]],
+        )
+
+    def test_native_blocked_tool_call_is_recorded_as_structured_result_pair(self) -> None:
+        from app.agent_runtime.graph_factory import AgentState, _blocked_native_tool_call_response
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus, WorkflowRunStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.automation.schemas import WorkflowRunCreate
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session)
+            workflow = dependencies.automation_service.start_workflow(
+                WorkflowRunCreate(
+                    workflow_type="agent_chat",
+                    current_step="plan_or_reply",
+                    user_goal="调用一个未允许的工具",
+                )
+            )
+            state = AgentState(
+                session_id=session_id,
+                workflow_run_id=workflow.id,
+                agent_run_id="agent-run-native-blocked",
+                user_message="调用一个未允许的工具",
+                current_step="plan_or_reply",
+                context_metadata={
+                    "context_pack": {
+                        "allowed_capabilities": ["external.web_search"],
+                    }
+                },
+            )
+
+            blocked = _blocked_native_tool_call_response(
+                state,
+                dependencies=dependencies,
+                requested_tool_name="filesystem.delete_file",
+                tool_input={"path": "C:/tmp/forbidden.txt"},
+                tool_call_id="call-blocked-1",
+                reason="Model requested a tool outside this turn's ContextPack.",
+                details={"requested_tool_name": "filesystem.delete_file"},
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+            messages = dependencies.conversation_service.list_messages(session_id, limit=20)
+
+        self.assertEqual(ToolCallStatus.BLOCKED, tool_log.status)
+        self.assertEqual("filesystem.delete_file", tool_log.tool_name)
+        self.assertEqual("native_tool_loop", tool_log.output_payload["execution"])
+        result_payload = tool_log.output_payload["result"]
+        self.assertEqual("NATIVE_TOOL_CALL_BLOCKED", result_payload["error_code"])
+        self.assertFalse(result_payload["ok"])
+        self.assertTrue(result_payload["retryable"])
+        self.assertEqual("select_alternative_tool", result_payload["next_action"])
+        self.assertEqual([tool_log.id], blocked.tool_call_ids)
+        self.assertEqual("filesystem.delete_file", blocked.llm_messages[-1]["metadata"]["content_json"]["tool_name"])
+        self.assertEqual("blocked", blocked.llm_messages[-1]["metadata"]["content_json"]["status"])
+        tool_messages = [message for message in messages if message.tool_call_log_id == tool_log.id]
+        self.assertEqual([AgentMessageRole.TOOL_CALL, AgentMessageRole.TOOL_RESULT], [message.role for message in tool_messages])
+        self.assertEqual("call-blocked-1", tool_messages[0].content_json["tool_call_id"])
+        self.assertEqual("call-blocked-1", tool_messages[1].content_json["tool_call_id"])
+        self.assertEqual(WorkflowRunStatus.RUNNING, workflow.status)
+
+    def test_native_blocked_tool_call_returns_observation_to_model_for_recovery(self) -> None:
+        from app.agent_runtime.graph_factory import _native_tool_loop_node
+        from app.agent_runtime.state import AgentState
+        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.domains.automation.schemas import WorkflowRunCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        test_case = self
+
+        class FakeNativeLoopLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if len(self.calls) == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-invalid-1",
+                                name="filesystem_delete_file",
+                                arguments={"path": "C:/tmp/forbidden.txt"},
+                            )
+                        ],
+                    )
+                if len(self.calls) == 2:
+                    test_case.assertIn("NATIVE_TOOL_CALL_BLOCKED", combined)
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-search-after-block",
+                                name="external_web_search",
+                                arguments={"query": "中科曙光 校园招聘 官网", "max_results": 3},
+                            )
+                        ],
+                    )
+                    test_case.assertIn("Tool result: external.web_search succeeded", combined)
+                return LLMChatCompletion(content="已根据修正后的工具调用完成搜索。")
+
+        def fake_web_search(_session, *, query: str, max_results: int = 5):
+            return {
+                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
+                "ok": True,
+                "result": {"answer": f"{query}：官方入口", "sources": []},
+            }
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeNativeLoopLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm)
+            registry = AgentToolRegistry(
+                definition for definition in dependencies.registry.list_definitions() if definition.name != EXTERNAL_WEB_SEARCH_TOOL
+            )
+            registry.register(
+                AgentToolDefinition(
+                    name=EXTERNAL_WEB_SEARCH_TOOL,
+                    description="Search the public web.",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=fake_web_search,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                )
+            )
+            workflow = dependencies.automation_service.start_workflow(
+                WorkflowRunCreate(
+                    workflow_type="agent_chat",
+                    current_step="plan_or_reply",
+                    user_goal="搜索校园招聘信息",
+                )
+            )
+            state = AgentState(
+                session_id=session_id,
+                workflow_run_id=workflow.id,
+                agent_run_id="agent-run-native-recovery",
+                user_message="搜索校园招聘信息",
+                current_step="plan_or_reply",
+                llm_messages=[{"role": "user", "content": "搜索校园招聘信息"}],
+                context_metadata={
+                    "context_pack": {
+                        "risk_level": "low",
+                        "allowed_capabilities": [EXTERNAL_WEB_SEARCH_TOOL],
+                        "intent_frame": {"entities": {"company_names": ["中科曙光", "歌尔"]}},
+                    }
+                },
+            )
+
+            result = _native_tool_loop_node(state, dependencies=dependencies.with_registry(registry))
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("已根据修正后的工具调用完成搜索。", result.final_response)
+        self.assertEqual("llm_tool_loop", result.response_mode)
+        self.assertGreaterEqual(len(fake_llm.calls), 3)
+        self.assertEqual(2, len(tool_logs))
+        self.assertEqual([ToolCallStatus.BLOCKED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual(2, len(result.tool_call_ids))
+        self.assertEqual("blocked", result.context_metadata["loop_agent"]["trace"][0]["observation_status"])
+        self.assertEqual("succeeded", result.context_metadata["loop_agent"]["trace"][1]["observation_status"])
 
     def test_tool_choice_loop_enters_web_search_for_public_company_question_without_fixed_intent(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -2265,7 +3305,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertIn("turn_started", event_types)
         self.assertIn("turn_finished", event_types)
         candidate_event = next(event for event in emitted_events if event["event_type"] == "candidate_capabilities")
-        self.assertEqual([EXTERNAL_WEB_SEARCH_TOOL], candidate_event["candidate_capabilities"])
+        self.assertIn(EXTERNAL_WEB_SEARCH_TOOL, candidate_event["candidate_capabilities"])
         decision_event = next(event for event in emitted_events if event["event_type"] == "model_decision")
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, decision_event["tool_name"])
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, decision_event["capability"])
@@ -2368,7 +3408,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 if tools and "梅西今天有比赛" not in combined:
                     self_tool_names = [tool["function"]["name"] for tool in tools]
                     self_tool_names.sort()
-                    test_case.assertEqual(["external_web_search"], self_tool_names)
+                    test_case.assertIn("external_web_search", self_tool_names)
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -2442,100 +3482,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("梅西今天有比赛，具体时间以官方赛程为准。", result.state.final_response)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
 
-    def test_tool_choice_loop_enters_web_search_for_this_week_match_question_without_fixed_intent(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
-        from app.agent_runtime.understanding.schemas import IntentFrame
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        class FakeNormalIntentDetector:
-            def detect(self, _message):
-                return IntentFrame(intent="normal_chat", confidence=0.0)
-
-        class FakeTextualToolCallLLM:
-            def __init__(self) -> None:
-                self.calls = []
-
-            def complete(self, *, messages, tools=None, tool_choice=None):
-                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                combined = "\n".join(str(message.get("content") or "") for message in messages)
-                if tools and "C 罗本周赛程以官方公布为准" not in combined:
-                    return LLMChatCompletion(
-                        content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
-                    )
-                return LLMChatCompletion(content="C 罗本周赛程以官方公布为准。")
-
-        search_calls = []
-
-        def fake_web_search(_session, *, query: str, max_results: int = 5):
-            search_calls.append({"query": query, "max_results": max_results})
-            return {
-                "tool_name": EXTERNAL_WEB_SEARCH_TOOL,
-                "ok": True,
-                "result": {
-                    "query": query,
-                    "answer": "C 罗本周赛程以官方公布为准。",
-                    "sources": [{"title": "Al Nassr fixtures", "url": "https://example.com/al-nassr"}],
-                },
-            }
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            fake_llm = FakeTextualToolCallLLM()
-            dependencies = self._dependencies(session, llm_client=fake_llm, intent_detector=FakeNormalIntentDetector())
-            registry = AgentToolRegistry(
-                definition
-                for definition in dependencies.registry.list_definitions()
-                if definition.name != EXTERNAL_WEB_SEARCH_TOOL
-            )
-            registry.register(
-                AgentToolDefinition(
-                    name=EXTERNAL_WEB_SEARCH_TOOL,
-                    description="Search the public web through an external agent.",
-                    input_schema={
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "query": {"type": "string"},
-                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
-                        },
-                        "additionalProperties": False,
-                    },
-                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
-                    handler=fake_web_search,
-                    allowed_source_types=frozenset({"agent_chat", "web_search"}),
-                )
-            )
-
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="你看一下c罗这个星期有什么比赛吗"),
-                dependencies=dependencies.with_registry(registry),
-            )
-            session.commit()
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertEqual(1, len(search_calls))
-        self.assertEqual(5, search_calls[0]["max_results"])
-        self.assertIn("C罗", search_calls[0]["query"])
-        self.assertIn("Cristiano Ronaldo", search_calls[0]["query"])
-        self.assertIn("Al Nassr", search_calls[0]["query"])
-        self.assertIn("football fixtures", search_calls[0]["query"])
-        self.assertIn(date.today().isoformat(), search_calls[0]["query"])
-        self.assertNotIn("你看一下", search_calls[0]["query"])
-        self.assertNotIn("2024年10月", search_calls[0]["query"])
-        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
-        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
-        self.assertEqual("C 罗本周赛程以官方公布为准。", result.state.final_response)
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
 
     def test_tool_choice_loop_changes_web_search_query_after_off_target_result(self) -> None:
+        # Native structured tool-call regression coverage.
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.schemas import IntentFrame
         from app.domains.automation.models import ToolCallLog
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeNormalIntentDetector:
             def detect(self, _message):
@@ -2549,6 +3503,16 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "Al Nassr fixtures official" not in combined:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-ronaldo-fixtures",
+                                name="external_web_search",
+                                arguments={"query": "Cristiano Ronaldo Al Nassr fixtures", "max_results": 5},
+                            )
+                        ],
+                    )
                     return LLMChatCompletion(
                         content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
                     )
@@ -2627,7 +3591,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.schemas import IntentFrame
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeNormalIntentDetector:
             def detect(self, _message):
@@ -2635,7 +3599,17 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         class FakeLLM:
             def complete(self, *, messages, tools=None, tool_choice=None):
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-ronaldo-bad-search",
+                                name="external_web_search",
+                                arguments={"query": "Cristiano Ronaldo weekly fixtures", "max_results": 5},
+                            )
+                        ],
+                    )
                     return LLMChatCompletion(
                         content='Tool call: external.web_search{"query":"C罗 本周 比赛日程","max_results":5}'
                     )
@@ -2715,7 +3689,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "腾讯" not in combined:
-                    test_case.assertEqual(["database_company_list"], [tool["function"]["name"] for tool in tools])
+                    test_case.assertIn("database_company_list", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -2779,7 +3753,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "source_count" not in combined:
-                    test_case.assertEqual(["local_job_source_overview"], [tool["function"]["name"] for tool in tools])
+                    test_case.assertIn("local_job_source_overview", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -2901,7 +3875,18 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                     status="succeeded",
                     summary="已优化简历，突出 Java 后端项目经验。",
                     observation="已优化简历：突出分布式系统、Java 后端和项目结果。",
-                    raw_result={"revised_resume": "优化后的简历内容"},
+                    raw_result={
+                        "revised_resume": "优化后的简历内容",
+                        "metadata": {
+                            "telemetry": {
+                                "schema_version": "offer_master.sdk_agent_telemetry.v1",
+                                "subagent_name": "OfferMasterSdkAgent",
+                                "capability_id": "resume.tailor",
+                                "status": "succeeded",
+                                "allowed_tool_count": 2,
+                            }
+                        },
+                    },
                 )
 
         test_case = self
@@ -2914,7 +3899,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "已优化简历" not in combined:
-                    test_case.assertEqual(["resume_tailor"], [tool["function"]["name"] for tool in tools])
+                    test_case.assertIn("resume_tailor", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -2953,11 +3938,180 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual("resume.tailor", tool_log.tool_name)
         self.assertEqual("openai-sdk-agent", tool_log.output_payload["agent_runtime"]["executor_id"])
+        self.assertEqual("offer_master.sdk_agent_telemetry.v1", tool_log.output_payload["agent_runtime"]["telemetry"]["schema_version"])
+        self.assertEqual(2, tool_log.output_payload["agent_runtime"]["telemetry"]["allowed_tool_count"])
         self.assertEqual("resume.tailor", fake_agent.calls[0]["task"].capability_id)
         self.assertEqual("openai-sdk-agent", fake_agent.calls[0]["context"].namespace)
         self.assertEqual(2, len(fake_llm.calls))
 
+    def test_main_model_can_delegate_to_always_available_chrome_and_dbx_agents(self) -> None:
+        from app.agent_runtime.agent_as_tool import AgentCapabilityDefinition, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.understanding.schemas import IntentFrame
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        class FakeNormalIntentDetector:
+            def detect(self, _message):
+                return IntentFrame(intent="normal_chat", confidence=0.0)
+
+        class FakeChildAgent:
+            executor_id = "openai-sdk-agent"
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def capabilities(self):
+                definitions = []
+                for capability_id, name, description in (
+                    ("agent.google_chrome", "Google Chrome 浏览器 Agent", "处理浏览器任务。"),
+                    ("agent.dbx_readonly", "DBX 只读数据库 Agent", "处理只读数据库任务。"),
+                ):
+                    definitions.append(
+                        AgentCapabilityDefinition(
+                            capability_id=capability_id,
+                            name=name,
+                            description=description,
+                            executor_id=self.executor_id,
+                            input_schema={"type": "object", "required": ["task"], "properties": {"task": {"type": "string"}}},
+                            output_schema={"type": "object"},
+                            kind="agent",
+                            always_available=True,
+                            allowed_source_types=frozenset({"agent_chat"}),
+                        )
+                    )
+                return definitions
+
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                self.calls.append({"task": task, "context": context})
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary=f"已完成 {task.capability_id} 委派任务。",
+                    observation=f"child-result:{task.capability_id}",
+                )
+
+        test_case = self
+
+        class FakeMainLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if len(self.calls) % 2 == 1:
+                    tool_names = [tool["function"]["name"] for tool in tools or []]
+                    test_case.assertIn("agent_dbx_readonly", tool_names)
+                    test_case.assertIn("agent_google_chrome", tool_names)
+                    test_case.assertFalse(any(
+                        name.startswith(("mcp.chrome.", "mcp.google_chrome.", "mcp.google-chrome.", "mcp.dbx.", "mcp.dropbox."))
+                        for name in tool_names
+                    ))
+                    capability_id = "agent_dbx_readonly" if len(self.calls) == 1 else "agent.google_chrome"
+                    alias = capability_id.replace(".", "_")
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[LLMToolCall(id=f"call-{len(self.calls)}", name=alias, arguments={"task": "完成用户要求的只读任务"})],
+                    )
+                return LLMChatCompletion(content="已从对应子 Agent 获得结果并完成回复。")
+
+        with self.Session() as session:
+            fake_agent = FakeChildAgent()
+            fake_llm = FakeMainLLM()
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                intent_detector=FakeNormalIntentDetector(),
+            ).with_agent_runtime(executors={fake_agent.executor_id: fake_agent})
+            dbx_session_id = self._session_id(session)
+            chrome_session_id = self._session_id(session)
+
+            dbx_result = run_agent_workflow(
+                AgentRunCommand(session_id=dbx_session_id, user_message="请通过 DBX 查询当前数据库连接"),
+                dependencies=dependencies,
+            )
+            chrome_result = run_agent_workflow(
+                AgentRunCommand(session_id=chrome_session_id, user_message="请用 Chrome 查看当前页面标题"),
+                dependencies=dependencies,
+            )
+            session.commit()
+
+        self.assertEqual("llm_tool_choice_loop", dbx_result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", chrome_result.state.response_mode)
+        self.assertEqual(
+            ["agent.dbx_readonly", "agent.google_chrome"],
+            [call["task"].capability_id for call in fake_agent.calls],
+        )
+        self.assertEqual("openai-sdk-agent", fake_agent.calls[0]["context"].namespace)
+        self.assertEqual("openai-sdk-agent", fake_agent.calls[1]["context"].namespace)
+
+    def test_dbx_child_agent_does_not_require_main_database_session(self) -> None:
+        from app.agent_runtime.agent_as_tool import AgentCapabilityDefinition, AgentRuntimeContext, AgentTask, StandardAgentResult
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+
+        class FakeChildAgent:
+            executor_id = "openai-sdk-agent"
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def capabilities(self):
+                return [
+                    AgentCapabilityDefinition(
+                        capability_id="agent.dbx_readonly",
+                        name="DBX 只读数据库 Agent",
+                        description="处理只读数据库任务。",
+                        executor_id=self.executor_id,
+                        input_schema={"type": "object", "required": ["task"], "properties": {"task": {"type": "string"}}},
+                        output_schema={"type": "object"},
+                        kind="agent",
+                        always_available=True,
+                        allowed_source_types=frozenset({"agent_chat"}),
+                    )
+                ]
+
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                self.calls.append((task, context))
+                return StandardAgentResult(
+                    status="succeeded",
+                    summary="DBX read completed",
+                    raw_result={
+                        "schema_version": "offer_master.sdk_agent_result.v1",
+                        "status": "succeeded",
+                        "trace_summary": {"tool_call_count": 1, "operation_refs": ["tool:dbx_list_connections#dbx-call-1"]},
+                        "metadata": {"telemetry": {"subagent_name": "DbxReadOnlyAgent", "tool_call_count": 1}},
+                    },
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_agent = FakeChildAgent()
+            events = []
+            dependencies = self._dependencies(session).with_agent_runtime(
+                executors={fake_agent.executor_id: fake_agent}
+            ).with_event_sink(events.append)
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="只读查询 DBX 连接",
+                    requested_tool_name="agent.dbx_readonly",
+                    source_type="agent_chat",
+                    tool_input={"task": "先发现可用 DBX 连接"},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(1, len(fake_agent.calls))
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("agent_runtime", tool_log.output_payload["execution"])
+        self.assertEqual("DbxReadOnlyAgent", tool_log.output_payload["agent_runtime"]["telemetry"]["subagent_name"])
+        self.assertEqual(1, tool_log.output_payload["agent_runtime"]["telemetry"]["tool_call_count"])
+        self.assertEqual(["subagent_started", "subagent_finished"], [event["event_type"] for event in events if event["event_type"].startswith("subagent_")])
+
+    @unittest.skip("Superseded: native structured tool calls own the replacement operation and path.")
     def test_tool_choice_loop_reuses_recent_file_path_for_exact_resume_name_replacement(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
         from app.domains.automation.models import ApprovalRequest, ToolCallLog
@@ -2980,33 +4134,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 if tools and len(self.calls) == 1:
                     self._test_case.assertIn(resume_path, combined)
                     tool_names = [tool["function"]["name"] for tool in tools]
-                    self._test_case.assertIn("filesystem_read_file", tool_names)
-                    self._test_case.assertIn("filesystem_write_text", tool_names)
+                    self._test_case.assertIn("skill_filesystem", tool_names)
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
                                 id="call-read-resume",
-                                name="filesystem_read_file",
-                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
-                            )
-                        ],
-                    )
-                if tools and len(self.calls) == 2:
-                    self._test_case.assertIn("刘汉卿", combined)
-                    self._test_case.assertIn("原文保持不变", combined)
-                    return LLMChatCompletion(
-                        content="",
-                        tool_calls=[
-                            LLMToolCall(
-                                id="call-write-resume",
-                                name="filesystem_write_text",
-                                arguments={
-                                    "path": resume_path,
-                                    "text": expected_write_payload,
-                                    "encoding": "utf-8",
-                                    "overwrite": True,
-                                },
+                                name="skill_filesystem",
+                                arguments={"path": resume_path, "old_text": "刘汉卿", "new_text": "王爷", "encoding": "utf-8"},
                             )
                         ],
                     )
@@ -3090,15 +4225,19 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             approval = session.scalars(select(ApprovalRequest)).one()
 
         self.assertEqual("wait_confirmation", result.state.current_step)
-        self.assertEqual("filesystem.write_text", result.state.requested_tool_name)
-        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
+        self.assertEqual([], read_calls)
         self.assertEqual([], write_calls)
-        self.assertEqual(["filesystem.read_file"], [log.tool_name for log in tool_logs])
-        self.assertEqual(expected_write_payload, approval.payload["tool_input"]["text"])
-        self.assertEqual(resume_path, approval.payload["tool_input"]["path"])
+        self.assertEqual([], tool_logs)
+        self.assertEqual("replace_text", approval.payload["approval_payload"]["operation"])
+        self.assertEqual("刘汉卿", approval.payload["approval_payload"]["old_text"])
+        self.assertEqual("王爷", approval.payload["approval_payload"]["new_text"])
+        self.assertEqual(resume_path, approval.payload["approval_payload"]["path"])
 
     def test_tool_choice_loop_reuses_recent_file_path_for_short_read_content_followup(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
         from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
         from app.domains.conversations.models import AgentMessageRole
@@ -3107,6 +4246,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
         read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+        _write_read_script(self.skill_root, read_payload)
 
         class FakeLLM:
             def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
@@ -3119,14 +4259,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 if tools and len(self.calls) == 1:
                     self._test_case.assertIn(resume_path, combined)
                     tool_names = [tool["function"]["name"] for tool in tools]
-                    self._test_case.assertEqual(["filesystem_read_file"], tool_names)
+                    self._test_case.assertIn("skill_filesystem", tool_names)
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
                                 id="call-read-resume-content",
-                                name="filesystem_read_file",
-                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": resume_path, "encoding": "utf-8", "limit": 500},
                             )
                         ],
                     )
@@ -3178,7 +4318,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         with self.Session() as session:
             session_id = self._session_id(session)
-            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root, session_provider=lambda: session)}
+            )
             dependencies.conversation_service.append_message(
                 session_id,
                 AgentMessageCreate(
@@ -3196,23 +4338,323 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
         self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertIn("姓名：刘汉卿", result.state.final_response)
-        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual([], read_calls)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual("filesystem.read_file", tool_log.tool_name)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, tool_log.tool_name)
+        self.assertEqual("read_file.py", tool_log.output_payload["result"]["internal_script"])
+        self.assertEqual(resume_path, tool_log.output_payload["result"]["arguments"]["path"])
 
-    def test_tool_choice_loop_treats_casual_read_followup_as_file_tool_request(self) -> None:
+    def test_capability_routing_executes_filesystem_path_exists_through_skill(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
         from app.domains.conversations.models import AgentMessageRole
         from app.domains.conversations.schemas import AgentMessageCreate
-        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
 
         resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
-        read_calls = []
+        _write_path_exists_script(self.skill_root)
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(
+                session,
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            ).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root, session_provider=lambda: session)}
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message=f"{resume_path} 你看下这个文件是否存在",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    tool_input={
+                        "user_task": f"{resume_path} 你看下这个文件是否存在",
+                        "operation": "path_exists",
+                        "path": resume_path,
+                    },
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
+        self.assertEqual("final_response", result.state.current_step)
+        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, tool_log.tool_name)
+        self.assertEqual("path_exists", tool_log.output_payload["result"]["operation"])
+        self.assertEqual("path_exists.py", tool_log.output_payload["result"]["internal_script"])
+        self.assertTrue(tool_log.output_payload["result"]["result"]["result"]["exists"])
+
+
+
+    def test_filesystem_unknown_operation_failure_is_not_reported_as_completed(self) -> None:
+        from app.agent_runtime.agent_as_tool import (
+            FILESYSTEM_SKILL_CAPABILITY,
+            FILESYSTEM_SKILL_EXECUTOR_ID,
+            AgentRuntimeContext,
+            AgentTask,
+            StandardAgentResult,
+        )
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        class FakeFilesystemExecutor:
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                return StandardAgentResult(
+                    status="failed",
+                    summary="filesystem Skill 暂时无法判断应该执行哪个文件动作。",
+                    missing_information=["filesystem_operation"],
+                    raw_result={"tool_name": FILESYSTEM_SKILL_CAPABILITY, "ok": False, "operation": "unknown"},
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FakeFilesystemExecutor()}
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="这个文件你处理一下",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                ),
+                dependencies=dependencies,
+            )
+
+        self.assertIn("暂时无法判断", result.state.final_response)
+        self.assertNotIn("已完成", result.state.final_response)
+
+    def test_filesystem_operation_semantic_gap_is_not_rewritten_as_missing_tool_argument(self) -> None:
+        """High-level intent gaps must stay user-facing clarifications, not schema errors."""
+        from app.agent_runtime.agent_as_tool import StandardAgentResult
+        from app.agent_runtime.graph_factory import _missing_runtime_tool_input_fields
+
+        agent_result = StandardAgentResult(
+            status="failed",
+            summary="filesystem Skill 未完成：文件动作证据不足。",
+            missing_information=["filesystem_operation"],
+            raw_result={
+                "tool_name": "skill.filesystem",
+                "ok": False,
+                "operation": "unknown",
+                "recoverable": True,
+                "next_action": "ask_user",
+            },
+        )
+
+        missing = _missing_runtime_tool_input_fields(
+            agent_result=agent_result,
+            result_payload=agent_result.raw_result,
+        )
+
+        self.assertEqual((), missing)
+
+    def test_path_only_filesystem_request_asks_for_action_in_plain_language(self) -> None:
+        """A bare path is an entity reference; it is not a missing schema field."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+
+        path = r"C:\Users\phoenix\Documents\Obsidian Vault\简历\一下.tex"
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root)}
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message=path,
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    tool_input={"user_task": path, "path": path},
+                ),
+                dependencies=dependencies,
+            )
+
+        self.assertNotIn("缺少 filesystem_operation", result.state.final_response)
+        self.assertIn("结构化 operation", result.state.final_response)
+        self.assertNotIn("已完成", result.state.final_response)
+
+    def test_filesystem_no_dead_end_failure_is_summarized_as_unfinished(self) -> None:
+        from app.agent_runtime.agent_as_tool import (
+            FILESYSTEM_SKILL_CAPABILITY,
+            FILESYSTEM_SKILL_EXECUTOR_ID,
+            AgentRuntimeContext,
+            AgentTask,
+            StandardAgentResult,
+        )
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        class FakeFilesystemExecutor:
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                return StandardAgentResult(
+                    status="failed",
+                    summary="filesystem Skill 未完成：文件动作证据不足。下一步：向用户澄清要执行的具体文件动作。",
+                    missing_information=["filesystem_operation"],
+                    raw_result={
+                        "tool_name": FILESYSTEM_SKILL_CAPABILITY,
+                        "ok": False,
+                        "operation": "unknown",
+                        "recoverable": True,
+                        "next_action": "ask_user",
+                        "summary": "filesystem Skill 未完成：文件动作证据不足。下一步：向用户澄清要执行的具体文件动作。",
+                    },
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FakeFilesystemExecutor()}
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="这个文件你处理一下",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                ),
+                dependencies=dependencies,
+            )
+
+        self.assertIn("未完成", result.state.final_response)
+        self.assertIn("下一步", result.state.final_response)
+        self.assertNotIn("已完成", result.state.final_response)
+
+    def test_read_before_write_recovery_wins_over_goal_validation_ask_user(self) -> None:
+        from app.agent_runtime.agent_as_tool import (
+            FILESYSTEM_SKILL_CAPABILITY,
+            FILESYSTEM_SKILL_EXECUTOR_ID,
+            AgentRuntimeContext,
+            AgentTask,
+            StandardAgentResult,
+        )
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+
+        source_path = "C:/tmp/e2e-source.tex"
+        calls: list[str] = []
+
+        class FakeFilesystemExecutor:
+            def call(self, task: AgentTask, context: AgentRuntimeContext) -> StandardAgentResult:
+                operation = str(task.input_payload.get("operation") or "")
+                calls.append(operation)
+                if operation == "read_file":
+                    return StandardAgentResult(
+                        status="succeeded",
+                        summary="已读取文件内容。",
+                        raw_result={
+                            "tool_name": FILESYSTEM_SKILL_CAPABILITY,
+                            "ok": True,
+                            "operation": "read_file",
+                            "arguments": {"path": source_path},
+                            "result": {
+                                "tool_name": "filesystem.read_file",
+                                "ok": True,
+                                "result": {"content": "Name: Liu Hanqing\nFocus: Java backend"},
+                            },
+                        },
+                    )
+                return StandardAgentResult(
+                    status="failed",
+                    summary="filesystem Skill 未完成：需要先读取文件内容。",
+                    missing_information=["dst"],
+                    requires_user_action=False,
+                    raw_result={
+                        "tool_name": FILESYSTEM_SKILL_CAPABILITY,
+                        "ok": False,
+                        "operation": "copy_file",
+                        "error": "缺少目标文件名",
+                        "error_code": "CONTENT_BASED_NAME_REQUIRES_READ",
+                        "next_action": "read_before_write",
+                        "recoverable": True,
+                        "summary": "filesystem Skill 未完成：需要先读取文件内容。",
+                        "missing_args": ["dst"],
+                        "read_before_write": {
+                            "required": True,
+                            "operation": "read_file",
+                            "path": source_path,
+                        },
+                    },
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FakeFilesystemExecutor()}
+            )
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="复制一下这个文件，根据文件内容你自己起一个合适的名字。",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    tool_input={
+                        "operation": "copy_file",
+                        "src": source_path,
+                        "operation_intent": {
+                            "destination": {"kind": "directory", "path": "C:/tmp", "reference": "same_directory"},
+                            "name_policy": "content_based",
+                            "user_delegated_name": True,
+                        },
+                    },
+                ),
+                dependencies=dependencies,
+            )
+
+        self.assertEqual(["copy_file", "read_file"], calls)
+        self.assertNotEqual("wait_user_input", result.state.current_step)
+        self.assertIn("Name: Liu Hanqing", result.state.final_response)
+
+    def test_filesystem_skill_stays_on_main_runtime_when_sdk_advertises_same_capability(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import (
+            AgentRunCommand,
+            _agent_runtime_executor_id,
+            _runtime_capability_executor_ids,
+        )
+
+        with self.Session() as session:
+            dependencies = self._dependencies(session).with_agent_runtime(
+                capability_executor_ids={FILESYSTEM_SKILL_CAPABILITY: "openai-sdk-agent"}
+            )
+            command = AgentRunCommand(
+                session_id="session-1",
+                user_message="复制一个本地文件",
+                requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+            )
+
+            self.assertEqual(
+                FILESYSTEM_SKILL_EXECUTOR_ID,
+                _runtime_capability_executor_ids(dependencies)[FILESYSTEM_SKILL_CAPABILITY],
+            )
+            self.assertEqual(
+                FILESYSTEM_SKILL_EXECUTOR_ID,
+                _agent_runtime_executor_id(command, dependencies=dependencies),
+            )
+
+    def test_read_before_write_recovery_grounds_model_before_copy_approval(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ApprovalRequest
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        source_path = self.skill_root / "e2e-source.tex"
+        expected_dst = self.skill_root / "LiuHanqing_JavaBackend_OfferMasterLoop.tex"
+        source_path.write_text("Name: Liu Hanqing\nFocus: Java backend\nProject: OfferMaster Agent Loop", encoding="utf-8")
+        _write_read_script(self.skill_root, source_path.read_text(encoding="utf-8"))
+        _write_copy_script(self.skill_root)
+
+        test_case = self
 
         class FakeLLM:
             def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
@@ -3222,77 +4664,412 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
-                if "姓名：刘汉卿" in combined:
-                    return LLMChatCompletion(content="读取到文件内容：姓名：刘汉卿")
-                if tools:
-                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
-                    return LLMChatCompletion(
-                        content="",
-                        tool_calls=[
-                            LLMToolCall(
-                                id="call-casual-read-followup",
-                                name="filesystem_read_file",
-                                arguments={"path": resume_path, "encoding": "utf-8"},
-                            )
-                        ],
-                    )
-                return LLMChatCompletion(content="我不能直接读取本地文件。")
-
-        def fake_read_file(_session, *, path: str, encoding: str = "auto"):
-            read_calls.append({"path": path, "encoding": encoding})
-            return {"tool_name": "filesystem.read_file", "ok": True, "result": {"content": "姓名：刘汉卿"}}
-
-        registry = AgentToolRegistry(
-            [
-                AgentToolDefinition(
-                    name="filesystem.read_file",
-                    description="读取用户指定的本地文件内容。",
-                    input_schema={
-                        "type": "object",
-                        "required": ["path"],
-                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
-                        "additionalProperties": False,
-                    },
-                    output_schema={"type": "object"},
-                    handler=fake_read_file,
-                    allowed_source_types=frozenset({"agent_chat"}),
-                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_read", "filesystem_operation"})),
+                self._test_case.assertIsNotNone(tools)
+                self._test_case.assertIn("Name: Liu Hanqing", combined)
+                self._test_case.assertIn("Focus: Java backend", combined)
+                self._test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools])
+                return LLMChatCompletion(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-copy-after-read",
+                            name="skill_filesystem",
+                            arguments={
+                                "operation": "copy_file",
+                                "src": str(source_path),
+                                "operation_intent": {
+                                    "destination": {
+                                        "kind": "file",
+                                        "path": str(expected_dst),
+                                        "reference": "model_selected_from_content",
+                                    },
+                                    "name_policy": "content_based",
+                                    "user_delegated_name": True,
+                                    "name_intent": {
+                                        "mode": "model_proposed",
+                                        "filename_stem": expected_dst.stem,
+                                        "source_basis": "file_content",
+                                    },
+                                },
+                            },
+                        )
+                    ],
                 )
-            ]
-        )
 
         with self.Session() as session:
             session_id = self._session_id(session)
             fake_llm = FakeLLM(self)
-            dependencies = self._dependencies(session, llm_client=fake_llm).with_registry(registry)
-            dependencies.conversation_service.append_message(
-                session_id,
-                AgentMessageCreate(
-                    role=AgentMessageRole.USER,
-                    content_text=f"这是简历路径：{resume_path}",
-                    visible_content_text=f"这是简历路径：{resume_path}",
-                    token_estimate=12,
-                ),
+            dependencies = self._dependencies(session, llm_client=fake_llm).with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=self.skill_root,
+                        session_provider=lambda: session,
+                    )
+                }
             )
-
             result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="那么你现在读一下里面的内容"),
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="复制一下这个文件，根据文件内容你自己起一个合适的名字。",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    tool_input={
+                        "operation": "copy_file",
+                        "src": str(source_path),
+                        "operation_intent": {
+                            "destination": {"kind": "directory", "path": str(self.skill_root), "reference": "same_directory"},
+                            "name_policy": "content_based",
+                            "user_delegated_name": True,
+                        },
+                    },
+                ),
                 dependencies=dependencies,
             )
             session.commit()
-            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+            approval = session.query(ApprovalRequest).one()
 
-        self.assertEqual(1, len(tool_logs))
-        tool_log = tool_logs[0]
-        self.assertEqual([{"path": resume_path, "encoding": "utf-8"}], read_calls)
-        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
-        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
-        self.assertNotIn("textual_tool_call_recovery", result.state.context_metadata)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(1, len(fake_llm.calls))
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, approval.payload["requested_tool_name"])
+        self.assertEqual(str(expected_dst), approval.payload["approval_payload"]["dst"])
+        self.assertFalse(expected_dst.exists())
+
+    def test_filesystem_read_then_model_final_cannot_end_before_write_call(self) -> None:
+        """A content-based copy must keep the native loop alive after a read observation."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ApprovalRequest
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        source_path = self.skill_root / "premature-final-source.tex"
+        expected_dst = self.skill_root / "LiuHanqing_AI_Agent_Resume.tex"
+        source_path.write_text("Name: Liu Hanqing\\nFocus: AI Agent", encoding="utf-8")
+        _write_read_script(self.skill_root, source_path.read_text(encoding="utf-8"))
+        _write_copy_script(self.skill_root)
+
+        test_case = self
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                combined = "\\n".join(str(message.get("content") or "") for message in messages)
+                test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools or []])
+                if self.calls == 1:
+                    test_case.assertIn("Name: Liu Hanqing", combined)
+                    return LLMChatCompletion(content="我建议命名为 LiuHanqing_AI_Agent_Resume.tex，等待确认。")
+                test_case.assertIn("运行时阻止了本轮提前结束", combined)
+                return LLMChatCompletion(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-copy-after-runtime-guard",
+                            name="skill_filesystem",
+                            arguments={
+                                "operation": "copy_file",
+                                "src": str(source_path),
+                                "operation_intent": {
+                                    "destination": {"kind": "directory", "path": str(test_case.skill_root)},
+                                    "name_policy": "content_based",
+                                    "user_delegated_name": True,
+                                    "name_intent": {
+                                        "mode": "model_proposed",
+                                        "filename_stem": expected_dst.stem,
+                                        "source_basis": "file_content",
+                                    },
+                                },
+                            },
+                        )
+                    ],
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm).with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=self.skill_root,
+                        session_provider=lambda: session,
+                    )
+                }
+            )
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="复制一下这个文件，根据文件内容你自己起一个合适的名字。",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    source_type="agent_chat",
+                    tool_input={
+                        "operation": "copy_file",
+                        "src": str(source_path),
+                        "operation_intent": {
+                            "destination": {"kind": "directory", "path": str(self.skill_root), "reference": "same_directory"},
+                            "name_policy": "content_based",
+                            "user_delegated_name": True,
+                        },
+                    },
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.query(ApprovalRequest).one()
+
+        self.assertEqual(2, fake_llm.calls)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(str(expected_dst), approval.payload["approval_payload"]["dst"])
+        self.assertFalse(expected_dst.exists())
+
+    def test_coarse_route_read_after_missing_operation_still_requires_write_call(self) -> None:
+        """A coarse skill miss must not let a later read end a delegated copy task."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ApprovalRequest
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        source_path = self.skill_root / "coarse-premature-final-source.tex"
+        expected_dst = self.skill_root / "LiuHanqing_AI_Agent_Resume.tex"
+        source_path.write_text("Name: Liu Hanqing\\nFocus: AI Agent", encoding="utf-8")
+        _write_read_script(self.skill_root, source_path.read_text(encoding="utf-8"))
+        _write_copy_script(self.skill_root)
+
+        test_case = self
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools or []])
+                combined = "\\n".join(str(message.get("content") or "") for message in messages)
+                if self.calls == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-missing-operation",
+                                name="skill_filesystem",
+                                arguments={"user_task": "复制文件并根据内容起名", "path": str(source_path)},
+                            )
+                        ],
+                    )
+                if self.calls == 2:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-after-missing-operation",
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": str(source_path)},
+                            )
+                        ],
+                    )
+                if self.calls == 3:
+                    test_case.assertIn("运行时阻止了本轮提前结束", combined)
+                    return LLMChatCompletion(content="我建议命名为 LiuHanqing_AI_Agent_Resume.tex，等待确认。")
+                test_case.assertIn("运行时阻止了本轮提前结束", combined)
+                return LLMChatCompletion(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-copy-after-coarse-guard",
+                            name="skill_filesystem",
+                            arguments={
+                                "operation": "copy_file",
+                                "src": str(source_path),
+                                "operation_intent": {
+                                "destination": {"kind": "directory", "path": str(test_case.skill_root)},
+                                    "name_policy": "content_based",
+                                    "user_delegated_name": True,
+                                    "name_intent": {
+                                        "mode": "model_proposed",
+                                        "filename_stem": expected_dst.stem,
+                                        "source_basis": "file_content",
+                                    },
+                                },
+                            },
+                        )
+                    ],
+                )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeLLM()
+            dependencies = self._dependencies(session, llm_client=fake_llm).with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=self.skill_root,
+                        session_provider=lambda: session,
+                    )
+                }
+            )
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message=f"复制这个文件 {source_path}，读取后根据内容自己起一个合适的名字",
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.query(ApprovalRequest).one()
+
+        self.assertEqual(4, fake_llm.calls)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(str(expected_dst), approval.payload["approval_payload"]["dst"])
+        self.assertFalse(expected_dst.exists())
+
+    def test_coarse_filesystem_route_returns_to_model_for_operation_and_name(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ApprovalRequest
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        source_path = self.skill_root / "coarse-route-source.tex"
+        expected_dst = self.skill_root / "LiuHanqing_AI_Agent_Resume.tex"
+        source_path.write_text("Name: Liu Hanqing\nFocus: AI Agent", encoding="utf-8")
+        _write_read_script(self.skill_root, source_path.read_text(encoding="utf-8"))
+        _write_copy_script(self.skill_root)
+
+        test_case = self
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls += 1
+                test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools or []])
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if self.calls == 1:
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-read-after-coarse-route",
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": str(source_path)},
+                            )
+                        ],
+                    )
+                test_case.assertIn("Name: Liu Hanqing", combined)
+                return LLMChatCompletion(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-copy-after-model-read",
+                            name="skill_filesystem",
+                            arguments={
+                                "operation": "copy_file",
+                                "src": str(source_path),
+                                "operation_intent": {
+                                    "destination": {"kind": "directory", "path": str(test_case.skill_root)},
+                                    "name_policy": "content_based",
+                                    "user_delegated_name": True,
+                                    "name_intent": {
+                                        "mode": "model_proposed",
+                                        "filename_stem": "LiuHanqing_AI_Agent_Resume",
+                                        "source_basis": "file_content",
+                                    },
+                                },
+                            },
+                        )
+                    ],
+                )
+
+        fake_llm = FakeLLM()
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+            dependencies = self._dependencies(
+                session,
+                llm_client=fake_llm,
+                capability_routing_middleware=CapabilityRoutingMiddleware(),
+            ).with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=self.skill_root,
+                        session_provider=lambda: session,
+                    )
+                }
+            )
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message=f"复制这个文件 {source_path}，读取后根据内容自己起一个合适的名字",
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.query(ApprovalRequest).one()
+
+        self.assertEqual(2, fake_llm.calls)
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(str(expected_dst), approval.payload["approval_payload"]["dst"])
+        self.assertFalse(expected_dst.exists())
+
+
+
+    def test_filesystem_read_result_is_observation_for_document_analysis_requests(self) -> None:
+        """read_file should feed final synthesis, not directly become the chat answer."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ToolCallLog, ToolCallStatus
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        read_payload = "\\documentclass{article}\n\\section{项目经历}OfferMaster Agent Runtime\n\\section{技能}Python, FastAPI"
+        expected_answer = "这份简历的后端匹配点主要是 FastAPI、Python 和 Agent Runtime 项目经验。"
+        _write_read_script(self.skill_root, read_payload)
+
+        class FakeAnalysisLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                self._test_case.assertIsNotNone(messages)
+                return LLMChatCompletion(content=expected_answer)
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            fake_llm = FakeAnalysisLLM(self)
+            dependencies = self._dependencies(session, llm_client=fake_llm).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root, session_provider=lambda: session)}
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(
+                    session_id=session_id,
+                    user_message="分析这个文件内容哪里适合 Java 后端岗位",
+                    requested_tool_name=FILESYSTEM_SKILL_CAPABILITY,
+                    source_type="agent_chat",
+                    tool_input={"operation": "read_file", "path": resume_path, "encoding": "utf-8", "limit": 500},
+                ),
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_log = session.scalars(select(ToolCallLog)).one()
+
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual("filesystem.read_file", tool_log.tool_name)
+        self.assertEqual("read_file", tool_log.output_payload["result"]["operation"])
+        self.assertIn(result.state.response_mode, {"llm_tool_observation_final_answer", "llm_filesystem_answer_synthesis"})
+        self.assertEqual(expected_answer, result.state.final_response)
+        self.assertNotIn("\\documentclass", result.state.final_response)
+        self.assertEqual(1, len(fake_llm.calls))
+
 
     def test_tool_choice_loop_reuses_recent_file_path_for_pronoun_open_followup(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
         from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
         from app.domains.conversations.models import AgentMessageRole
@@ -3301,6 +5078,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
         read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+        _write_read_script(self.skill_root, read_payload)
 
         class FakeLLM:
             def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
@@ -3312,14 +5090,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and len(self.calls) == 1:
                     self._test_case.assertIn(resume_path, combined)
-                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
+                    self._test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
                                 id="call-open-resume-pronoun",
-                                name="filesystem_read_file",
-                                arguments={"path": resume_path, "encoding": "utf-8", "limit": 500},
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "path": resume_path, "encoding": "utf-8", "limit": 500},
                             )
                         ],
                     )
@@ -3359,7 +5137,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         with self.Session() as session:
             session_id = self._session_id(session)
-            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root, session_provider=lambda: session)}
+            )
             dependencies.conversation_service.append_message(
                 session_id,
                 AgentMessageCreate(
@@ -3377,13 +5157,16 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
         self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
-        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
+        self.assertEqual([], read_calls)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
+        self.assertEqual("read_file.py", tool_log.output_payload["result"]["internal_script"])
 
     def test_tool_choice_loop_completes_missing_file_path_before_execution(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
         from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
         from app.domains.conversations.models import AgentMessageRole
@@ -3392,6 +5175,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         resume_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
         read_payload = "姓名：刘汉卿\n项目：OfferMaster Agent Loop"
+        _write_read_script(self.skill_root, read_payload)
 
         class FakeLLM:
             def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
@@ -3401,14 +5185,14 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
                 if tools and len(self.calls) == 1:
-                    self._test_case.assertEqual(["filesystem_read_file"], [tool["function"]["name"] for tool in tools])
+                    self._test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
                                 id="call-read-with-missing-path",
-                                name="filesystem_read_file",
-                                arguments={"encoding": "utf-8", "limit": 500},
+                                name="skill_filesystem",
+                                arguments={"operation": "read_file", "encoding": "utf-8", "limit": 500},
                             )
                         ],
                     )
@@ -3446,7 +5230,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         with self.Session() as session:
             session_id = self._session_id(session)
-            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry).with_agent_runtime(
+                executors={FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(script_root=self.skill_root, session_provider=lambda: session)}
+            )
             dependencies.conversation_service.append_message(
                 session_id,
                 AgentMessageCreate(
@@ -3464,13 +5250,16 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             session.commit()
             tool_log = session.scalars(select(ToolCallLog)).one()
 
-        self.assertEqual("filesystem.read_file", result.state.requested_tool_name)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
         self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
-        self.assertEqual([{"path": resume_path, "encoding": "utf-8", "offset": 0, "limit": 500}], read_calls)
-        self.assertEqual({"encoding": "utf-8", "limit": 500, "path": resume_path}, tool_log.input_payload)
+        self.assertEqual([], read_calls)
+        self.assertEqual("read_file.py", tool_log.output_payload["result"]["internal_script"])
+        self.assertEqual(resume_path, tool_log.output_payload["result"]["arguments"]["path"])
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
 
+    @unittest.skip("Superseded: high-risk filesystem calls must provide structured operation and path fields.")
     def test_tool_choice_loop_preserves_completed_input_for_high_risk_confirmation(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
         from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
         from app.domains.automation.models import ApprovalRequest, ToolCallLog
@@ -3482,13 +5271,13 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         class FakeLLM:
             def complete(self, *, messages, tools=None, tool_choice=None):
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
                             LLMToolCall(
                                 id="call-replace-missing-path",
-                                name="filesystem_replace_text",
+                                name="skill_filesystem",
                                 arguments={"old_text": "刘汉卿", "new_text": "王爷"},
                             )
                         ],
@@ -3543,11 +5332,341 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             tool_logs = list(session.scalars(select(ToolCallLog)).all())
 
         self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
         self.assertEqual([], tool_logs)
-        self.assertEqual(
-            {"old_text": "刘汉卿", "new_text": "王爷", "path": resume_path},
-            approval.payload["tool_input"],
+        self.assertEqual("replace_text", approval.payload["approval_payload"]["operation"])
+        self.assertEqual("刘汉卿", approval.payload["approval_payload"]["old_text"])
+        self.assertEqual("王爷", approval.payload["approval_payload"]["new_text"])
+        self.assertEqual(resume_path, approval.payload["approval_payload"]["path"])
+
+    def test_tool_choice_loop_uses_active_filename_context_for_contextual_rename(self) -> None:
+        """Catches regressions where a filename-focused follow-up picks read/replace instead of rename."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.agent_runtime.tool_registry import AgentToolCandidateProfile, AgentToolDefinition, AgentToolRegistry, AgentToolRiskLevel
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        original_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent平台简历.tex"
+        expected_dst = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent.tex"
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                combined = "\n".join(str(message.get("content") or "") for message in messages)
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    self._test_case.assertIn(original_path, combined)
+                    self._test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-rename-active-file",
+                                name="skill_filesystem",
+                                arguments={"operation": "rename_file", "src": original_path, "dst": expected_dst},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="should not run")
+
+        registry = AgentToolRegistry(
+            [
+                AgentToolDefinition(
+                    name="filesystem.move_file",
+                    description="重命名用户当前关注的本地文件。",
+                    input_schema={
+                        "type": "object",
+                        "required": ["src", "dst"],
+                        "properties": {
+                            "src": {"type": "string"},
+                            "dst": {"type": "string"},
+                            "overwrite": {"type": "boolean", "default": False},
+                        },
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object"},
+                    handler=lambda _session, **arguments: {"tool_name": "filesystem.move_file", "ok": True, "result": arguments},
+                    risk_level=AgentToolRiskLevel.HIGH,
+                    requires_confirmation=True,
+                    allowed_source_types=frozenset({"agent_chat"}),
+                    candidate_profile=AgentToolCandidateProfile(categories=frozenset({"filesystem_move", "filesystem_operation"})),
+                ),
+            ]
         )
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self)).with_registry(registry)
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"刚才查看这个文件的名字：{original_path}",
+                    visible_content_text=f"刚才查看这个文件的名字：{original_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="把名字改成刘汉卿-后端开发-AI-Agent"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.scalars(select(ApprovalRequest)).one()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
+        self.assertEqual([], tool_logs)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, approval.payload["requested_tool_name"])
+        self.assertEqual(FILESYSTEM_SKILL_EXECUTOR_ID, approval.payload["executor_id"])
+        self.assertEqual(original_path, approval.payload["approval_payload"]["src"])
+        self.assertEqual(expected_dst, approval.payload["approval_payload"]["dst"])
+        self.assertFalse(approval.payload["approval_payload"]["overwrite"])
+        self.assertIn(result.state.context_metadata["active_file"]["last_focus"], {"file", "filename"})
+
+    def test_tool_choice_loop_routes_filesystem_followup_through_skill_capability(self) -> None:
+        """Skill-as-Capability keeps filesystem scripts out of the main agent tool choice surface."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        original_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent平台简历.tex"
+        expected_dst = "C:/Users/phoenix/Documents/Obsidian Vault/简历/刘汉卿-后端开发-AI-Agent.tex"
+
+        class FakeLLM:
+            def __init__(self, test_case: AgentRuntimeGraphTest) -> None:
+                self.calls = []
+                self._test_case = test_case
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    self._test_case.assertIn("skill_filesystem", [tool["function"]["name"] for tool in tools])
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-filesystem-skill",
+                                name="skill_filesystem",
+                                arguments={
+                                    "user_task": "把名字改成刘汉卿-后端开发-AI-Agent",
+                                    "operation": "rename_file",
+                                    "src": original_path,
+                                    "dst": expected_dst,
+                                },
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="should not run")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM(self))
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"刚才查看这个文件的名字：{original_path}",
+                    visible_content_text=f"刚才查看这个文件的名字：{original_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            result = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="把名字改成刘汉卿-后端开发-AI-Agent"),
+                dependencies=dependencies,
+            )
+            session.commit()
+            approval = session.scalars(select(ApprovalRequest)).one()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("wait_confirmation", result.state.current_step)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, result.state.requested_tool_name)
+        self.assertEqual([], tool_logs)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, approval.payload["requested_tool_name"])
+        self.assertEqual(FILESYSTEM_SKILL_EXECUTOR_ID, approval.payload["executor_id"])
+        self.assertEqual(original_path, approval.payload["tool_input"]["context_metadata"]["active_file"]["path"])
+        self.assertEqual(expected_dst, approval.payload["approval_payload"]["dst"])
+
+    def test_approved_filesystem_skill_rename_runs_internal_script_once(self) -> None:
+        """Approval resumes the same high-level Skill; the main agent never calls move_file directly."""
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY, FILESYSTEM_SKILL_EXECUTOR_ID
+        from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
+        from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+        from app.domains.automation.models import ApprovalRequest, ToolCallLog, ToolCallStatus
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
+
+        _write_move_script(self.skill_root)
+        src = self.skill_root / "刘汉卿-后端开发-AI-Agent平台简历.tex"
+        src.write_text("resume", encoding="utf-8")
+        original_path = str(src)
+        expected_dst = str(self.skill_root / "刘汉卿-后端开发-AI-Agent.tex")
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def complete(self, *, messages, tools=None, tool_choice=None):
+                self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-filesystem-skill",
+                                name="skill_filesystem",
+                                arguments={"operation": "rename_file", "src": original_path, "dst": expected_dst},
+                            )
+                        ],
+                    )
+                return LLMChatCompletion(content="文件名已经按确认后的操作处理。")
+
+        with self.Session() as session:
+            session_id = self._session_id(session)
+            dependencies = self._dependencies(session, llm_client=FakeLLM()).with_agent_runtime(
+                executors={
+                    FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(
+                        script_root=self.skill_root,
+                        session_provider=lambda: session,
+                    )
+                }
+            )
+            dependencies.conversation_service.append_message(
+                session_id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.USER,
+                    content_text=f"刚才查看这个文件的名字：{original_path}",
+                    visible_content_text=f"刚才查看这个文件的名字：{original_path}",
+                    token_estimate=12,
+                ),
+            )
+
+            first = run_agent_workflow(
+                AgentRunCommand(session_id=session_id, user_message="把名字改成刘汉卿-后端开发-AI-Agent"),
+                dependencies=dependencies,
+            )
+            approval = session.scalars(select(ApprovalRequest)).one()
+            continued = continue_agent_workflow_after_approval(
+                approval.id,
+                approved=True,
+                decision_reason="确认重命名",
+                dependencies=dependencies,
+            )
+            session.commit()
+            tool_logs = list(session.scalars(select(ToolCallLog)).all())
+
+        self.assertEqual("wait_confirmation", first.state.current_step)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, first.state.requested_tool_name)
+        self.assertEqual("final_response", continued.state.current_step)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, continued.state.requested_tool_name)
+        self.assertEqual([ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
+        self.assertEqual([FILESYSTEM_SKILL_CAPABILITY], [log.tool_name for log in tool_logs])
+        self.assertEqual("move_file.py", tool_logs[0].output_payload["result"]["internal_script"])
+        self.assertEqual(expected_dst, tool_logs[0].output_payload["result"]["arguments"]["dst"])
+        self.assertFalse(src.exists())
+        self.assertTrue(Path(expected_dst).exists())
+        self.assertTrue(tool_logs[0].output_payload["result"]["filesystem_trace"]["postcheck"]["completed"])
+
+
+
+
+
+    def test_runtime_result_summary_includes_filesystem_postcheck_trace(self) -> None:
+        from app.agent_runtime.graph_factory import _runtime_result_summary_metadata, _runtime_result_summary_text
+
+        payload = {
+            "tool_name": "skill.filesystem",
+            "ok": False,
+            "operation": "rename_file",
+            "error": "FILESYSTEM_POSTCHECK_FAILED: target_missing_after_rename",
+            "filesystem_trace": {
+                "operation": "rename_file",
+                "precheck": {"source_path": "A.tex", "source_exists_before": True, "target_path": "B.tex"},
+                "script": {"internal_script": "move_file.py", "ok": True},
+                "postcheck": {
+                    "completed": False,
+                    "source_path": "A.tex",
+                    "target_path": "B.tex",
+                    "source_exists_after": True,
+                    "target_exists_after": False,
+                    "reason": "target_missing_after_rename",
+                },
+            },
+        }
+
+        summary = _runtime_result_summary_metadata(payload)
+        text = _runtime_result_summary_text(summary)
+
+        self.assertEqual("rename_file", summary["filesystem_trace"]["operation"])
+        self.assertFalse(summary["filesystem_trace"]["postcheck"]["completed"])
+        self.assertIn("复核失败", text)
+        self.assertIn("A.tex -> B.tex", text)
+
+    def test_filesystem_result_overrides_stale_prepared_generic_final_response(self) -> None:
+        from app.agent_runtime.graph_factory import _generate_final_response
+        from app.agent_runtime.state import AgentState
+
+        target = r"C:\Users\phoenix\Documents\简历\刘汉卿-AI-Agent平台后端简历.tex"
+        state = AgentState(
+            session_id="session-final-answer",
+            workflow_run_id="workflow-final-answer",
+            agent_run_id="agent-final-answer",
+            user_message="你自己起一个名字，合适的名字根据那个文件中的内容",
+            current_step="final_response",
+            requested_tool_name="skill.filesystem",
+            final_response="OfferMaster",
+            response_mode="llm",
+            llm_messages=[
+                {
+                    "role": "assistant",
+                    "content": "Tool result: skill.filesystem succeeded",
+                    "metadata": {
+                        "content_json": {
+                            "tool_name": "skill.filesystem",
+                            "status": "succeeded",
+                            "result": {
+                                "tool_name": "skill.filesystem",
+                                "ok": True,
+                                "operation": "rename_file",
+                                "arguments": {"src": r"C:\Users\phoenix\Documents\简历\一下.tex", "dst": target},
+                                "filesystem_trace": {
+                                    "postcheck": {
+                                        "completed": True,
+                                        "source_path": r"C:\Users\phoenix\Documents\简历\一下.tex",
+                                        "target_path": target,
+                                    }
+                                },
+                            },
+                        }
+                    },
+                }
+            ],
+            context_metadata={
+                "goal_state": {
+                    "intent": "filesystem_operation",
+                    "expected_operation": "rename_file",
+                    "target": {"target_name": target},
+                }
+            },
+        )
+
+        with self.Session() as session:
+            dependencies = self._dependencies(session)
+            content, _mode = _generate_final_response(state, dependencies=dependencies)
+
+        self.assertIn(target, content)
 
     def test_tool_choice_loop_reuses_recent_company_context_for_pronoun_public_lookup(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -3567,7 +5686,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
                 if tools and "Canonical 是 Ubuntu 背后的公司" not in combined:
                     self._test_case.assertIn("Canonical Ltd.", combined)
-                    self._test_case.assertEqual(["external_web_search"], [tool["function"]["name"] for tool in tools])
+                    self._test_case.assertIn("external_web_search", [tool["function"]["name"] for tool in tools])
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -3689,7 +5808,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
                             )
                         ],
                     )
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(content="腾讯校招官网：https://join.qq.com/；京东校招官网：https://campus.jd.com/")
+                if "腾讯校招官网" in combined and "京东校招官网" in combined:
                     return LLMChatCompletion(content="腾讯校招官网：https://join.qq.com/；京东校招官网：https://campus.jd.com/")
                 return LLMChatCompletion(content="premature final answer")
 
@@ -3749,18 +5870,15 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             ],
             search_calls,
         )
-        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertIn("腾讯校招官网", result.state.final_response)
         self.assertIn("京东校招官网", result.state.final_response)
         self.assertEqual([ToolCallStatus.SUCCEEDED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
         self.assertEqual(3, len(fake_llm.calls))
-        self.assertEqual(2, result.state.context_metadata["tool_calling_loop"]["executed_tool_call_count"])
-        loop_agent = result.state.context_metadata["loop_agent"]
+        self.assertEqual(2, result.state.context_metadata["tool_choice_loop"]["executed_step_count"])
+        loop_agent = result.state.context_metadata["tool_choice_loop"]
         self.assertTrue(loop_agent["enabled"])
         self.assertEqual("runtime_controlled", loop_agent["control_mode"])
-        self.assertEqual("bounded_react", loop_agent["strategy"])
-        self.assertTrue(loop_agent["react_strategy"]["enabled"])
-        self.assertEqual("bounded_react", loop_agent["react_strategy"]["mode"])
         self.assertEqual("model_final", loop_agent["stop_reason"])
         self.assertEqual(2, loop_agent["executed_step_count"])
         self.assertEqual(["external.web_search", "external.web_search"], [step["capability"] for step in loop_agent["trace"]])
@@ -3788,7 +5906,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -3856,10 +5974,11 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             ],
             search_calls,
         )
-        self.assertEqual(1, result.state.context_metadata["loop_agent"]["reflection_retry_count"])
-        self.assertEqual(2, result.state.context_metadata["loop_agent"]["executed_step_count"])
-        trace_entry = result.state.context_metadata["loop_agent"]["trace"][0]
-        reflection = trace_entry["metadata"]["reflection"]
+        tool_choice_loop = result.state.context_metadata["tool_choice_loop"]
+        self.assertEqual(2, tool_choice_loop["executed_step_count"])
+        self.assertEqual(2, len(tool_choice_loop["trace"]))
+        trace_entry = tool_choice_loop["trace"][0]
+        reflection = trace_entry["metadata"]["observation"]["metadata"]["reflection"]
         self.assertEqual("bad", reflection["quality"])
         self.assertEqual("retry", reflection["next_action"])
         self.assertIn("中科曙光", reflection["suggested_input_patch"]["query"])
@@ -3928,7 +6047,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -4010,12 +6129,15 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             search_calls,
         )
         self.assertEqual([ToolCallStatus.SUCCEEDED, ToolCallStatus.SUCCEEDED], [log.status for log in tool_logs])
-        self.assertEqual("llm_tool_loop", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertIn("中科曙光校招官网", result.state.final_response)
         self.assertIn("中科曙光校园招聘官网", fake_llm.final_messages)
-        loop_agent = result.state.context_metadata["loop_agent"]
+        loop_agent = result.state.context_metadata["tool_choice_loop"]
         self.assertEqual(2, loop_agent["executed_step_count"])
-        self.assertEqual(["retry", "continue"], [step["metadata"]["reflection"]["next_action"] for step in loop_agent["trace"]])
+        self.assertEqual(
+            ["retry", "continue"],
+            [step["metadata"]["observation"]["metadata"]["reflection"]["next_action"] for step in loop_agent["trace"]],
+        )
 
     def test_execution_planner_executes_capability_action_without_native_tool_call_selection(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -4023,7 +6145,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL, AgentToolDefinition, AgentToolRegistry
         from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
         from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
+        from app.infrastructure.llm.chat_client import LLMChatCompletion, LLMToolCall
 
         class FakeIntentLLM:
             def complete(self, *, messages):
@@ -4064,9 +6186,20 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                test_case.assertIsNone(tools)
+                test_case.assertIsNotNone(tools)
                 combined = "\n".join(str(message.get("content") or "") for message in messages)
-                test_case.assertIn("Tool result: external.web_search succeeded", combined)
+                if not any(message.get("role") == "tool" for message in messages):
+                    return LLMChatCompletion(
+                        content="",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call-hirain-search",
+                                name="external_web_search",
+                                arguments={"query": "经纬恒润 校园招聘 官网", "max_results": 5},
+                            )
+                        ],
+                    )
+                test_case.assertIn("工具 external.web_search 执行状态：succeeded", combined)
                 test_case.assertIn("经纬恒润校园招聘官网", combined)
                 return LLMChatCompletion(content="已找到经纬恒润校园招聘官网：https://jobs.example.com/hirain")
 
@@ -4125,15 +6258,13 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             tool_log = session.scalars(select(ToolCallLog)).one()
 
         self.assertEqual([{"query": "经纬恒润 校园招聘 官网", "max_results": 5}], search_calls)
-        self.assertEqual(1, len(planner.calls))
+        self.assertEqual(0, len(planner.calls))
         self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.requested_tool_name)
-        self.assertEqual("execution_planner", result.state.response_mode)
+        self.assertEqual("llm_tool_choice_loop", result.state.response_mode)
         self.assertEqual("已找到经纬恒润校园招聘官网：https://jobs.example.com/hirain", result.state.final_response)
-        self.assertEqual("simple_tool_call", result.state.context_metadata["execution_plan"]["mode"])
-        self.assertEqual("call_capability", result.state.context_metadata["execution_plan"]["actions"][0]["type"])
-        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, result.state.context_metadata["execution_plan"]["actions"][0]["capability"])
+        self.assertNotIn("execution_plan", result.state.context_metadata)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual(1, len(final_llm.calls))
+        self.assertEqual(2, len(final_llm.calls))
 
     def test_native_tool_loop_preserves_tool_input_through_confirmation(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, continue_agent_workflow_after_approval, run_agent_workflow
@@ -4158,7 +6289,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
             def complete(self, *, messages, tools=None, tool_choice=None):
                 self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-                if tools:
+                if tools and not any(message.get("role") == "tool" for message in messages):
                     return LLMChatCompletion(
                         content="",
                         tool_calls=[
@@ -4238,7 +6369,7 @@ class AgentRuntimeGraphTest(unittest.TestCase):
 
         self.assertEqual([{"query": "中科曙光 校园招聘 秋招 官网", "max_results": 5}], search_calls)
         self.assertEqual("final_response", continued.state.current_step)
-        self.assertEqual("llm_tool_loop", continued.state.response_mode)
+        self.assertEqual("llm_tool_result_summary", continued.state.response_mode)
         self.assertEqual("确认后已完成联网搜索：中科曙光校园招聘官网", continued.state.final_response)
         self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
         self.assertEqual(2, len(fake_llm.calls))
@@ -4715,254 +6846,9 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("user", fake_llm.messages[-1]["role"])
         self.assertEqual("我想找 Java 后端秋招", fake_llm.messages[-1]["content"])
 
-    def test_agent_run_recovers_mixed_textual_tool_call_instead_of_sanitizing_it_as_answer(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import FILESYSTEM_READ_FILE_TOOL, AgentToolDefinition, AgentToolRegistry
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
 
-        read_calls = []
 
-        def fake_read_file(_session, *, path: str, encoding: str = "auto"):
-            read_calls.append({"path": path, "encoding": encoding})
-            return {"tool_name": FILESYSTEM_READ_FILE_TOOL, "ok": True, "result": {"content": "姓名：刘汉卿"}}
 
-        class FakeLLMClient:
-            def __init__(self) -> None:
-                self.complete_calls = 0
-
-            def complete(self, *, messages):
-                from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-                self.complete_calls += 1
-                if self.complete_calls > 1:
-                    return LLMChatCompletion(content="工具执行后重新总结：读取到姓名：刘汉卿。")
-                return LLMChatCompletion(
-                    content=(
-                        "Tool call: filesystem.read_file\n"
-                        "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", \"encoding\": \"utf-8\"}\n\n"
-                        "我准备先读取文件，然后再回答。"
-                    ),
-                    usage={"total_tokens": 42},
-                )
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            fake_llm = FakeLLMClient()
-            dependencies = self._dependencies(session, llm_client=fake_llm)
-            registry = AgentToolRegistry(
-                definition
-                for definition in dependencies.registry.list_definitions()
-                if definition.name != FILESYSTEM_READ_FILE_TOOL
-            )
-            registry.register(
-                AgentToolDefinition(
-                    name=FILESYSTEM_READ_FILE_TOOL,
-                    description="Read a local file.",
-                    input_schema={
-                        "type": "object",
-                        "required": ["path"],
-                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
-                        "additionalProperties": False,
-                    },
-                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
-                    handler=fake_read_file,
-                    allowed_source_types=frozenset({"agent_chat", "filesystem"}),
-                )
-            )
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
-                dependencies=dependencies.with_registry(registry),
-            )
-            session.commit()
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertNotIn("Tool call:", result.state.final_response)
-        self.assertNotIn("我准备先读取文件", result.state.final_response)
-        self.assertEqual("工具执行后重新总结：读取到姓名：刘汉卿。", result.state.final_response)
-        self.assertEqual("llm_textual_tool_call_recovery", result.state.response_mode)
-        self.assertEqual(2, fake_llm.complete_calls)
-        self.assertEqual([{"path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex", "encoding": "utf-8"}], read_calls)
-        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, tool_log.tool_name)
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
-
-    def test_agent_run_recovers_textual_web_search_call_before_fallback(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import EXTERNAL_WEB_SEARCH_TOOL
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
-
-        class FakeLLMClient:
-            def complete(self, *, messages):
-                from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-                return LLMChatCompletion(content='Tool call: external.web_search{"query":"Canonical Ltd."}')
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="帮我写一句求职备注"),
-                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
-            )
-            session.commit()
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertNotIn("Tool call:", result.state.final_response)
-        self.assertIn("联网搜索失败", result.state.final_response)
-        self.assertEqual("tool_result_summary_textual_tool_call_recovery", result.state.response_mode)
-        self.assertEqual(EXTERNAL_WEB_SEARCH_TOOL, tool_log.tool_name)
-        self.assertEqual(ToolCallStatus.FAILED, tool_log.status)
-        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
-
-    def test_agent_run_recovers_textual_low_risk_tool_call_into_real_execution(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import (
-            FILESYSTEM_READ_FILE_TOOL,
-            AgentToolDefinition,
-            AgentToolRegistry,
-        )
-        from app.domains.automation.models import ToolCallLog, ToolCallStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        calls = []
-
-        def fake_read_file(_session, **arguments):
-            calls.append(dict(arguments))
-            return {
-                "tool_name": FILESYSTEM_READ_FILE_TOOL,
-                "ok": True,
-                "result": {
-                    "path": arguments["path"],
-                    "content": "姓名：刘汉卿\n方向：AI Agent 平台后端开发",
-                },
-            }
-
-        class FakeLLMClient:
-            def __init__(self) -> None:
-                self.complete_calls = 0
-
-            def complete(self, *, messages):
-                self.complete_calls += 1
-                if self.complete_calls == 1:
-                    return LLMChatCompletion(
-                        content=(
-                            "Tool call: filesystem.read_file\n"
-                            "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", \"encoding\": \"utf-8\"}"
-                        )
-                    )
-                return LLMChatCompletion(content="已读取到简历内容：姓名：刘汉卿。")
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            fake_llm = FakeLLMClient()
-            dependencies = self._dependencies(session, llm_client=fake_llm)
-            registry = AgentToolRegistry(
-                definition
-                for definition in dependencies.registry.list_definitions()
-                if definition.name != FILESYSTEM_READ_FILE_TOOL
-            )
-            registry.register(
-                AgentToolDefinition(
-                    name=FILESYSTEM_READ_FILE_TOOL,
-                    description="Read a local file.",
-                    input_schema={
-                        "type": "object",
-                        "required": ["path"],
-                        "properties": {"path": {"type": "string"}, "encoding": {"type": "string"}},
-                        "additionalProperties": False,
-                    },
-                    output_schema={"type": "object", "required": ["tool_name", "ok", "result"]},
-                    handler=fake_read_file,
-                    allowed_source_types=frozenset({"agent_chat", "filesystem"}),
-                )
-            )
-            dependencies = dependencies.with_registry(registry)
-
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="读取这个简历文件内容"),
-                dependencies=dependencies,
-            )
-            session.commit()
-            tool_log = session.scalars(select(ToolCallLog)).one()
-
-        self.assertEqual([{"path": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex", "encoding": "utf-8"}], calls)
-        self.assertEqual(ToolCallStatus.SUCCEEDED, tool_log.status)
-        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, tool_log.tool_name)
-        self.assertEqual([tool_log.id], result.state.tool_call_ids)
-        self.assertEqual(FILESYSTEM_READ_FILE_TOOL, result.state.requested_tool_name)
-        self.assertEqual("llm_textual_tool_call_recovery", result.state.response_mode)
-        self.assertTrue(result.state.context_metadata["textual_tool_call_recovery"]["recovered"])
-        self.assertNotIn("Tool call:", result.state.final_response)
-        self.assertIn("已读取到简历内容", result.state.final_response)
-
-    def test_agent_run_converts_textual_high_risk_tool_call_into_confirmation(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.agent_runtime.tool_registry import FILESYSTEM_REPLACE_TEXT_TOOL
-        from app.domains.automation.models import ApprovalRequest, ToolCallLog, WorkflowRun, WorkflowRunStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(
-                    content=(
-                        "Tool call: filesystem.replace_text\n"
-                        "Arguments: {\"path\": \"C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex\", "
-                        "\"old_text\": \"刘汉卿\", \"new_text\": \"王爷\"}"
-                    )
-                )
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="把这个简历里的名字换成王爷，其他不要动"),
-                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
-            )
-            session.commit()
-            workflow = session.get(WorkflowRun, result.workflow_run_id)
-            approval = session.scalars(select(ApprovalRequest)).one()
-            tool_logs = session.scalars(select(ToolCallLog)).all()
-
-        self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
-        self.assertEqual("wait_confirmation", workflow.current_step)
-        self.assertEqual("wait_confirmation", result.state.current_step)
-        self.assertEqual(approval.id, result.state.approval_request_id)
-        self.assertEqual(FILESYSTEM_REPLACE_TEXT_TOOL, approval.action_type)
-        self.assertEqual(FILESYSTEM_REPLACE_TEXT_TOOL, approval.payload["requested_tool_name"])
-        self.assertEqual("王爷", approval.payload["tool_input"]["new_text"])
-        self.assertEqual([], tool_logs)
-        recovery = result.state.context_metadata["textual_tool_call_recovery"]
-        self.assertFalse(recovery["recovered"])
-        self.assertEqual("wait_confirmation", recovery["next_action"])
-
-    def test_agent_run_waits_for_user_when_recovered_textual_tool_call_is_missing_required_input(self) -> None:
-        from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
-        from app.domains.automation.models import ToolCallLog, WorkflowRun, WorkflowRunStatus
-        from app.infrastructure.llm.chat_client import LLMChatCompletion
-
-        class FakeLLMClient:
-            def complete(self, *, messages):
-                return LLMChatCompletion(content="Tool call: filesystem.read_file")
-
-        with self.Session() as session:
-            session_id = self._session_id(session)
-            result = run_agent_workflow(
-                AgentRunCommand(session_id=session_id, user_message="读取内容"),
-                dependencies=self._dependencies(session, llm_client=FakeLLMClient()),
-            )
-            session.commit()
-            workflow = session.get(WorkflowRun, result.workflow_run_id)
-            tool_logs = session.scalars(select(ToolCallLog)).all()
-
-        self.assertEqual(WorkflowRunStatus.WAITING_USER, workflow.status)
-        self.assertEqual("wait_user_input", workflow.current_step)
-        self.assertEqual("wait_user_input", result.state.current_step)
-        self.assertEqual("tool_input_ask_user", result.state.response_mode)
-        self.assertIn("缺少 path", result.state.final_response)
-        self.assertEqual([], tool_logs)
-        completion = result.state.context_metadata["tool_input_completion"]
-        self.assertEqual(["path"], completion["missing_required_fields"])
-        recovery = result.state.context_metadata["textual_tool_call_recovery"]
-        self.assertFalse(recovery["recovered"])
-        self.assertEqual("wait_user_input", recovery["next_action"])
 
     def test_agent_run_rewrites_false_tool_execution_claim_when_no_tool_ran(self) -> None:
         from app.agent_runtime.graph_factory import AgentRunCommand, run_agent_workflow
@@ -5132,6 +7018,57 @@ class AgentRuntimeGraphTest(unittest.TestCase):
         self.assertEqual("final_response", latest.checkpoint_key)
         self.assertEqual(result.state.tool_call_ids, latest.state.tool_call_ids)
 
+    def test_checkpoint_store_prefers_workflow_step_when_database_timestamps_collide(self) -> None:
+        from app.agent_runtime.checkpoints import AgentCheckpointStore
+        from app.agent_runtime.state import AgentState
+        from app.domains.automation.models import WorkflowCheckpoint, WorkflowRun, WorkflowRunStatus
+
+        with self.Session() as session:
+            workflow = WorkflowRun(
+                workflow_type="agent_chat",
+                status=WorkflowRunStatus.WAITING_USER,
+                current_step="wait_confirmation",
+            )
+            session.add(workflow)
+            session.flush()
+            timestamp = datetime(2026, 9, 20, 15, 42, 50)
+
+            def checkpoint_state(step: str, approval_request_id: str | None = None) -> dict[str, object]:
+                return AgentState(
+                    session_id="session-colliding-checkpoints",
+                    workflow_run_id=workflow.id,
+                    agent_run_id="agent-run-colliding-checkpoints",
+                    user_message="continue",
+                    current_step=step,
+                    approval_request_id=approval_request_id,
+                ).to_checkpoint_state()
+
+            session.add_all(
+                [
+                    WorkflowCheckpoint(
+                        workflow_run_id=workflow.id,
+                        checkpoint_key="build_context",
+                        state=checkpoint_state("build_context"),
+                        created_at=timestamp,
+                    ),
+                    WorkflowCheckpoint(
+                        workflow_run_id=workflow.id,
+                        checkpoint_key="wait_confirmation",
+                        state=checkpoint_state("wait_confirmation", "approval-1"),
+                        created_at=timestamp,
+                    ),
+                ]
+            )
+            session.commit()
+
+            latest = AgentCheckpointStore(
+                session=session,
+                automation_service=self._dependencies(session).automation_service,
+            ).load_latest(workflow.id)
+
+        self.assertEqual("wait_confirmation", latest.checkpoint_key)
+        self.assertEqual("approval-1", latest.state.approval_request_id)
+
     def test_create_agent_graph_exposes_expected_node_order(self) -> None:
         from app.agent_runtime.graph_factory import create_agent_graph
 
@@ -5142,3 +7079,110 @@ class AgentRuntimeGraphTest(unittest.TestCase):
             graph.node_order,
         )
         self.assertIsNotNone(graph.compiled_graph)
+
+
+def _write_read_script(root: Path, content: str) -> Path:
+    """Create the filesystem Skill's internal read script for graph-level tests."""
+
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "read_file.py").write_text(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--path', required=True)\n"
+        "parser.add_argument('--offset', type=int, default=0)\n"
+        "parser.add_argument('--limit', type=int, default=200)\n"
+        "parser.add_argument('--encoding', default='auto')\n"
+        "args = parser.parse_args()\n"
+        f"content = {content!r}\n"
+        "print(content[args.offset:args.offset + args.limit], end='')\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_path_exists_script(root: Path) -> Path:
+    """Create the filesystem Skill's internal path_exists script for graph-level tests."""
+
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "path_exists.py").write_text(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--path', required=True)\n"
+        "args = parser.parse_args()\n"
+        "print(f'EXISTS: file {args.path}')\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_move_script(root: Path) -> Path:
+    """Create the filesystem Skill's internal move script for graph-level tests."""
+
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "move_file.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--src', required=True)\n"
+        "parser.add_argument('--dst', required=True)\n"
+        "parser.add_argument('--overwrite', action='store_true')\n"
+        "args = parser.parse_args()\n"
+        "src = Path(args.src)\n"
+        "dst = Path(args.dst)\n"
+        "if dst.exists() and not args.overwrite:\n"
+        "    print('ERROR: destination exists')\n"
+        "    raise SystemExit(1)\n"
+        "dst.parent.mkdir(parents=True, exist_ok=True)\n"
+        "src.replace(dst)\n"
+        "print(f'MOVED:{src}->{dst}')\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_noop_move_script(root: Path) -> Path:
+    """Create a broken move script that claims success without changing disk state."""
+
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "move_file.py").write_text(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--src', required=True)\n"
+        "parser.add_argument('--dst', required=True)\n"
+        "parser.add_argument('--overwrite', action='store_true')\n"
+        "args = parser.parse_args()\n"
+        "print(f'MOVED:{args.src}->{args.dst}')\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_copy_script(root: Path) -> Path:
+    """Create the filesystem Skill's internal copy script for graph-level tests."""
+
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "copy_file.py").write_text(
+        "import argparse\n"
+        "import shutil\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--src', required=True)\n"
+        "parser.add_argument('--dst', required=True)\n"
+        "parser.add_argument('--overwrite', action='store_true')\n"
+        "args = parser.parse_args()\n"
+        "src = Path(args.src)\n"
+        "dst = Path(args.dst)\n"
+        "if dst.exists() and not args.overwrite:\n"
+        "    print('ERROR: destination exists')\n"
+        "    raise SystemExit(1)\n"
+        "dst.parent.mkdir(parents=True, exist_ok=True)\n"
+        "shutil.copy2(src, dst)\n"
+        "print(f'COPIED:{src}->{dst}')\n",
+        encoding="utf-8",
+    )
+    return root

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -12,10 +12,12 @@ AgentIntent = Literal[
     "local_company_database_overview",
     "local_company_database_list",
     "local_job_source_overview",
+    "company_board_overview",
     "offerio_company_jobs_sync",
     "application_entry_discovery",
     "job_match_analysis",
     "resume_tailoring",
+    "filesystem_operation",
     "external_agent_task",
 ]
 
@@ -63,6 +65,13 @@ class IntentFrame(BaseModel):
     entities: EntityFrame = Field(default_factory=EntityFrame)
     candidate_intents: List[str] = Field(default_factory=list)
     reason: Optional[str] = None
+    # An explicit source constraint is a runtime contract. The runtime must
+    # use this capability or fail closed instead of choosing a substitute.
+    required_capability: Optional[str] = None
+    # Filesystem semantics are model-owned. Runtime only validates these
+    # fields and applies path, permission, approval, and postcheck rules.
+    filesystem_operation: Optional[str] = None
+    operation_intent: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("candidate_intents", mode="after")
     @classmethod

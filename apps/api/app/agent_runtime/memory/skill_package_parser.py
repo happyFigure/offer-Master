@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+import json
 from pathlib import Path
 import re
 from typing import Any
+
+from app.agent_runtime.memory.skill_action_catalog import build_skill_action_metadata
 
 
 GENERIC_DESCRIPTION_PATTERNS = {
@@ -68,6 +71,11 @@ class SkillPackageParser:
         disallowed_tools = string_list(frontmatter_value(frontmatter, "disallowed-tools", "disallowed_tools"))
         compatibility = string_list(frontmatter.get("compatibility"))
         resources = collect_resources(package_root)
+        action_metadata = build_skill_action_metadata(
+            package_root=package_root,
+            frontmatter=frontmatter,
+            resources=resources,
+        )
         description_quality = evaluate_description_quality(raw_description)
         blocking_errors = blocking_errors_for(raw_description)
         import_warnings = warnings_for(raw_description, description_quality)
@@ -88,6 +96,7 @@ class SkillPackageParser:
             "compatibility": compatibility,
             "license": str(frontmatter.get("license") or "").strip(),
             "resources": resources,
+            **action_metadata,
             "openai_agent_metadata": load_openai_agent_metadata(resources),
             "import_warnings": import_warnings,
             "blocking_errors": blocking_errors,
@@ -169,9 +178,15 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
 
 
 def parse_metadata_value(value: str) -> Any:
-    stripped = value.strip().strip('"\'')
-    if value.startswith("[") and value.endswith("]"):
-        return [item.strip().strip('"\'') for item in value[1:-1].split(",") if item.strip()]
+    raw = value.strip()
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    stripped = raw.strip('"\'')
+    if raw.startswith("[") and raw.endswith("]"):
+        return [item.strip().strip('"\'') for item in raw[1:-1].split(",") if item.strip()]
     if stripped.lower() == "true":
         return True
     if stripped.lower() == "false":

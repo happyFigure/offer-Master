@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import re
 from typing import Any
 
@@ -19,6 +20,9 @@ from app.domains.agent_memory.models import AgentSkillStatus, AgentSkillUsageEve
 from app.domains.agent_memory.repository import AgentMemoryRepository
 from app.domains.conversations.models import AgentContextSummary, AgentMessage, AgentMessageRole
 from app.domains.conversations.service import ConversationService
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,10 @@ class MemoryContextBuilder:
     ) -> BuiltContext:
         self._conversation_service.get_session(session_id)
         latest_summary = self._conversation_service.get_latest_summary(session_id)
-        recent_messages = self._recent_context_messages(session_id, config.max_recent_messages)
+        all_context_messages = self._all_context_messages(session_id)
+        recent_messages = all_context_messages
+        if config.max_recent_messages > 0:
+            recent_messages = recent_messages[-config.max_recent_messages:]
         hygiene_result = repair_tool_result_pairing(recent_messages)
         context_messages = hygiene_result.messages
         memory_recall_result = self._recall_relevant_memories(
@@ -148,6 +155,10 @@ class MemoryContextBuilder:
         skill_tool_permission_policy = AgentToolPermissionPolicy.from_loaded_skill_metadata(
             [(document.skill.id, document.skill.metadata_json) for document in skill_documents]
         ).to_metadata()
+        # Runtime state recovery is intentionally broader than the LLM window:
+        # a filename proposal may be several turns old, but it is still a
+        # resumable structured fact when it points at the current active file.
+        recent_runtime_context = _latest_runtime_context_metadata(all_context_messages)
 
         return BuiltContext(
             llm_messages=llm_messages,
@@ -184,6 +195,7 @@ class MemoryContextBuilder:
                 "max_skill_resource_chars": config.max_skill_resource_chars,
                 "max_loaded_memories": config.max_loaded_memories,
                 "max_memory_context_chars": config.max_memory_context_chars,
+                **recent_runtime_context,
             },
             loaded_session_history_ids=loaded_history_ids,
             loaded_memory_ids=loaded_memory_ids,
@@ -242,13 +254,16 @@ class MemoryContextBuilder:
             self._skill_repository.record_usage(document.skill.id, AgentSkillUsageEvent.USE)
         return matched_documents, matched_candidates, list(load_result.load_records)
 
-    def _recent_context_messages(self, session_id: str, max_recent_messages: int) -> list[AgentMessage]:
+    def _all_context_messages(self, session_id: str) -> list[AgentMessage]:
         messages = self._conversation_service.list_messages(session_id, limit=500)
-        context_messages = [
+        return [
             message
             for message in messages
             if not message.exclude_from_context and message.compacted_by_summary_id is None
         ]
+
+    def _recent_context_messages(self, session_id: str, max_recent_messages: int) -> list[AgentMessage]:
+        context_messages = self._all_context_messages(session_id)
         if max_recent_messages <= 0:
             return context_messages
         return context_messages[-max_recent_messages:]
@@ -291,6 +306,49 @@ def _memory_recall_trace_metadata(result: MemoryRecallResult) -> dict[str, Any]:
             for item in result.items
         ],
     }
+
+
+def _latest_runtime_context_metadata(messages: list[AgentMessage]) -> dict[str, Any]:
+    """Recover structured runtime state from recent assistant turns.
+
+    Recent chat text is useful for the LLM, but it is not precise enough to
+    resume a half-filled tool call. This keeps pending tool state structured
+    across ordinary follow-up messages.
+    """
+
+    recovered: dict[str, Any] = {}
+    for message in reversed(messages):
+        metadata = message.metadata_json if isinstance(message.metadata_json, dict) else {}
+        context_metadata = metadata.get("context_metadata") if isinstance(metadata.get("context_metadata"), dict) else {}
+        if not isinstance(context_metadata, dict):
+            continue
+        for key in (
+            "pending_operation",
+            "active_file",
+            "filesystem_operation",
+            "operation_intent",
+            "last_file_operation_result",
+            "resource_effects",
+            "active_resource",
+            "artifact_context",
+            "recent_file_paths",
+            "active_directory",
+            "recent_directory_paths",
+        ):
+            if key not in recovered and key in context_metadata:
+                recovered[key] = context_metadata[key]
+        if (
+            "pending_operation" in recovered
+            and "active_file" in recovered
+            and "last_file_operation_result" in recovered
+            and "resource_effects" in recovered
+            and "active_resource" in recovered
+        ):
+            break
+
+    if recovered:
+        logger.info("Recovered runtime context from recent assistant turns: keys=%s", sorted(recovered.keys()))
+    return recovered
 
 
 def _skill_candidate_selection_metadata(candidates: list[SkillCandidate]) -> dict[str, Any]:

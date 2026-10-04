@@ -83,6 +83,10 @@ class AgentContextBuilderTest(unittest.TestCase):
         self.assertIsNone(built.context_metadata["summary_id"])
         self.assertFalse(built.need_compaction)
 
+
+
+
+
     def test_build_with_latest_summary_adds_summary_context_block(self):
         from app.agent_runtime.memory.context_builder import ContextBuildConfig, MemoryContextBuilder
         from app.domains.conversations.models import AgentMessageRole
@@ -424,6 +428,54 @@ class AgentContextBuilderTest(unittest.TestCase):
                 for message in built.llm_messages
             )
         )
+
+    def test_build_recovers_generic_resource_effect_context_from_recent_assistant_turn(self):
+        from app.agent_runtime.memory.context_builder import ContextBuildConfig, MemoryContextBuilder
+        from app.domains.conversations.models import AgentMessageRole
+        from app.domains.conversations.schemas import AgentMessageCreate
+
+        effect = {
+            "source": "filesystem_result_context_v1",
+            "resource_type": "file",
+            "action": "created",
+            "operation": "copy_file",
+            "source_path": "C:/简历/resume.tex",
+            "target_path": "C:/简历/resume-1.tex",
+            "focus_path": "C:/简历/resume-1.tex",
+            "aliases": ["刚才复制的文件"],
+            "completed": True,
+        }
+
+        with self.Session() as session:
+            service = self._service(session)
+            conversation = service.create_session(title="资源效果恢复", primary_intent="agent_chat")
+            service.append_message(
+                conversation.id,
+                AgentMessageCreate(
+                    role=AgentMessageRole.ASSISTANT,
+                    content_text="复制完成。",
+                    visible_content_text="复制完成。",
+                    token_estimate=10,
+                    metadata_json={
+                        "context_metadata": {
+                            "resource_effects": [effect],
+                            "active_resource": effect,
+                            "artifact_context": {"active_artifact": effect, "created_artifacts": [effect]},
+                        }
+                    },
+                ),
+            )
+            session.commit()
+
+            built = MemoryContextBuilder(service).build(
+                conversation.id,
+                new_user_message="你刚才复制的文件给它起一个合适的名字",
+                config=ContextBuildConfig(max_recent_messages=10),
+            )
+
+        self.assertEqual([effect], built.context_metadata["resource_effects"])
+        self.assertEqual(effect, built.context_metadata["active_resource"])
+        self.assertEqual(effect, built.context_metadata["artifact_context"]["active_artifact"])
 
 
 if __name__ == "__main__":

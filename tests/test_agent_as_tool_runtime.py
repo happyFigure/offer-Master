@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -121,6 +122,43 @@ class AgentAsToolRuntimeTest(unittest.TestCase):
         self.assertTrue(registry.get("filesystem.replace_text").requires_confirmation)
         self.assertTrue(registry.get("filesystem.delete_path").requires_confirmation)
 
+    def test_runtime_blocks_legacy_filesystem_capability_and_redirects_to_skill(self) -> None:
+        from app.agent_runtime.agent_as_tool import (
+            TOOL_REGISTRY_EXECUTOR_ID,
+            AgentCapabilityRegistry,
+            AgentRuntime,
+            AgentRuntimeContext,
+            AgentTask,
+            ToolRegistryAgentExecutor,
+        )
+        from app.agent_runtime.tool_registry import AgentToolRegistry, create_filesystem_agent_tool_definitions
+
+        tool_registry = AgentToolRegistry(create_filesystem_agent_tool_definitions())
+        capability_registry = AgentCapabilityRegistry.from_tool_registry(
+            tool_registry,
+            default_executor_id=TOOL_REGISTRY_EXECUTOR_ID,
+        )
+        runtime = AgentRuntime(
+            registry=capability_registry,
+            executors={
+                TOOL_REGISTRY_EXECUTOR_ID: ToolRegistryAgentExecutor(tool_registry),
+            },
+        )
+
+        result = runtime.call(
+            AgentTask(
+                capability_id="filesystem.copy_file",
+                goal="复制本地简历文件",
+                input_payload={"src": "C:/tmp/resume.tex", "dst": "C:/tmp/resume-copy.tex"},
+            ),
+            AgentRuntimeContext(session_id="session-1", run_id="run-1", task_id="task-1"),
+        )
+
+        self.assertEqual("failed", result.status)
+        self.assertIn("skill.filesystem", result.summary)
+        self.assertEqual("LEGACY_FILESYSTEM_ROUTE_BLOCKED", result.raw_result["error_code"])
+        self.assertEqual("skill.filesystem", result.raw_result["redirect_capability"])
+
     def test_filesystem_read_file_tool_runs_packaged_script(self) -> None:
         from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
 
@@ -157,6 +195,41 @@ class AgentAsToolRuntimeTest(unittest.TestCase):
         self.assertIn("姓名：刘汉卿", result["result"]["content"])
         self.assertNotIn("�", result["result"]["content"])
         self.assertEqual(0, result["result"]["return_code"])
+
+    def test_filesystem_copy_tool_requires_model_submitted_destination(self) -> None:
+        from app.agent_runtime.tool_registry import create_filesystem_agent_tool_definitions
+
+        skill_root = PROJECT_ROOT / "docs" / "agent-skills" / "0539e315-2960-45bf-ae7c-1a7abc4e6755"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_file = root / "一下.tex"
+            destination_dir = root / "待投递简历"
+            source_file.write_text("resume", encoding="utf-8")
+            destination_dir.mkdir()
+
+            copy_file = next(
+                definition
+                for definition in create_filesystem_agent_tool_definitions(script_root=skill_root)
+                if definition.name == "filesystem.copy_file"
+            )
+            result = copy_file.handler(
+                None,
+                src=str(source_file),
+                operation_intent={
+                    "destination": {
+                        "kind": "directory",
+                        "path": str(destination_dir),
+                        "reference": "previous_turn_explicit_directory",
+                    },
+                    "name_policy": "auto_generate_copy_name",
+                    "user_delegated_name": True,
+                    "avoid_conflict": True,
+                },
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertIn("dst", str(result))
+            self.assertFalse((destination_dir / "一下-副本.tex").exists())
 
     def test_filesystem_write_tool_requires_runtime_confirmation(self) -> None:
         from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolNextAction, AgentToolRuntimeGuard

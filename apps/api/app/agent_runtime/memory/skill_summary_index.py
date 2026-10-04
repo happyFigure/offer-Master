@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.agent_runtime.memory.skill_action_catalog import action_details_from_metadata
 from app.agent_runtime.memory.skill_repository import SkillDocument
 
 
@@ -23,6 +24,8 @@ class SkillSummaryCard:
     pinned: bool
     auto_load_enabled: bool
     description_quality_score: int
+    actions_count: int
+    actions_preview: tuple[str, ...]
     version_hash: str
     summary_text: str
 
@@ -43,6 +46,8 @@ class SkillSummaryCard:
             "pinned": self.pinned,
             "auto_load_enabled": self.auto_load_enabled,
             "description_quality_score": self.description_quality_score,
+            "actions_count": self.actions_count,
+            "actions_preview": list(self.actions_preview),
             "version_hash": self.version_hash,
             "summary_text": self.summary_text,
         }
@@ -64,6 +69,13 @@ def build_skill_summary_card(document: SkillDocument) -> SkillSummaryCard:
     description_quality_score = _int_value(metadata.get("description_quality_score"))
     when_to_use = _extract_section(document.content, "何时使用") or str(metadata.get("when_to_use") or "").strip()
     auto_load_enabled = str(metadata.get("auto_trigger_state") or "").strip().lower() == "enabled"
+    action_details = action_details_from_metadata(metadata)
+    actions = tuple(_metadata_list(metadata.get("actions"))) or tuple(
+        str(detail.get("action") or "").strip()
+        for detail in action_details
+        if str(detail.get("action") or "").strip()
+    )
+    actions_preview = actions[:5]
 
     summary_text = _summary_text(
         title=skill.title,
@@ -77,6 +89,8 @@ def build_skill_summary_card(document: SkillDocument) -> SkillSummaryCard:
         disallowed_tools=disallowed_tools,
         risk_level=risk_level,
         auto_load_enabled=auto_load_enabled,
+        actions_count=len(actions),
+        actions_preview=actions_preview,
     )
 
     return SkillSummaryCard(
@@ -95,6 +109,8 @@ def build_skill_summary_card(document: SkillDocument) -> SkillSummaryCard:
         pinned=bool(skill.pinned),
         auto_load_enabled=auto_load_enabled,
         description_quality_score=description_quality_score,
+        actions_count=len(actions),
+        actions_preview=actions_preview,
         version_hash=document.version_hash,
         summary_text=summary_text,
     )
@@ -113,6 +129,8 @@ def _summary_text(
     disallowed_tools: tuple[str, ...],
     risk_level: str,
     auto_load_enabled: bool,
+    actions_count: int,
+    actions_preview: tuple[str, ...],
 ) -> str:
     lines = [
         f"技能：{title}（{name}）",
@@ -123,6 +141,9 @@ def _summary_text(
         lines.append(f"适用场景：{when_to_use}")
     if source_types:
         lines.append(f"来源类型：{', '.join(source_types)}")
+    if actions_count:
+        suffix = "" if actions_count <= len(actions_preview) else f" 等 {actions_count} 个"
+        lines.append(f"可用动作：{', '.join(actions_preview)}{suffix}")
     tool_boundary_parts: list[str] = []
     if allowed_tools:
         tool_boundary_parts.append(f"自动允许：{', '.join(allowed_tools)}")

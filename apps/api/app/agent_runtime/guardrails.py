@@ -19,6 +19,9 @@ from app.agent_runtime.tool_registry import (
     LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
     LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
     OFFERIO_COMPANY_JOBS_TOOL,
+    SKILL_LIST_ACTIONS_TOOL,
+    SKILL_LIST_TOOL,
+    SKILL_READ_TOOL,
     AgentToolDefinition,
     AgentToolRegistry,
     AgentToolRiskLevel,
@@ -52,6 +55,9 @@ LOW_RISK_RUNTIME_CAPABILITY_TOOLS = frozenset(
         LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL,
         LOCAL_JOB_SOURCE_OVERVIEW_TOOL,
         OFFERIO_COMPANY_JOBS_TOOL,
+        SKILL_LIST_TOOL,
+        SKILL_LIST_ACTIONS_TOOL,
+        SKILL_READ_TOOL,
         "resume.tailor",
     }
 )

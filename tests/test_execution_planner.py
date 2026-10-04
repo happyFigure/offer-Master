@@ -76,7 +76,7 @@ class ExecutionPlannerTest(unittest.TestCase):
         self.assertEqual({"query": "经纬恒润 校园招聘 官网", "max_results": 5}, action.arguments)
         self.assertIn("只能输出 JSON", llm.messages[0][0]["content"])
 
-    def test_execution_planner_blocks_capability_outside_context_pack(self) -> None:
+    def test_legacy_execution_planner_still_validates_an_explicit_context_pack(self) -> None:
         from app.agent_runtime.planning.execution_planner import HybridExecutionPlanner
 
         llm = FakePlannerLLM(
@@ -96,9 +96,14 @@ class ExecutionPlannerTest(unittest.TestCase):
             """
         )
 
+        context_pack = self._campus_search_context_pack()
+        # Ordinary Agent Chat no longer invokes this planner. Keep this unit
+        # test focused on its standalone compatibility contract by supplying
+        # the narrow pack that the old planner validator expects.
+        context_pack["allowed_capabilities"] = ["external.web_search"]
         plan = HybridExecutionPlanner(llm_client=llm).plan(
             user_message="查一下经纬恒润的校园招聘信息",
-            context_pack=self._campus_search_context_pack(),
+            context_pack=context_pack,
         )
 
         action = plan.primary_action()

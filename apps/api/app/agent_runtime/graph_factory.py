@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import warnings
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
@@ -16,10 +17,16 @@ except Exception:  # pragma: no cover - only relevant when langchain_core change
 
 warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning, module=r"langgraph\..*")
 
+logger = logging.getLogger(__name__)
+
 from app.agent_runtime.checkpoints import AgentCheckpointStore
 from app.agent_runtime.agent_as_tool import (
     AbilityAgent,
     AgentCapabilityDefinition,
+    AgentCapabilityRegistry,
+    FILESYSTEM_SKILL_CAPABILITY,
+    FILESYSTEM_SKILL_EXECUTOR_ID,
+    LEGACY_FILESYSTEM_CAPABILITIES,
     TOOL_REGISTRY_EXECUTOR_ID,
     AgentRuntime,
     AgentRuntimeContext,
@@ -31,7 +38,14 @@ from app.agent_runtime.agent_as_tool import (
 from app.agent_runtime.guardrails import AgentToolCallContext, AgentToolNextAction, AgentToolRuntimeGuard
 from app.agent_runtime.context.capability_catalog import CapabilityCatalog
 from app.agent_runtime.context.context_pack import ContextPack, ContextPackBuilder
+from app.agent_runtime.context.file_context import build_file_context_hints, extract_local_file_references
+from app.agent_runtime.context.file_result_context import promote_filesystem_result_context
+from app.agent_runtime.context.resource_effects import promote_contract_resource_effects_context, promote_declared_resource_effects_context
 from app.agent_runtime.durable_state.service import DurableStateNotFoundError
+from app.agent_runtime.goal.builder import build_goal_state
+from app.agent_runtime.goal.schemas import GoalState
+from app.agent_runtime.goal.validator import validate_goal_completion
+from app.agent_runtime.final_answer.synthesis import complete_tool_observation_final_answer
 from app.agent_runtime.loop_agent.react_strategy import BoundedReActPolicy
 from app.agent_runtime.loop_agent.schemas import (
     LoopAgentAction,
@@ -51,15 +65,31 @@ from app.agent_runtime.output_sanitizer import (
     false_tool_execution_claim_fallback_response,
     sanitize_agent_final_answer,
 )
+from app.agent_runtime.pending_operations import (
+    build_pending_operation_from_tool_input_completion,
+    clear_pending_operation,
+    with_pending_operation,
+)
 from app.agent_runtime.routing.result_envelope import build_result_envelope
 from app.agent_runtime.routing.runtime_guard import validate_route_decision
 from app.agent_runtime.routing.schemas import RouteDecision
+from app.agent_runtime.sdk_agents.approval_bridge import (
+    approval_request_create_from_waiting_payload,
+    is_sdk_agent_approval_payload,
+    sdk_agent_has_resumable_run_state,
+    sdk_agent_approval_payload_from_result,
+    sdk_agent_approval_rejected_response,
+    with_sdk_agent_approval_decision_metadata,
+    with_sdk_agent_approval_metadata,
+)
+from app.agent_runtime.sdk_agents.delegation_policy import SDK_AGENT_CHILD_MCP_PREFIXES
+from app.agent_runtime.skills.filesystem_executor import FilesystemSkillExecutor
+from app.agent_runtime.skills.filesystem_operation_catalog import FilesystemOperationSpec, get_filesystem_operation_spec
 from app.agent_runtime.state import AgentState
-from app.agent_runtime.tool_candidate_selector import ToolCandidateSelection, ToolCandidateSelector
+from app.agent_runtime.tool_candidate_selector import ToolCandidateSelection
 from app.agent_runtime.tool_input_completion import ToolInputCompletionResult, complete_tool_input
 from app.agent_runtime.tool_input import requested_sample_limit_from_text
 from app.agent_runtime.tool_permissions import AgentToolPermissionPolicy
-from app.agent_runtime.textual_tool_call_recovery import TextualToolCall, recover_textual_tool_call
 from app.agent_runtime.tool_result_envelope import build_tool_result_envelope
 from app.agent_runtime.tool_registry import (
     APPLICATION_FIND_APPLY_ENTRY_TOOL,
@@ -73,8 +103,8 @@ from app.agent_runtime.tool_registry import (
     AgentToolRegistry,
 )
 from app.agent_runtime.understanding.intent_detector import HybridIntentDetector
-from app.agent_runtime.understanding.schemas import IntentFrame
-from app.domains.automation.models import ApprovalRequest, ToolCallStatus, WorkflowRun, WorkflowRunStatus, utc_now
+from app.agent_runtime.understanding.schemas import EntityFrame, IntentFrame
+from app.domains.automation.models import ApprovalRequest, ApprovalRequestStatus, ToolCallStatus, WorkflowRun, WorkflowRunStatus, utc_now
 from app.domains.automation.schemas import ApprovalRequestCreate, ToolCallLogCreate, WorkflowRunCreate
 from app.domains.automation.service import AutomationService
 from app.domains.agent_memory.repository import AgentMemoryRepository
@@ -91,6 +121,10 @@ LOOP_RUNNER_STAGE_CONTEXT_METADATA_KEY = "loop_runner_stage_context"
 # Keep it bounded because repeated bad search rewrites can drift away from the user's intent.
 DEFAULT_REFLECTION_RETRY_BUDGET = 3
 MAX_REFLECTION_RETRY_BUDGET = 3
+RUNTIME_CAPABILITY_APPROVAL_METADATA_KEY = "runtime_capability_approval"
+RUNTIME_CAPABILITY_APPROVAL_ERROR_CODE = "RUNTIME_CAPABILITY_APPROVAL_REQUIRED"
+GOAL_STATE_METADATA_KEY = "goal_state"
+FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY = "filesystem_completion_contract"
 
 
 @dataclass(frozen=True)
@@ -120,6 +154,7 @@ class AgentGraphDependencies:
     durable_state_service: Any | None = None
     agent_executors: dict[str, AbilityAgent] = field(default_factory=dict)
     capability_executor_ids: dict[str, str] = field(default_factory=dict)
+    context_build_config: ContextBuildConfig = field(default_factory=ContextBuildConfig)
     event_sink: Callable[[dict[str, Any]], None] | None = None
 
     def with_registry(self, registry: AgentToolRegistry) -> AgentGraphDependencies:
@@ -150,6 +185,59 @@ class AgentGraphDependencies:
 class AgentWorkflowResult:
     workflow_run_id: str
     state: AgentState
+
+
+class StaleApprovalContinuationError(ValueError):
+    """Raised when a UI approval card no longer matches the workflow checkpoint.
+
+    Approval is a two-phase operation: the database approval row says what the
+    user clicked, while the workflow checkpoint says where the agent is paused.
+    Treating either side alone as truth can consume a stale UI card and leave the
+    frontend spinning, so continuation validates both sides before marking a
+    pending request approved or rejected.
+    """
+
+    error_code = "STALE_APPROVAL_REQUEST"
+
+    def __init__(
+        self,
+        *,
+        approval_request_id: str,
+        workflow_run_id: str,
+        reason: str,
+        approval_status: str | None = None,
+        workflow_status: str | None = None,
+        workflow_current_step: str | None = None,
+        workflow_approval_request_id: str | None = None,
+        checkpoint_current_step: str | None = None,
+        checkpoint_approval_request_id: str | None = None,
+    ) -> None:
+        self.approval_request_id = approval_request_id
+        self.workflow_run_id = workflow_run_id
+        self.reason = reason
+        self.approval_status = approval_status
+        self.workflow_status = workflow_status
+        self.workflow_current_step = workflow_current_step
+        self.workflow_approval_request_id = workflow_approval_request_id
+        self.checkpoint_current_step = checkpoint_current_step
+        self.checkpoint_approval_request_id = checkpoint_approval_request_id
+        self.message = "这个确认请求已经过期或任务状态已变化，请刷新会话后重新发起。"
+        super().__init__(self.message)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "message": self.message,
+            "reason": self.reason,
+            "approval_request_id": self.approval_request_id,
+            "workflow_run_id": self.workflow_run_id,
+            "approval_status": self.approval_status,
+            "workflow_status": self.workflow_status,
+            "workflow_current_step": self.workflow_current_step,
+            "workflow_approval_request_id": self.workflow_approval_request_id,
+            "checkpoint_current_step": self.checkpoint_current_step,
+            "checkpoint_approval_request_id": self.checkpoint_approval_request_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -187,6 +275,31 @@ def _state_is_waiting_for_user(state: AgentState) -> bool:
     return state.current_step in {"wait_confirmation", "wait_user_input"}
 
 
+def _approval_request_create_for_waiting_state(
+    workflow: WorkflowRun,
+    state: AgentState,
+    *,
+    fallback_action_type: str,
+    fallback_prompt: str,
+    fallback_payload: dict[str, Any],
+) -> ApprovalRequestCreate:
+    runtime_payload = _runtime_capability_approval_payload_from_state_metadata(state.context_metadata)
+    if runtime_payload is not None:
+        return ApprovalRequestCreate(
+            workflow_run_id=workflow.id,
+            action_type=str(runtime_payload.get("requested_tool_name") or fallback_action_type),
+            prompt=str(runtime_payload.get("user_message") or runtime_payload.get("reason") or fallback_prompt),
+            payload={**runtime_payload, "outer_approval_payload": dict(fallback_payload)},
+        )
+    return approval_request_create_from_waiting_payload(
+        workflow_run_id=workflow.id,
+        fallback_action_type=fallback_action_type,
+        fallback_prompt=fallback_prompt,
+        fallback_payload=fallback_payload,
+        state_metadata=state.context_metadata,
+    )
+
+
 def run_agent_workflow(
     command: AgentRunCommand,
     *,
@@ -202,14 +315,7 @@ def run_agent_workflow(
         return AgentWorkflowResult(workflow_run_id=prepared.workflow_run_id, state=prepared.state)
 
     final_response, response_mode = _generate_final_response(prepared.state, dependencies=dependencies)
-    prepared_state, final_response, response_mode = _maybe_recover_textual_tool_call_from_final_response(
-        prepared.state,
-        command=command,
-        workflow=prepared.workflow,
-        final_response=final_response,
-        response_mode=response_mode,
-        dependencies=dependencies,
-    )
+    prepared_state = prepared.state
     if _state_is_waiting_for_user(prepared_state):
         return AgentWorkflowResult(workflow_run_id=prepared.workflow_run_id, state=prepared_state)
     return finalize_agent_workflow_response(
@@ -263,27 +369,6 @@ def finalize_agent_workflow_response(
     workflow = dependencies.db_session.get(WorkflowRun, state.workflow_run_id)
     if workflow is None:
         raise ValueError(f"Workflow run not found: {state.workflow_run_id}")
-
-    state, final_response, response_mode = _maybe_recover_textual_tool_call_from_final_response(
-        state,
-        command=AgentRunCommand(
-            session_id=state.session_id,
-            user_message=state.user_message,
-            requested_tool_name=state.requested_tool_name,
-            source_type=state.source_type,
-            tool_input={},
-        ),
-        workflow=workflow,
-        final_response=final_response,
-        response_mode=response_mode,
-        dependencies=dependencies,
-    )
-    if _state_is_waiting_for_user(state):
-        state = state.with_updates(final_response=final_response, response_mode=response_mode)
-        workflow.status = WorkflowRunStatus.WAITING_USER
-        workflow.current_step = state.current_step
-        _save_step(workflow, state, dependencies)
-        return AgentWorkflowResult(workflow_run_id=workflow.id, state=state)
 
     state, final_response, response_mode = _sanitize_final_response_for_user(
         state,
@@ -352,195 +437,46 @@ def _sanitize_false_tool_execution_claim_for_user(
     }
     return state.with_updates(context_metadata=metadata), false_tool_execution_claim_fallback_response(), "false_tool_claim_fallback"
 
-
-def _maybe_recover_textual_tool_call_from_final_response(
-    state: AgentState,
-    *,
-    command: AgentRunCommand,
-    workflow: WorkflowRun,
-    final_response: str,
-    response_mode: str,
-    dependencies: AgentGraphDependencies,
-) -> tuple[AgentState, str, str]:
-    if state.tool_call_ids or state.current_step == "wait_confirmation":
-        return state, final_response, response_mode
-    textual_call = recover_textual_tool_call(final_response, registry=dependencies.registry)
-    if textual_call is None:
-        return state, final_response, response_mode
-    sanitized = sanitize_agent_final_answer(final_response)
-    mixed_text_discarded = bool(sanitized.content and not _final_response_is_only_textual_tool_call(final_response, textual_call))
-
-    recovered_command = AgentRunCommand(
-        session_id=state.session_id,
-        user_message=command.user_message,
-        requested_tool_name=textual_call.tool_name,
-        source_type="agent_chat",
-        user_confirmed=False,
-        tool_input=dict(textual_call.tool_input),
-    )
-    definition = dependencies.registry.get(textual_call.tool_name)
-    recovered_command, completed_tool_input, _completion = _complete_runtime_tool_command(
-        recovered_command,
-        state=state,
-        definition=definition,
-    )
-    _emit_runtime_tool_event(
-        dependencies,
-        "textual_tool_call_recovered",
-        state=state,
-        command=recovered_command,
-        tool_input=completed_tool_input,
-        status="running",
-        summary="模型把工具调用写成了普通文字，运行时已转换为真实工具调用流程。",
-    )
-    next_state = _execute_recovered_textual_tool_call(
-        state,
-        command=recovered_command,
-        textual_call=textual_call,
-        dependencies=dependencies,
-    )
-    if next_state.current_step == "wait_confirmation":
-        approval = dependencies.automation_service.request_user_approval(
-            ApprovalRequestCreate(
-                workflow_run_id=workflow.id,
-                action_type=textual_call.tool_name,
-                prompt=f"Confirm before running tool: {textual_call.tool_name}",
-                payload={
-                    "agent_run_id": next_state.agent_run_id,
-                    "source_type": "agent_chat",
-                    "requested_tool_name": textual_call.tool_name,
-                    "tool_input": _pending_runtime_tool_input(next_state) or recovered_command.tool_input,
-                    "guard_result": next_state.guard_result,
-                    "textual_tool_call_recovery": _textual_tool_call_recovery_metadata(
-                        textual_call,
-                        recovered=False,
-                        mixed_text_discarded=mixed_text_discarded,
-                    ),
-                },
-            )
-        ).approval
-        workflow.current_step = "wait_confirmation"
-        next_state = next_state.with_updates(
-            approval_request_id=approval.id,
-            context_metadata=_with_textual_tool_call_recovery_metadata(
-                next_state.context_metadata,
-                textual_call,
-                recovered=False,
-                next_action="wait_confirmation",
-                mixed_text_discarded=mixed_text_discarded,
-            ),
-        )
-        _save_step(workflow, next_state, dependencies)
-        return next_state, final_response, "textual_tool_call_wait_confirmation"
-
-    if next_state.current_step == "wait_user_input":
-        workflow.status = WorkflowRunStatus.WAITING_USER
-        workflow.current_step = "wait_user_input"
-        next_state = next_state.with_updates(
-            context_metadata=_with_textual_tool_call_recovery_metadata(
-                next_state.context_metadata,
-                textual_call,
-                recovered=False,
-                next_action="wait_user_input",
-                mixed_text_discarded=mixed_text_discarded,
-            ),
-        )
-        _save_step(workflow, next_state, dependencies)
-        return next_state, next_state.final_response or final_response, next_state.response_mode
-
-    if not next_state.tool_call_ids:
-        return next_state, final_response, response_mode
-
-    next_state = next_state.with_updates(
-        context_metadata=_with_textual_tool_call_recovery_metadata(
-            next_state.context_metadata,
-            textual_call,
-            recovered=True,
-            next_action="executed",
-            mixed_text_discarded=mixed_text_discarded,
-        )
-    )
-    next_response, next_mode = _generate_final_response(next_state, dependencies=dependencies)
-    return next_state, next_response, _textual_tool_call_recovery_response_mode(next_mode)
-
-
-def _execute_recovered_textual_tool_call(
-    state: AgentState,
-    *,
-    command: AgentRunCommand,
-    textual_call: TextualToolCall,
-    dependencies: AgentGraphDependencies,
-) -> AgentState:
-    return _maybe_tool_node(
-        state.with_updates(requested_tool_name=textual_call.tool_name, source_type="agent_chat"),
-        command=AgentRunCommand(
-            session_id=state.session_id,
-            user_message=command.user_message,
-            requested_tool_name=textual_call.tool_name,
-            source_type="agent_chat",
-            user_confirmed=False,
-            tool_input=dict(command.tool_input),
-        ),
-        dependencies=dependencies,
-    )
-
-
-def _with_textual_tool_call_recovery_metadata(
-    metadata: dict[str, Any],
-    textual_call: TextualToolCall,
-    *,
-    recovered: bool,
-    next_action: str,
-    mixed_text_discarded: bool = False,
-) -> dict[str, Any]:
-    return {
-        **metadata,
-        "textual_tool_call_recovery": _textual_tool_call_recovery_metadata(
-            textual_call,
-            recovered=recovered,
-            next_action=next_action,
-            mixed_text_discarded=mixed_text_discarded,
-        ),
-    }
-
-
-def _textual_tool_call_recovery_metadata(
-    textual_call: TextualToolCall,
-    *,
-    recovered: bool,
-    next_action: str | None = None,
-    mixed_text_discarded: bool = False,
-) -> dict[str, Any]:
-    payload = {
-        "recovered": recovered,
-        "tool_name": textual_call.tool_name,
-        "raw_tool_name": textual_call.raw_tool_name,
-        "tool_input_keys": sorted(str(key) for key in textual_call.tool_input.keys()),
-        "mixed_text_discarded": mixed_text_discarded,
-    }
-    if next_action is not None:
-        payload["next_action"] = next_action
-    return payload
-
-
-def _textual_tool_call_recovery_response_mode(response_mode: str) -> str:
-    if response_mode == "llm":
-        return "llm_textual_tool_call_recovery"
-    if response_mode.endswith("_textual_tool_call_recovery"):
-        return response_mode
-    return f"{response_mode}_textual_tool_call_recovery"
-
-
-def _final_response_is_only_textual_tool_call(content: str, textual_call: TextualToolCall) -> bool:
-    normalized = str(content or "").replace("\\_", "_").strip()
-    remaining = normalized.replace(textual_call.raw_content, "", 1).strip()
-    remaining_lines = [line.strip() for line in remaining.splitlines() if line.strip()]
-    return not remaining_lines or all(re.fullmatch(r"(?:\*\*)?OfferMaster\s+AI(?:\*\*)?[:：]?", line, re.IGNORECASE) for line in remaining_lines)
-
-
 def resume_agent_workflow(workflow_run_id: str, *, dependencies: AgentGraphDependencies) -> AgentWorkflowResult:
     snapshot = dependencies.checkpoint_store.load_latest(workflow_run_id)
     return AgentWorkflowResult(workflow_run_id=workflow_run_id, state=snapshot.state)
+
+
+def _enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
+def _ensure_approval_can_continue(approval: ApprovalRequest, snapshot, workflow: WorkflowRun) -> None:
+    approval_status = _enum_value(approval.status)
+    workflow_status = _enum_value(workflow.status)
+    checkpoint_approval_request_id = str(snapshot.state.approval_request_id or "") or None
+    workflow_approval_request_id = str(workflow.approval_request_id or "") or None
+
+    def raise_stale(reason: str) -> None:
+        raise StaleApprovalContinuationError(
+            approval_request_id=approval.id,
+            workflow_run_id=approval.workflow_run_id,
+            reason=reason,
+            approval_status=approval_status,
+            workflow_status=workflow_status,
+            workflow_current_step=workflow.current_step,
+            workflow_approval_request_id=workflow_approval_request_id,
+            checkpoint_current_step=snapshot.state.current_step,
+            checkpoint_approval_request_id=checkpoint_approval_request_id,
+        )
+
+    if approval_status != ApprovalRequestStatus.PENDING.value:
+        raise_stale("approval_request_not_pending")
+    if workflow_status != WorkflowRunStatus.WAITING_USER.value:
+        raise_stale("workflow_not_waiting_user")
+    if workflow.current_step != "wait_confirmation" or snapshot.state.current_step != "wait_confirmation":
+        raise_stale("workflow_not_wait_confirmation")
+    if workflow_approval_request_id != approval.id or checkpoint_approval_request_id != approval.id:
+        raise_stale("approval_request_id_mismatch")
 
 
 def continue_agent_workflow_after_approval(
@@ -557,22 +493,61 @@ def continue_agent_workflow_after_approval(
     if approval is None:
         raise ValueError(f"Approval request not found: {approval_request_id}")
 
-    approval = dependencies.automation_service.decide_approval(
-        approval_request_id,
-        approved=approved,
-        decision=decision_reason,
-    )
     snapshot = dependencies.checkpoint_store.load_latest(approval.workflow_run_id)
     workflow = dependencies.db_session.get(WorkflowRun, approval.workflow_run_id)
     if workflow is None:
         raise ValueError(f"Workflow run not found: {approval.workflow_run_id}")
 
+    _ensure_approval_can_continue(approval, snapshot, workflow)
+    approval = dependencies.automation_service.decide_approval(
+        approval_request_id,
+        approved=approved,
+        decision=decision_reason,
+    )
+
+    payload = approval.payload or {}
+    sdk_approval_payload = payload if is_sdk_agent_approval_payload(payload) else None
+
+    if sdk_approval_payload is not None and sdk_agent_has_resumable_run_state(sdk_approval_payload):
+        # Real SDK interruptions preserve RunState; resume the child agent instead of replaying its inner tool outside the SDK.
+        state = _resume_sdk_agent_after_approval(
+            snapshot.state,
+            workflow=workflow,
+            approval=approval,
+            approved=approved,
+            decision_reason=decision_reason,
+            sdk_approval_payload=sdk_approval_payload,
+            dependencies=dependencies,
+        )
+        _save_step(workflow, state, dependencies)
+        state = _finalize_execution_planner_after_approval(state, dependencies=dependencies)
+        state = _finalize_native_tool_loop_after_approval(state, dependencies=dependencies)
+        final_response, response_mode = _generate_final_response(state, dependencies=dependencies)
+        return finalize_agent_workflow_response(
+            state,
+            final_response=final_response,
+            response_mode=response_mode,
+            dependencies=dependencies,
+        )
+
     if not approved:
+        context_metadata = dict(snapshot.state.context_metadata)
+        final_response = "User rejected the pending tool call. The Agent stopped before executing the tool."
+        if sdk_approval_payload is not None:
+            # SDK sub-agent approvals carry the inner tool request; preserve that decision for audit.
+            context_metadata = with_sdk_agent_approval_decision_metadata(
+                context_metadata,
+                sdk_approval_payload,
+                approved=False,
+                decision_reason=decision_reason,
+            )
+            final_response = sdk_agent_approval_rejected_response(sdk_approval_payload, decision_reason=decision_reason)
         state = snapshot.state.with_updates(
             current_step="approval_rejected",
             approval_request_id=approval.id,
-            final_response="User rejected the pending tool call. The Agent stopped before executing the tool.",
+            final_response=final_response,
             response_mode="user_rejected",
+            context_metadata=context_metadata,
         )
         _record_skill_runtime_event(
             state,
@@ -586,21 +561,33 @@ def continue_agent_workflow_after_approval(
                 "decision_reason": decision_reason,
             },
         )
+        workflow.status = WorkflowRunStatus.CANCELED
+        workflow.current_step = state.current_step
+        workflow.completed_at = utc_now()
         _save_step(workflow, state, dependencies)
         return AgentWorkflowResult(workflow_run_id=workflow.id, state=state)
 
     if snapshot.state.current_step != "wait_confirmation":
         raise ValueError(f"Workflow is not waiting for user confirmation: {approval.workflow_run_id}")
 
-    payload = approval.payload or {}
     requested_tool_name = str(payload.get("requested_tool_name") or approval.action_type or snapshot.state.requested_tool_name or "")
     source_type = str(payload.get("source_type") or snapshot.state.source_type or "agent_chat")
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    context_metadata = _approval_continuation_context_metadata(snapshot.state.context_metadata, tool_input)
+    if sdk_approval_payload is not None:
+        # Resume from the SDK approval payload so approval executes only the requested inner tool once.
+        context_metadata = with_sdk_agent_approval_decision_metadata(
+            context_metadata,
+            sdk_approval_payload,
+            approved=True,
+            decision_reason=decision_reason,
+        )
     state = snapshot.state.with_updates(
         current_step="maybe_tool",
         approval_request_id=approval.id,
         requested_tool_name=requested_tool_name,
         source_type=source_type,
+        context_metadata=context_metadata,
     )
     state = _maybe_tool_node(
         state,
@@ -626,6 +613,350 @@ def continue_agent_workflow_after_approval(
     )
 
 
+_APPROVAL_CONTINUATION_CONTEXT_KEYS = (
+    GOAL_STATE_METADATA_KEY,
+    "active_file",
+    "active_directory",
+    "recent_directory_paths",
+    "filesystem_operation",
+    "operation_intent",
+    "pending_operation",
+    "resource_effects",
+    "active_resource",
+    "artifact_context",
+    "last_file_operation_result",
+    "context_pack",
+    "intent_frame",
+)
+
+
+def _approval_continuation_context_metadata(base_metadata: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(base_metadata)
+    tool_context = tool_input.get("context_metadata") if isinstance(tool_input.get("context_metadata"), dict) else None
+    if not isinstance(tool_context, dict):
+        return metadata
+    for key in _APPROVAL_CONTINUATION_CONTEXT_KEYS:
+        if key not in metadata and key in tool_context:
+            # Approval payloads are server-created checkpoints. Rehydrating only
+            # these intent/file frame keys prevents the confirmation round-trip
+            # from losing the exact user goal the tool result must satisfy.
+            metadata[key] = tool_context[key]
+    return metadata
+
+
+def _resume_sdk_agent_after_approval(
+    state: AgentState,
+    *,
+    workflow: WorkflowRun,
+    approval: ApprovalRequest,
+    approved: bool,
+    decision_reason: str | None,
+    sdk_approval_payload: dict[str, Any],
+    dependencies: AgentGraphDependencies,
+) -> AgentState:
+    outer_capability = str(sdk_approval_payload.get("outer_capability") or approval.action_type or state.requested_tool_name or "")
+    outer_tool_input = sdk_approval_payload.get("outer_tool_input") if isinstance(sdk_approval_payload.get("outer_tool_input"), dict) else {}
+    executor_id = str(sdk_approval_payload.get("executor_id") or _agent_runtime_executor_id(AgentRunCommand(state.session_id, state.user_message, outer_capability), dependencies=dependencies))
+    source_type = str(sdk_approval_payload.get("source_type") or state.source_type or "agent_chat")
+    command = AgentRunCommand(
+        session_id=state.session_id,
+        user_message=state.user_message,
+        requested_tool_name=outer_capability,
+        source_type=source_type,
+        user_confirmed=approved,
+        tool_input=dict(outer_tool_input),
+    )
+    context_metadata = with_sdk_agent_approval_decision_metadata(
+        state.context_metadata,
+        sdk_approval_payload,
+        approved=approved,
+        decision_reason=decision_reason,
+    )
+    state = state.with_updates(
+        current_step="maybe_tool",
+        approval_request_id=approval.id,
+        requested_tool_name=outer_capability,
+        source_type=source_type,
+        context_metadata=context_metadata,
+    )
+    durable_step_id = _begin_durable_tool_step(
+        state,
+        command=command,
+        dependencies=dependencies,
+        tool_input=dict(outer_tool_input),
+    )
+    guard_payload = {
+        "ok": True,
+        "error_code": None,
+        "reason": "SDK agent approval decision accepted.",
+        "user_message": None,
+        "next_action": "execute",
+        "retryable": False,
+        "error_details": {
+            "executor_id": executor_id,
+            "sdk_agent_approval_resume": True,
+            "approved": bool(approved),
+            "approval_request_id": approval.id,
+            "requested_tool_name": sdk_approval_payload.get("requested_tool_name"),
+        },
+        "cost": {},
+        "artifacts": {},
+    }
+    resume = _sdk_agent_resume_method(sdk_approval_payload, dependencies=dependencies)
+    if resume is None:
+        agent_result = StandardAgentResult(
+            status="failed",
+            summary="SDK approval payload has RunState, but no SDK executor can resume it.",
+            raw_result={"tool_name": outer_capability, "ok": False, "error_type": "SdkRunStateResumeUnavailable"},
+        )
+    else:
+        try:
+            agent_result = resume(
+                sdk_approval_payload,
+                approved=approved,
+                context=AgentRuntimeContext(
+                    session_id=state.session_id,
+                    run_id=state.workflow_run_id,
+                    task_id=f"{state.workflow_run_id}:sdk-resume-{len(state.tool_call_ids) + 1}",
+                    namespace=executor_id,
+                    permission_scope={
+                        "source_type": source_type,
+                        "user_confirmed": approved,
+                        "sdk_agent_approval_resume": True,
+                    },
+                    metadata={
+                        "agent_run_id": state.agent_run_id,
+                        "approval_request_id": approval.id,
+                        "decision_reason": decision_reason,
+                    },
+                    capability_id=outer_capability,
+                    event_sink=dependencies.event_sink,
+                ),
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary for external SDK adapters.
+            agent_result = StandardAgentResult(
+                status="failed",
+                summary=f"SDK RunState resume failed: {type(exc).__name__}: {exc}",
+                raw_result={"tool_name": outer_capability, "ok": False, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+
+    next_sdk_approval_payload = sdk_agent_approval_payload_from_result(
+        agent_result,
+        outer_capability=outer_capability,
+        outer_tool_input=dict(outer_tool_input),
+        executor_id=executor_id,
+    )
+    if next_sdk_approval_payload is not None:
+        return _pause_sdk_agent_resume_for_approval(
+            state,
+            workflow=workflow,
+            command=command,
+            agent_result=agent_result,
+            sdk_approval_payload=next_sdk_approval_payload,
+            context_metadata=context_metadata,
+            outer_tool_input=dict(outer_tool_input),
+            executor_id=executor_id,
+            durable_step_id=durable_step_id,
+            dependencies=dependencies,
+        )
+
+    result_payload = _jsonable(agent_result.raw_result)
+    if not result_payload:
+        result_payload = {"tool_name": outer_capability, "ok": agent_result.status != "failed", "result": {"summary": agent_result.summary}}
+    result_payload = _with_result_envelope(outer_capability, result_payload, state=state)
+    tool_ok = agent_result.status != "failed" and _tool_result_ok(result_payload)
+    tool_error = None if tool_ok else _tool_result_error(result_payload)
+    if tool_ok:
+        # A resumed SDK child agent may create files after user approval. Promote
+        # those declared effects into runtime context so follow-up turns can
+        # resolve phrases like "刚才生成的文件" without re-reading chat logs.
+        context_metadata = promote_contract_resource_effects_context(
+            context_metadata,
+            result_payload,
+            tool_input=dict(outer_tool_input),
+            semantic_profile=_semantic_profile_for_tool(dependencies.registry, outer_capability),
+        )
+        context_metadata = promote_declared_resource_effects_context(context_metadata, result_payload)
+        context_metadata = promote_filesystem_result_context(context_metadata, result_payload)
+    tool_call = dependencies.automation_service.record_tool_call(
+        ToolCallLogCreate(
+            workflow_run_id=state.workflow_run_id,
+            tool_name=outer_capability,
+            tool_group="agent",
+            status=ToolCallStatus.SUCCEEDED if tool_ok else ToolCallStatus.FAILED,
+            input_payload=dict(outer_tool_input),
+            output_payload={
+                "guard_result": guard_payload,
+                "execution": "sdk_agent_resume",
+                "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=executor_id),
+                "result": result_payload,
+                "sdk_agent_approval_decision": context_metadata.get("sdk_agent_approval_decision"),
+            },
+            error=tool_error,
+        )
+    )
+    _mark_durable_tool_step_completed(
+        durable_step_id,
+        state=state,
+        command=command,
+        tool_input=dict(outer_tool_input),
+        dependencies=dependencies,
+        succeeded=tool_ok,
+        tool_call_log_id=tool_call.id,
+        external_task_id=_extract_external_task_id(result_payload),
+        output_payload={
+            "guard_result": guard_payload,
+            "execution": "sdk_agent_resume",
+            "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=executor_id),
+            "result": result_payload,
+            "error": tool_error,
+        },
+    )
+    tool_messages = _append_tool_pair_messages(
+        state,
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        tool_name=outer_capability,
+        tool_input=dict(outer_tool_input),
+        status="succeeded" if tool_ok else "failed",
+        result=result_payload,
+        error=tool_error,
+    )
+    _record_skill_runtime_event(
+        state,
+        dependencies=dependencies,
+        event="tool_succeeded" if tool_ok else "tool_failed",
+        evidence=_tool_runtime_evidence(
+            state,
+            command=command,
+            tool_call_log_id=tool_call.id,
+            status="succeeded" if tool_ok else "failed",
+            guard_payload=guard_payload,
+            error=tool_error,
+        ),
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "tool_finished",
+        state=state,
+        command=command,
+        tool_input=dict(outer_tool_input),
+        tool_call_id=tool_call.id,
+        status="succeeded" if tool_ok else "failed",
+        summary=agent_result.summary,
+    )
+    return state.with_updates(
+        current_step="maybe_tool",
+        guard_result=guard_payload,
+        tool_call_ids=[*state.tool_call_ids, tool_call.id],
+        llm_messages=[*state.llm_messages, *tool_messages],
+        context_metadata=context_metadata,
+        final_response=agent_result.summary,
+        response_mode="sdk_agent_resume",
+    )
+
+
+def _pause_sdk_agent_resume_for_approval(
+    state: AgentState,
+    *,
+    workflow: WorkflowRun,
+    command: AgentRunCommand,
+    agent_result: StandardAgentResult,
+    sdk_approval_payload: dict[str, Any],
+    context_metadata: dict[str, Any],
+    outer_tool_input: dict[str, Any],
+    executor_id: str,
+    durable_step_id: str | None,
+    dependencies: AgentGraphDependencies,
+) -> AgentState:
+    guard_payload = sdk_approval_payload["guard_result"]
+    result_payload = _jsonable(agent_result.raw_result)
+    tool_error = f"{guard_payload.get('error_code')}: {guard_payload.get('reason')}"
+    tool_call = dependencies.automation_service.record_tool_call(
+        ToolCallLogCreate(
+            workflow_run_id=state.workflow_run_id,
+            tool_name=command.requested_tool_name or "",
+            tool_group="agent",
+            status=ToolCallStatus.BLOCKED,
+            input_payload=dict(outer_tool_input),
+            output_payload={
+                "guard_result": guard_payload,
+                "execution": "sdk_agent_resume_approval",
+                "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=executor_id),
+                "result": result_payload,
+                "sdk_agent_approval": sdk_approval_payload,
+            },
+            error=tool_error,
+        )
+    )
+    _mark_durable_tool_step_waiting_user(
+        durable_step_id,
+        state=state,
+        command=command,
+        tool_input=dict(outer_tool_input),
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        output_payload={
+            "guard_result": guard_payload,
+            "execution": "sdk_agent_resume_approval",
+            "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=executor_id),
+            "result": result_payload,
+            "error": tool_error,
+            "sdk_agent_approval": sdk_approval_payload,
+        },
+    )
+    tool_messages = _append_tool_pair_messages(
+        state,
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        tool_name=command.requested_tool_name or "",
+        tool_input=dict(outer_tool_input),
+        status="waiting_user",
+        result=result_payload,
+        error=tool_error,
+    )
+    waiting_metadata = with_sdk_agent_approval_metadata(context_metadata, sdk_approval_payload)
+    waiting_state = state.with_updates(
+        current_step="wait_confirmation",
+        guard_result=guard_payload,
+        tool_call_ids=[*state.tool_call_ids, tool_call.id],
+        llm_messages=[*state.llm_messages, *tool_messages],
+        context_metadata=waiting_metadata,
+        final_response=str(guard_payload.get("user_message") or guard_payload.get("reason") or agent_result.summary),
+        response_mode="sdk_agent_approval",
+    )
+    # A resumed SDK run can pause again; create a fresh approval tied to the inner request it just surfaced.
+    approval = dependencies.automation_service.request_user_approval(
+        _approval_request_create_for_waiting_state(
+            workflow,
+            waiting_state,
+            fallback_action_type=str(sdk_approval_payload.get("requested_tool_name") or command.requested_tool_name or "sdk_agent_tool_call"),
+            fallback_prompt=str(sdk_approval_payload.get("user_message") or sdk_approval_payload.get("reason") or "Confirm SDK agent tool call."),
+            fallback_payload={
+                "agent_run_id": waiting_state.agent_run_id,
+                "source_type": command.source_type,
+                "requested_tool_name": sdk_approval_payload.get("requested_tool_name") or command.requested_tool_name,
+                "tool_input": sdk_approval_payload.get("tool_input") if isinstance(sdk_approval_payload.get("tool_input"), dict) else {},
+                "guard_result": guard_payload,
+            },
+        )
+    ).approval
+    workflow.status = WorkflowRunStatus.WAITING_USER
+    workflow.current_step = "wait_confirmation"
+    return waiting_state.with_updates(approval_request_id=approval.id)
+
+
+def _sdk_agent_resume_method(
+    sdk_approval_payload: dict[str, Any],
+    *,
+    dependencies: AgentGraphDependencies,
+) -> Callable[..., StandardAgentResult] | None:
+    executor_id = str(sdk_approval_payload.get("executor_id") or "")
+    executor = dependencies.agent_executors.get(executor_id)
+    resume = getattr(executor, "resume_after_approval", None)
+    return resume if callable(resume) else None
+
+
 def _run_until_response_ready(
     state: AgentState,
     *,
@@ -634,6 +965,9 @@ def _run_until_response_ready(
     dependencies: AgentGraphDependencies,
     on_workflow_started: Callable[[WorkflowRun, AgentState], AgentState | None] | None = None,
 ) -> AgentPreparedResponse:
+    # Declared Agent capabilities must be present before ContextPack is built,
+    # otherwise normal_chat and unrelated intents cannot delegate to MCP agents.
+    dependencies = _dependencies_with_declared_agent_capability_tools(dependencies)
     state = _build_context_node(state, dependencies=dependencies)
     _record_durable_context_snapshots(state, dependencies=dependencies)
     _save_step(workflow, state, dependencies)
@@ -642,7 +976,6 @@ def _run_until_response_ready(
         if next_state is not None:
             state = next_state
 
-    route_decision: RouteDecision | None = None
     command = _auto_select_tool_command(command, state=state, registry=dependencies.registry)
     if command.requested_tool_name:
         state = state.with_updates(requested_tool_name=command.requested_tool_name, source_type=command.source_type)
@@ -650,15 +983,19 @@ def _run_until_response_ready(
     state = state.with_updates(current_step="plan_or_reply")
     _save_step(workflow, state, dependencies)
 
-    if not command.requested_tool_name and _route_allows_tool_choice_loop(route_decision):
+    if not command.requested_tool_name:
+        # The main Agent is the first semantic decision maker. It receives the
+        # server-loaded history and the complete source-eligible capability
+        # catalog, then submits a structured call when work is needed.
         state = _tool_choice_loop_node(state, dependencies=dependencies)
         if state.current_step == "wait_confirmation":
             approval = dependencies.automation_service.request_user_approval(
-                ApprovalRequestCreate(
-                    workflow_run_id=workflow.id,
-                    action_type=state.requested_tool_name or "tool_choice_call",
-                    prompt=f"Confirm before running tool: {state.requested_tool_name}",
-                    payload={
+                _approval_request_create_for_waiting_state(
+                    workflow,
+                    state,
+                    fallback_action_type=state.requested_tool_name or "tool_choice_call",
+                    fallback_prompt=f"Confirm before running tool: {state.requested_tool_name}",
+                    fallback_payload={
                         "agent_run_id": state.agent_run_id,
                         "source_type": state.source_type,
                         "requested_tool_name": state.requested_tool_name,
@@ -680,106 +1017,22 @@ def _run_until_response_ready(
             _save_step(workflow, state, dependencies)
             return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
 
-    if not command.requested_tool_name:
-        route_decision = _capability_routing_node(state, dependencies=dependencies)
-        if route_decision is not None:
-            state = state.with_updates(
-                context_metadata=_with_capability_routing_metadata(state.context_metadata, route_decision)
-            )
-            route_guard_result = _validate_capability_route_decision(
-                route_decision,
-                state=state,
-                dependencies=dependencies,
-            )
-            state = state.with_updates(
-                context_metadata={
-                    **state.context_metadata,
-                    "capability_routing_guard": route_guard_result,
-                }
-            )
-            if route_guard_result.get("blocked"):
-                state = state.with_updates(
-                    final_response=f"Capability route blocked: {route_guard_result.get('reason')}",
-                    response_mode="capability_route_blocked",
-                )
-            elif route_decision.route in {"ask_user", "block"}:
-                state = _finalize_non_executable_route_decision(state, route_decision)
-            if route_decision.capability and route_decision.route in {
-                "external_agent",
-                "local_tool",
-                "local_workflow",
-                "browser_executor",
-            } and not route_guard_result.get("blocked"):
-                command = replace(
-                    command,
-                    requested_tool_name=route_decision.capability,
-                    source_type="agent_chat",
-                    tool_input=dict(route_decision.tool_input),
-                )
-                state = state.with_updates(requested_tool_name=command.requested_tool_name, source_type=command.source_type)
-
-    if not command.requested_tool_name and _route_allows_execution_planner(route_decision):
-        state = _execution_planner_node(state, dependencies=dependencies)
-        if state.current_step == "wait_confirmation":
-            approval = dependencies.automation_service.request_user_approval(
-                ApprovalRequestCreate(
-                    workflow_run_id=workflow.id,
-                    action_type=state.requested_tool_name or "planner_tool_call",
-                    prompt=f"Confirm before running tool: {state.requested_tool_name}",
-                    payload={
-                        "agent_run_id": state.agent_run_id,
-                        "source_type": state.source_type,
-                        "requested_tool_name": state.requested_tool_name,
-                        "tool_input": _pending_runtime_tool_input(state),
-                        "guard_result": state.guard_result,
-                    },
-                )
-            ).approval
-            workflow.current_step = "wait_confirmation"
-            state = state.with_updates(approval_request_id=approval.id)
-            _save_step(workflow, state, dependencies)
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-        if state.final_response and _has_prepared_final_response(state):
-            _save_step(workflow, state, dependencies)
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-        if state.tool_call_ids or state.requested_tool_name:
-            _save_step(workflow, state, dependencies)
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-
-    if not command.requested_tool_name and _route_allows_native_tool_loop(route_decision):
-        state = _native_tool_loop_node(state, dependencies=dependencies)
-        if state.current_step == "wait_confirmation":
-            approval = dependencies.automation_service.request_user_approval(
-                ApprovalRequestCreate(
-                    workflow_run_id=workflow.id,
-                    action_type=state.requested_tool_name or "native_tool_call",
-                    prompt=f"Confirm before running tool: {state.requested_tool_name}",
-                    payload={
-                        "agent_run_id": state.agent_run_id,
-                        "source_type": state.source_type,
-                        "requested_tool_name": state.requested_tool_name,
-                        "tool_input": _pending_runtime_tool_input(state),
-                        "guard_result": state.guard_result,
-                    },
-                )
-            ).approval
-            workflow.current_step = "wait_confirmation"
-            state = state.with_updates(approval_request_id=approval.id)
-            _save_step(workflow, state, dependencies)
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-        if state.final_response and _has_prepared_final_response(state):
-            _save_step(workflow, state, dependencies)
-            return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
-
     if command.requested_tool_name:
         state = _maybe_tool_node(state, command=command, dependencies=dependencies)
+        if state.current_step == "maybe_tool":
+            state = _recover_explicit_tool_no_dead_end(
+                state,
+                command=command,
+                dependencies=dependencies,
+            )
         if state.current_step == "wait_confirmation":
             approval = dependencies.automation_service.request_user_approval(
-                ApprovalRequestCreate(
-                    workflow_run_id=workflow.id,
-                    action_type=command.requested_tool_name,
-                    prompt=f"Confirm before running tool: {command.requested_tool_name}",
-                    payload={
+                _approval_request_create_for_waiting_state(
+                    workflow,
+                    state,
+                    fallback_action_type=command.requested_tool_name or "tool_call",
+                    fallback_prompt=f"Confirm before running tool: {command.requested_tool_name}",
+                    fallback_payload={
                         "agent_run_id": state.agent_run_id,
                         "source_type": command.source_type,
                         "requested_tool_name": command.requested_tool_name,
@@ -815,6 +1068,268 @@ def _run_until_response_ready(
     return AgentPreparedResponse(workflow_run_id=workflow.id, workflow=workflow, state=state)
 
 
+def _recover_explicit_tool_no_dead_end(
+    state: AgentState,
+    *,
+    command: AgentRunCommand,
+    dependencies: AgentGraphDependencies,
+) -> AgentState:
+    """Continue an explicit capability call when its result exposes recovery work."""
+
+    requested_tool_name = str(state.requested_tool_name or command.requested_tool_name or "").strip()
+    if not requested_tool_name:
+        return state
+    original_input = _pending_runtime_tool_input(state) or dict(command.tool_input)
+    payload = _latest_tool_result_payload(state, requested_tool_name)
+    recovery_outcome = _no_dead_end_outcome_from_payload(payload)
+    logger.info(
+        "Explicit capability recovery inspection: capability=%s payload_keys=%s recovery_keys=%s current_step=%s",
+        requested_tool_name,
+        sorted(payload.keys()) if isinstance(payload, dict) else [],
+        sorted(recovery_outcome.keys()) if isinstance(recovery_outcome, dict) else [],
+        state.current_step,
+    )
+    if (
+        isinstance(recovery_outcome, dict)
+        and str(recovery_outcome.get("next_action") or "").strip() == "continue_model_loop"
+        and dependencies.llm_client is not None
+    ):
+        # A coarse capability call can legitimately fail because the model has
+        # not yet selected the inner filesystem operation or filename intent.
+        # Feed that structured observation into the same native tool loop so
+        # the model gets another decision turn; never infer the missing field
+        # from the user's prose here.
+        logger.info(
+            "Continuing model loop after recoverable explicit capability result: capability=%s error_code=%s",
+            requested_tool_name,
+            recovery_outcome.get("error_code"),
+        )
+        if (
+            requested_tool_name == FILESYSTEM_SKILL_CAPABILITY
+            and not str(original_input.get("operation") or "").strip()
+        ):
+            state = _arm_filesystem_write_follow_up_candidate(state, original_tool_input=original_input)
+        return _tool_choice_loop_node(
+            state,
+            dependencies=dependencies,
+            capabilities_override=(requested_tool_name,),
+        )
+    decision = _no_dead_end_recovery_decision_from_payload(requested_tool_name, original_input, payload)
+    if decision is None or decision.action != LoopAgentAction.CALL_TOOL:
+        return state
+
+    recovery_capability = str(decision.capability or requested_tool_name).strip()
+    recovery_input = dict(decision.tool_input or {})
+    recovery_state = _maybe_tool_node(
+        state.with_updates(requested_tool_name=recovery_capability, source_type="agent_chat"),
+        command=AgentRunCommand(
+            session_id=state.session_id,
+            user_message=state.user_message,
+            requested_tool_name=recovery_capability,
+            source_type="agent_chat",
+            user_confirmed=False,
+            tool_input=recovery_input,
+        ),
+        dependencies=dependencies,
+    )
+    if recovery_state.current_step in {"wait_confirmation", "wait_user_input"}:
+        return recovery_state
+
+    # Once read-before-write evidence is available, let the model choose the
+    # concrete destination through the bounded loop that preserves the actual
+    # tool observations in state.llm_messages. The separate candidate loop
+    # rebuilds messages from the user prompt and can otherwise answer from
+    # stale intent without issuing the required mutation call.
+    if recovery_state.tool_call_ids and dependencies.llm_client is not None:
+        recovery_state = _mark_filesystem_write_follow_up_contract(
+            recovery_state,
+            original_tool_input=original_input,
+            recovery_outcome=recovery_outcome,
+        )
+        return _tool_choice_loop_node(
+            recovery_state,
+            dependencies=dependencies,
+            capabilities_override=(recovery_capability,),
+        )
+    return recovery_state
+
+
+def _mark_filesystem_write_follow_up_contract(
+    state: AgentState,
+    *,
+    original_tool_input: dict[str, Any] | None = None,
+    recovery_outcome: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> AgentState:
+    """Persist a runtime-owned read-before-write continuation contract.
+
+    The contract is created only from structured runtime/tool evidence. It does
+    not parse the user's prose and it never supplies a filename or destination.
+    """
+
+    original_tool_input = original_tool_input if isinstance(original_tool_input, dict) else {}
+    recovery_outcome = recovery_outcome if isinstance(recovery_outcome, dict) else {}
+    payload = payload or _latest_tool_result_payload(state, FILESYSTEM_SKILL_CAPABILITY) or {}
+    operation = str(original_tool_input.get("operation") or "").strip()
+    read_operation = _filesystem_payload_operation(payload)
+    inferred_recovery = recovery_outcome or _no_dead_end_outcome_from_payload(payload) or {}
+    next_action = str(
+        recovery_outcome.get("next_action")
+        or inferred_recovery.get("next_action")
+        or ""
+    ).strip()
+
+    # A coarse filesystem capability can fail before the model selects the
+    # inner operation. Preserve that structured recovery signal immediately so
+    # the same native loop remains responsible for the later read and write.
+    # This uses only runtime-owned fields and never invents a filename or dst.
+    if (
+        not operation
+        and not read_operation
+        and next_action == "continue_model_loop"
+        and isinstance(inferred_recovery, dict)
+    ):
+        logger.info(
+            "Filesystem completion candidate armed after coarse operation recovery: error_code=%s source=%s",
+            inferred_recovery.get("error_code"),
+            original_tool_input.get("path") or original_tool_input.get("src"),
+        )
+        return _arm_filesystem_write_follow_up_candidate(state, original_tool_input=original_tool_input)
+    existing = state.context_metadata.get(FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY)
+    if (
+        read_operation == "read_file"
+        and _tool_result_ok(payload)
+        and isinstance(existing, dict)
+        and existing.get("requires_follow_up_after_read")
+        and not existing.get("awaiting_write")
+    ):
+        source_path = str(
+            existing.get("source_path")
+            or original_tool_input.get("src")
+            or original_tool_input.get("path")
+            or _filesystem_payload_argument(payload, "path")
+            or _filesystem_payload_argument(payload, "src")
+            or ""
+        ).strip()
+        contract = {
+            **existing,
+            "awaiting_write": True,
+            "requires_follow_up_after_read": False,
+            "source_path": source_path,
+            "source": "runtime_read_before_write",
+        }
+        logger.info("Filesystem completion contract upgraded after verified read: source=%s", source_path)
+        return state.with_updates(
+            context_metadata={
+                **state.context_metadata,
+                FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY: contract,
+            }
+        )
+    if read_operation in {"copy_file", "rename_file"} and _tool_result_ok(payload):
+        if not isinstance(existing, dict):
+            return state
+        logger.info(
+            "Filesystem completion contract cleared after verified mutation: operation=%s",
+            read_operation,
+        )
+        return state.with_updates(
+            context_metadata={
+                key: value
+                for key, value in state.context_metadata.items()
+                if key != FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY
+            }
+        )
+    if operation not in {"copy_file", "rename_file"} and next_action != "read_before_write":
+        return state
+    if read_operation != "read_file":
+        return state
+    if isinstance(existing, dict) and existing.get("awaiting_write"):
+        return state
+
+    source_path = str(
+        original_tool_input.get("src")
+        or original_tool_input.get("path")
+        or _filesystem_payload_argument(payload, "path")
+        or _filesystem_payload_argument(payload, "src")
+        or ""
+    ).strip()
+    contract = {
+        "awaiting_write": True,
+        "capability": FILESYSTEM_SKILL_CAPABILITY,
+        "source_path": source_path,
+        "operation_hint": operation if operation in {"copy_file", "rename_file"} else None,
+        "source": "runtime_read_before_write",
+    }
+    logger.info(
+        "Filesystem completion contract armed: source=%s operation_hint=%s next_action=%s",
+        source_path,
+        contract["operation_hint"],
+        next_action,
+    )
+    return state.with_updates(
+        context_metadata={
+            **state.context_metadata,
+            FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY: contract,
+        }
+    )
+
+
+def _arm_filesystem_write_follow_up_candidate(
+    state: AgentState,
+    *,
+    original_tool_input: dict[str, Any] | None = None,
+) -> AgentState:
+    """Remember a coarse filesystem recovery that must be followed through."""
+
+    existing = state.context_metadata.get(FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY)
+    if isinstance(existing, dict) and (existing.get("awaiting_write") or existing.get("requires_follow_up_after_read")):
+        return state
+    original_tool_input = original_tool_input if isinstance(original_tool_input, dict) else {}
+    source_path = str(original_tool_input.get("src") or original_tool_input.get("path") or "").strip()
+    contract = {
+        "awaiting_write": False,
+        "requires_follow_up_after_read": True,
+        "capability": FILESYSTEM_SKILL_CAPABILITY,
+        "source_path": source_path,
+        "source": "runtime_structured_operation_recovery",
+    }
+    logger.info("Filesystem write follow-up candidate armed: source=%s", source_path)
+    return state.with_updates(
+        context_metadata={
+            **state.context_metadata,
+            FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY: contract,
+        }
+    )
+
+
+def _filesystem_payload_operation(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[Any] = [payload.get("operation")]
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+    candidates.extend([result.get("operation"), nested.get("operation")])
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _filesystem_payload_argument(payload: dict[str, Any] | None, key: str) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+    for candidate in (payload, result, nested):
+        arguments = candidate.get("arguments") if isinstance(candidate, dict) else None
+        if isinstance(arguments, dict) and arguments.get(key):
+            return arguments.get(key)
+        if isinstance(candidate, dict) and candidate.get(key):
+            return candidate.get(key)
+    return None
+
+
 def _capability_routing_node(state: AgentState, *, dependencies: AgentGraphDependencies) -> RouteDecision | None:
     if dependencies.capability_routing_middleware is None:
         return None
@@ -844,7 +1359,14 @@ def _validate_capability_route_decision(
     context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
     if not isinstance(context_pack, dict):
         return {"ok": False, "blocked": True, "reason": "ContextPack is unavailable for capability routing."}
-    return validate_route_decision(decision, context_pack=context_pack, registry=dependencies.registry).to_metadata_dict()
+    # Route decisions can target high-level runtime capabilities such as
+    # skill.filesystem, not just legacy ToolRegistry entries. Validate against
+    # the same capability registry used by actual runtime execution.
+    return validate_route_decision(
+        decision,
+        context_pack=context_pack,
+        registry=_runtime_capability_registry(dependencies),
+    ).to_metadata_dict()
 
 
 def _finalize_non_executable_route_decision(state: AgentState, decision: RouteDecision) -> AgentState:
@@ -887,12 +1409,61 @@ def _route_allows_tool_choice_loop(decision: RouteDecision | None) -> bool:
     return decision.route == "native_tool_loop"
 
 
-def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDependencies) -> AgentState:
+def _should_offer_tool_choice_before_specialized_routing(state: AgentState) -> bool:
+    """Let confident specialist intents reach their route before broad tool selection.
+
+    Filesystem stays in the model loop because its inner operation is model-owned;
+    other confident intents already have a dedicated planner/runtime route. Generic
+    or uncertain requests still offer always-available child Agents to the model.
+    """
+    metadata = state.context_metadata if isinstance(state.context_metadata, dict) else {}
+    intent_frame = metadata.get("intent_frame") if isinstance(metadata.get("intent_frame"), dict) else {}
+    context_pack = metadata.get("context_pack") if isinstance(metadata.get("context_pack"), dict) else {}
+    # An explicit capability is a runtime contract, not a suggestion for the
+    # broad model tool chooser. Let the capability router handle it first;
+    # otherwise a model-selected Chrome/DB tool can steal the request before
+    # the required DBX fail-closed check runs.
+    if str(intent_frame.get("required_capability") or context_pack.get("required_capability") or "").strip():
+        return False
+    intent = str(intent_frame.get("intent") or "normal_chat")
+    try:
+        confidence = float(intent_frame.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return intent in {"normal_chat", "filesystem_operation"} or confidence < 0.75
+
+
+def _tool_choice_loop_node(
+    state: AgentState,
+    *,
+    dependencies: AgentGraphDependencies,
+    capabilities_override: tuple[str, ...] | None = None,
+) -> AgentState:
     runtime_dependencies = _dependencies_with_declared_agent_capability_tools(dependencies)
+    capability_registry = _runtime_capability_registry(runtime_dependencies)
     selection = _tool_choice_loop_candidate_selection(state, dependencies=runtime_dependencies)
-    capabilities = selection.capabilities
+    selection_metadata = selection.to_metadata_dict()
+    state = state.with_updates(
+        context_metadata=_with_runtime_decision_trace(
+            state.context_metadata,
+            "tool_candidate_selection",
+            selection_metadata,
+        )
+    )
+    capabilities = tuple(capabilities_override or selection.capabilities)
     if not capabilities:
         return state
+
+    # A recovered coarse filesystem call has already proven that this loop is
+    # continuing an incomplete delegated filesystem task. Preserve that fact
+    # before the model chooses read_file, so a read observation cannot be
+    # mistaken for final completion.
+    if (
+        capabilities_override == (FILESYSTEM_SKILL_CAPABILITY,)
+        and state.tool_call_ids
+        and not isinstance(state.context_metadata.get(FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY), dict)
+    ):
+        state = _arm_filesystem_write_follow_up_candidate(state)
 
     state_holder = {"state": state}
     _emit_tool_choice_candidate_event(runtime_dependencies, state=state, selection=selection)
@@ -940,6 +1511,15 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
             )
 
         payload = _latest_tool_result_payload(next_state, requested_tool_name)
+        if requested_tool_name == FILESYSTEM_SKILL_CAPABILITY:
+            recovery_outcome = _no_dead_end_outcome_from_payload(payload)
+            next_state = _mark_filesystem_write_follow_up_contract(
+                next_state,
+                original_tool_input=tool_input,
+                recovery_outcome=recovery_outcome,
+                payload=payload,
+            )
+            state_holder["state"] = next_state
         reflection = None
         if requested_tool_name == EXTERNAL_WEB_SEARCH_TOOL:
             reflection = _loop_agent_reflection_metadata(
@@ -951,6 +1531,26 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                 attempt_index=before_tool_call_count + 1,
             )
         observation_metadata: dict[str, Any] = {"tool_input": tool_input}
+        if isinstance(payload, dict):
+            # Preserve runtime-owned recovery signals for the next model turn.
+            # The router and executor may know that a failure is recoverable,
+            # but the loop controller can only continue when that fact crosses
+            # the tool-observation boundary without semantic reinterpretation.
+            # Preserve runtime-owned recovery signals through every result
+            # envelope. The coarse filesystem entry can fail first with a
+            # structured "operation required" result, then the model may
+            # choose read_file; the completion guard needs both observations
+            # in the same native loop to prevent an early prose answer.
+            for key in ("error_code", "recoverable", "retryable", "next_action", "missing_information", "missing_args"):
+                value = _first_nested_runtime_field(payload, key)
+                if value is not None:
+                    observation_metadata[key] = value
+            recovery_outcome = _no_dead_end_outcome_from_payload(payload)
+            if isinstance(recovery_outcome, dict):
+                observation_metadata["recovery_outcome"] = dict(recovery_outcome)
+        goal_validation = _goal_validation_from_payload(payload)
+        if goal_validation is not None:
+            observation_metadata["goal_validation"] = goal_validation
         if reflection is not None:
             observation_metadata["reflection"] = reflection
         retry_input = _reflection_retry_input_from_metadata(
@@ -959,8 +1559,14 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
             requested_tool_name=requested_tool_name,
             dependencies=runtime_dependencies,
         )
-        suggested_next_decision = None
-        if retry_input is not None:
+        # A filesystem Skill can return a concrete read-before-write recovery
+        # signal while goal validation still describes the incomplete mutation
+        # as "ask_user". Prefer the executable recovery route so the runtime
+        # can gather the missing evidence before asking the user again.
+        suggested_next_decision = _no_dead_end_recovery_decision_from_payload(requested_tool_name, tool_input, payload)
+        if suggested_next_decision is None:
+            suggested_next_decision = _goal_recovery_decision_from_validation(requested_tool_name, tool_input, payload)
+        if suggested_next_decision is None and retry_input is not None:
             suggested_next_decision = LoopAgentDecision(
                 action=LoopAgentAction.CALL_TOOL,
                 capability=requested_tool_name,
@@ -979,8 +1585,19 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
 
     try:
         stage_context = _loop_runner_stage_context_from_state(state)
+        loop_context = {
+            "mode": "model_selected_tool",
+            "candidate_selection": selection.to_metadata_dict(),
+            **_tool_choice_loop_context_hints(state),
+        }
+        completion_contract = state.context_metadata.get(FILESYSTEM_COMPLETION_CONTRACT_METADATA_KEY)
+        if isinstance(completion_contract, dict) and (
+            completion_contract.get("awaiting_write")
+            or completion_contract.get("requires_follow_up_after_read")
+        ):
+            loop_context["filesystem_completion_contract"] = dict(completion_contract)
         result = ToolChoiceLoopRunner(
-            registry=runtime_dependencies.registry,
+            registry=capability_registry,
             llm_client=runtime_dependencies.llm_client,
             db_session=runtime_dependencies.db_session,
             execute_tool=execute_tool,
@@ -989,14 +1606,10 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
                 user_message=state.user_message,
                 available_capabilities=tuple(capabilities),
                 source_type="agent_chat",
-                context={
-                    "mode": "model_selected_tool",
-                    "candidate_selection": selection.to_metadata_dict(),
-                    **_tool_choice_loop_context_hints(state),
-                },
+                context=loop_context,
                 stage_context=stage_context,
             ),
-            max_steps=_tool_choice_loop_max_steps(stage_context),
+            max_steps=_tool_choice_loop_max_steps(stage_context, capabilities=capabilities),
             session_id=state.session_id,
             task_id=state.workflow_run_id,
             run_id=state.agent_run_id,
@@ -1007,16 +1620,39 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
             ),
         )
     except (AttributeError, TypeError):
+        logger.exception(
+            "Tool choice loop aborted due to runtime integration error: capability_override=%s state_step=%s",
+            capabilities_override,
+            state.current_step,
+        )
         return state
 
     state = state_holder["state"]
     metadata = {
         **state.context_metadata,
-        "tool_candidate_selection": selection.to_metadata_dict(),
+        "tool_candidate_selection": selection_metadata,
         "tool_choice_loop": result.to_metadata_dict(),
     }
     if result.stop_reason == LoopAgentStopReason.WAITING_USER:
-        return state.with_updates(context_metadata=metadata)
+        pending = result.pending_decision.to_metadata_dict() if result.pending_decision else {}
+        pending_decision = result.pending_decision
+        preserved_waiting_step = state.current_step if state.current_step in {"wait_confirmation", "wait_user_input"} else None
+        if preserved_waiting_step == "wait_confirmation":
+            return state.with_updates(context_metadata=metadata)
+        return state.with_updates(
+            current_step="wait_user_input",
+            guard_result={
+                "ok": False,
+                "error_code": "RUNTIME_COMPLETION_GUARD",
+                "reason": str(pending_decision.reason if pending_decision else "文件任务尚未完成。"),
+                "user_message": str(pending_decision.message if pending_decision else "文件任务尚未完成，请继续提交结构化文件操作。"),
+                "next_action": "wait_user_input",
+                "retryable": True,
+                "pending_decision": pending,
+            },
+            response_mode="runtime_completion_guard",
+            context_metadata=metadata,
+        )
     if result.final_answer:
         return state.with_updates(
             final_response=result.final_answer,
@@ -1026,6 +1662,27 @@ def _tool_choice_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
     return state.with_updates(context_metadata=metadata)
 
 
+def _first_nested_runtime_field(payload: dict[str, Any] | None, key: str) -> Any | None:
+    """Find one runtime-owned field without interpreting user prose."""
+
+    if not isinstance(payload, dict):
+        return None
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if not isinstance(current, dict) or id(current) in visited:
+            continue
+        visited.add(id(current))
+        if key in current and current[key] is not None:
+            return current[key]
+        for child_key in ("result", "raw_result", "result_envelope", "error_details", "output_payload"):
+            child = current.get(child_key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return None
+
+
 def _loop_runner_stage_context_from_state(state: AgentState) -> dict[str, Any] | None:
     if not isinstance(state.context_metadata, dict):
         return None
@@ -1033,13 +1690,21 @@ def _loop_runner_stage_context_from_state(state: AgentState) -> dict[str, Any] |
     return dict(value) if isinstance(value, dict) and value else None
 
 
-def _tool_choice_loop_max_steps(stage_context: dict[str, Any] | None) -> int:
+def _tool_choice_loop_max_steps(stage_context: dict[str, Any] | None, *, capabilities: tuple[str, ...] = ()) -> int:
     if not isinstance(stage_context, dict) or not stage_context:
-        return 2
-    stage_plan = stage_context.get("stage_plan")
-    if not isinstance(stage_plan, list) or not stage_plan:
-        return 2
-    return max(2, min(6, len(stage_plan) + 1))
+        base_steps = 2
+    else:
+        stage_plan = stage_context.get("stage_plan")
+        if not isinstance(stage_plan, list) or not stage_plan:
+            base_steps = 2
+        else:
+            base_steps = max(2, min(6, len(stage_plan) + 1))
+    if FILESYSTEM_SKILL_CAPABILITY in capabilities:
+        # A filesystem task may need: recover missing operation -> read source
+        # -> model selects name/destination -> approval. Keep this bounded but
+        # large enough that a prose-only model turn cannot consume the budget.
+        return max(base_steps, 6)
+    return base_steps
 
 
 def _emit_tool_choice_candidate_event(
@@ -1124,6 +1789,7 @@ def format_runtime_capability_name(capability: str | None) -> str:
         LOCAL_JOB_SOURCE_OVERVIEW_TOOL: "岗位来源概览",
         OFFERIO_COMPANY_JOBS_TOOL: "OfferIO 岗位同步",
         APPLICATION_FIND_APPLY_ENTRY_TOOL: "申请入口发现",
+        FILESYSTEM_SKILL_CAPABILITY: "文件系统 Skill",
         "filesystem.list_dir": "查看目录",
         "filesystem.path_exists": "检查路径是否存在",
         "filesystem.path_stat": "查看文件信息",
@@ -1154,20 +1820,48 @@ def _tool_choice_loop_candidate_selection(
 ) -> ToolCandidateSelection:
     if dependencies.llm_client is None or dependencies.db_session is None:
         return ToolCandidateSelection()
-    context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
-    allowed_capabilities = context_pack.get("allowed_capabilities") if isinstance(context_pack, dict) else None
-    if isinstance(allowed_capabilities, list) and allowed_capabilities:
-        return ToolCandidateSelection()
-    capability_registry = create_default_agent_capability_registry(
-        tool_registry=dependencies.registry,
-        executor_id_by_capability=dependencies.capability_executor_ids,
+    # The complete source-eligible catalog is intentionally offered to the
+    # model. Keyword selection here used to make a second semantic decision
+    # before the model saw the conversation history. Runtime validation still
+    # decides whether a submitted call may execute.
+    capability_registry = _runtime_capability_registry(dependencies)
+    capabilities = model_capability_catalog_for_agent_chat(capability_registry)
+    return ToolCandidateSelection(
+        capabilities=capabilities,
+        signals=("model_driven_capability_catalog",),
+        reasons={
+            capability: "registered agent_chat capability; model decides whether it is relevant"
+            for capability in capabilities
+        },
     )
-    selection_text = _tool_choice_loop_selection_text(state)
-    return ToolCandidateSelector(capability_registry).select(
-        selection_text,
-        source_type="agent_chat",
-        auto_executable_only=False,
-    )
+
+
+def model_capability_catalog_for_agent_chat(registry: Any) -> tuple[str, ...]:
+    """Build the main Agent's source-eligible capability directory.
+
+    This is deliberately independent of the current user sentence. Internal
+    child-agent MCP tools and legacy fine-grained filesystem tools are runtime
+    implementation details, so only the high-level child capability or Skill
+    is visible to the main model.
+    """
+
+    capabilities: list[str] = []
+    for definition in registry.list_definitions():
+        capability = str(
+            getattr(definition, "capability_id", None)
+            or getattr(definition, "name", "")
+        ).strip()
+        if not capability or capability in LEGACY_FILESYSTEM_CAPABILITIES:
+            continue
+        if capability.startswith(SDK_AGENT_CHILD_MCP_PREFIXES):
+            continue
+        if not bool(getattr(definition, "enabled", True)):
+            continue
+        allowed_source_types = frozenset(getattr(definition, "allowed_source_types", ()) or ())
+        if allowed_source_types and "agent_chat" not in allowed_source_types:
+            continue
+        capabilities.append(capability)
+    return tuple(sorted(set(capabilities)))
 
 
 _LOCAL_FILE_REFERENCE_RE = re.compile(
@@ -1187,18 +1881,48 @@ def _tool_choice_loop_selection_text(state: AgentState) -> str:
 
 
 def _tool_choice_loop_context_hints(state: AgentState) -> dict[str, Any]:
-    if not _should_reuse_recent_context_for_tool_choice(str(state.user_message or "")):
+    hints: dict[str, Any] = {}
+    if _should_reuse_recent_context_for_tool_choice(str(state.user_message or "")):
+        recent_context = _recent_user_context_for_tool_choice(state)
+        file_context_hints = build_file_context_hints(
+            user_message=str(state.user_message or ""),
+            recent_user_context=recent_context,
+            context=state.context_metadata,
+        )
+        recent_paths = _extract_local_file_references(recent_context)
+        if recent_context or recent_paths:
+            hints.update(
+                {
+                    "recent_user_context": recent_context,
+                    "context_usage_hint": "如果当前用户用这个、它、刚才、继续等省略说法，要先复用最近用户消息里的对象、路径和约束，再判断是否调用工具。",
+                    **file_context_hints,
+                }
+            )
+            if recent_paths:
+                hints["recent_file_paths"] = recent_paths
+
+    # When a runtime recovery step has just read or inspected a file, preserve
+    # that observation in the next model decision. Without it, a fresh
+    # candidate loop only sees the original user wording and can hallucinate a
+    # completed rename instead of submitting a concrete, approvable target.
+    tool_observations: list[str] = []
+    for message in state.llm_messages or []:
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        role = str(message.get("role") or "")
+        tool_status = str(metadata.get("tool_status") or "").strip()
+        is_tool_observation = role == "tool" or (
+            metadata.get("source") == "tool_transcript"
+            and tool_status in {"succeeded", "failed", "waiting_user", "blocked"}
+        )
+        if is_tool_observation:
+            tool_observations.append(content)
+    if tool_observations:
+        hints["tool_observations"] = "\n\n".join(tool_observations[-4:])[-6000:]
+    if not hints:
         return {}
-    recent_context = _recent_user_context_for_tool_choice(state)
-    recent_paths = _extract_local_file_references(recent_context)
-    if not recent_context and not recent_paths:
-        return {}
-    hints = {
-        "recent_user_context": recent_context,
-        "context_usage_hint": "如果当前用户用这个、它、刚才、继续等省略说法，要先复用最近用户消息里的对象、路径和约束，再判断是否调用工具。",
-    }
-    if recent_paths:
-        hints["recent_file_paths"] = recent_paths
     return hints
 
 
@@ -1219,10 +1943,31 @@ def _recent_user_context_for_tool_choice(state: AgentState, *, limit: int = 4, m
     return context[-max_chars:]
 
 
+def _recent_user_context_from_messages(
+    llm_messages: list[dict[str, Any]],
+    *,
+    current_user_message: str,
+    limit: int = 4,
+    max_chars: int = 1600,
+) -> str:
+    messages: list[str] = []
+    for message in reversed(llm_messages or []):
+        if str(message.get("role") or "") != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content or content == current_user_message:
+            continue
+        messages.append(content)
+        if len(messages) >= limit:
+            break
+    context = "\n".join(reversed(messages))
+    if len(context) <= max_chars:
+        return context
+    return context[-max_chars:]
+
+
 def _extract_local_file_references(text: str) -> list[str]:
-    if not text:
-        return []
-    return _dedupe_tool_choice_strings(match.group(0).strip() for match in _LOCAL_FILE_REFERENCE_RE.finditer(text))
+    return extract_local_file_references(text)
 
 
 def _dedupe_tool_choice_strings(values) -> list[str]:
@@ -1270,7 +2015,7 @@ def _looks_like_contextual_entity_tool_followup(text: str) -> bool:
 def _looks_like_contextual_file_operation(text: str) -> bool:
     if not text:
         return False
-    file_markers = ("文件", "内容", "简历", "resume", "tex", "md", "这个", "这份", "它", "上面", "刚才")
+    file_markers = ("文件", "文件名", "文件名称", "名字", "名称", "内容", "简历", "resume", "tex", "md", "这个", "这份", "它", "上面", "刚才")
     action_markers = (
         "读取",
         "读一下",
@@ -1352,6 +2097,184 @@ def _agent_tool_risk_level(value: Any) -> AgentToolRiskLevel:
         return AgentToolRiskLevel.MEDIUM
 
 
+def _runtime_capability_executor_ids(dependencies: AgentGraphDependencies) -> dict[str, str]:
+    executor_ids = dict(dependencies.capability_executor_ids)
+    # Filesystem Skill is a main-runtime capability. Even when an SDK child
+    # advertises a coarse filesystem capability, local file operations must
+    # stay on the main runtime so path checks, approval, scripts and postchecks
+    # all run against the real filesystem instead of a child sandbox artifact.
+    executor_ids[FILESYSTEM_SKILL_CAPABILITY] = FILESYSTEM_SKILL_EXECUTOR_ID
+    for executor_id, agent in dependencies.agent_executors.items():
+        for capability in _declared_agent_capabilities(agent):
+            executor_ids.setdefault(capability.capability_id, str(executor_id))
+    return executor_ids
+
+
+def _runtime_agent_executors(dependencies: AgentGraphDependencies) -> dict[str, AbilityAgent]:
+    return {
+        FILESYSTEM_SKILL_EXECUTOR_ID: FilesystemSkillExecutor(session_provider=lambda: dependencies.db_session),
+        **dependencies.agent_executors,
+    }
+
+
+def _runtime_capability_registry(dependencies: AgentGraphDependencies) -> AgentCapabilityRegistry:
+    declared_capabilities = [
+        capability
+        for agent in dependencies.agent_executors.values()
+        for capability in _declared_agent_capabilities(agent)
+    ]
+    declared_ids = {capability.capability_id for capability in declared_capabilities}
+    # MCP definitions are child-agent implementation details. Exclude them, as
+    # well as generated facades, before building the main model's capability
+    # registry; then register each real Agent declaration with its metadata.
+    main_runtime_tools = AgentToolRegistry(
+        definition
+        for definition in dependencies.registry.list_definitions()
+        if (
+            not definition.name.startswith(SDK_AGENT_CHILD_MCP_PREFIXES)
+            and definition.name not in declared_ids
+            and definition.name not in LEGACY_FILESYSTEM_CAPABILITIES
+        )
+    )
+    registry = create_default_agent_capability_registry(
+        tool_registry=main_runtime_tools,
+        executor_id_by_capability=_runtime_capability_executor_ids(dependencies),
+    )
+    for capability in declared_capabilities:
+        # Filesystem remains a main-runtime Skill even when an SDK agent also
+        # declares it as an internal specialist capability.
+        if capability.capability_id == FILESYSTEM_SKILL_CAPABILITY:
+            continue
+        registry.register(capability)
+    return registry
+
+
+def _runtime_capability_definition(
+    capability_id: str | None,
+    *,
+    dependencies: AgentGraphDependencies,
+) -> AgentCapabilityDefinition | None:
+    return _runtime_capability_registry(dependencies).get(str(capability_id or ""))
+
+
+def _skill_capability_runtime_input(
+    capability_id: str | None,
+    tool_input: dict[str, Any],
+    *,
+    state: AgentState,
+) -> dict[str, Any]:
+    if capability_id != FILESYSTEM_SKILL_CAPABILITY:
+        return dict(tool_input)
+    # The model chooses both the high-level Skill and the structured filesystem
+    # operation. Runtime receives those fields unchanged and only validates,
+    # approves, executes, and postchecks them. Never backfill an operation from
+    # the intent detector: that would reintroduce the old read-first shortcut.
+    resolved = {
+        "user_task": state.user_message,
+        "context_metadata": dict(state.context_metadata),
+        **dict(tool_input),
+    }
+    # Keep the public tool contract ergonomic: a model may provide a top-level
+    # name_intent, while the filesystem catalog consumes it inside the
+    # structured operation_intent envelope. This is a shape conversion only;
+    # the runtime never invents the filename or destination semantics.
+    if isinstance(resolved.get("name_intent"), dict) and not isinstance(resolved.get("operation_intent"), dict):
+        resolved["operation_intent"] = {"name_intent": dict(resolved["name_intent"])}
+    return resolved
+
+
+def _runtime_capability_guard_payload(definition: AgentCapabilityDefinition) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "error_code": None,
+        "reason": None,
+        "user_message": None,
+        "next_action": AgentToolNextAction.CONTINUE.value,
+        "retryable": False,
+        "error_details": {"capability_id": definition.capability_id, "capability_kind": definition.kind},
+        "cost": {},
+        "artifacts": {},
+    }
+
+
+def _runtime_capability_approval_payload_from_result(
+    result: StandardAgentResult,
+    *,
+    outer_capability: str,
+    outer_tool_input: dict[str, Any],
+    executor_id: str,
+) -> dict[str, Any] | None:
+    if executor_id != FILESYSTEM_SKILL_EXECUTOR_ID:
+        return None
+    raw_result = _jsonable(result.raw_result)
+    raw_result = raw_result if isinstance(raw_result, dict) else {}
+    approval_request = raw_result.get("approval_request")
+    if not result.requires_user_action or not isinstance(approval_request, dict):
+        return None
+
+    reason = str(approval_request.get("reason") or result.summary or "Runtime capability requires user approval.").strip()
+    user_message = str(approval_request.get("suggested_user_message") or reason).strip()
+    risk_level = str(approval_request.get("risk_level") or "high").strip() or "high"
+    approval_payload = raw_result.get("approval_payload") if isinstance(raw_result.get("approval_payload"), dict) else {}
+    requested_tool_name = str(approval_request.get("tool_name") or outer_capability).strip()
+    # The approval card is built after the filesystem Skill has completed
+    # semantic admission and chosen a concrete source, destination and
+    # operation. Rehydrate those canonical arguments into the continuation
+    # input so approval cannot cause a second model pass to reinterpret
+    # "copy ... rename as ..." as a different operation.
+    tool_input = dict(outer_tool_input)
+    for key in ("operation", "src", "dst", "path", "overwrite", "operation_intent"):
+        if key in approval_payload:
+            tool_input[key] = approval_payload[key]
+
+    guard_result = {
+        "ok": False,
+        "error_code": RUNTIME_CAPABILITY_APPROVAL_ERROR_CODE,
+        "reason": reason,
+        "user_message": user_message,
+        "next_action": "wait_confirmation",
+        "retryable": True,
+        "error_details": {
+            "executor_id": executor_id,
+            "outer_capability": outer_capability,
+            "requested_tool_name": requested_tool_name,
+            "tool_input": tool_input,
+            "approval_payload": dict(approval_payload),
+            "risk_level": risk_level,
+            "approval_type": approval_request.get("approval_type") or "runtime_capability",
+        },
+        "cost": {},
+        "artifacts": {},
+    }
+
+    return {
+        "runtime_capability_approval": True,
+        "executor_id": executor_id,
+        "outer_capability": outer_capability,
+        "requested_tool_name": requested_tool_name,
+        "tool_input": tool_input,
+        "approval_payload": dict(approval_payload),
+        "reason": reason,
+        "user_message": user_message,
+        "risk_level": risk_level,
+        "approval_request": dict(approval_request),
+        "capability_result": raw_result,
+        "guard_result": guard_result,
+    }
+
+
+def _with_runtime_capability_approval_metadata(
+    metadata: dict[str, Any],
+    approval_payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {**dict(metadata), RUNTIME_CAPABILITY_APPROVAL_METADATA_KEY: dict(approval_payload)}
+
+
+def _runtime_capability_approval_payload_from_state_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    payload = metadata.get(RUNTIME_CAPABILITY_APPROVAL_METADATA_KEY) if isinstance(metadata, dict) else None
+    return dict(payload) if isinstance(payload, dict) and payload.get("runtime_capability_approval") else None
+
+
 def _execution_planner_node(state: AgentState, *, dependencies: AgentGraphDependencies) -> AgentState:
     if dependencies.execution_planner is None or dependencies.db_session is None:
         return state
@@ -1424,7 +2347,7 @@ def _execute_planner_capability_action(
             details={"requested_capability": capability, "allowed_capabilities": allowed_capabilities},
         )
 
-    definition = dependencies.registry.get(capability)
+    definition = _runtime_capability_definition(capability, dependencies=dependencies)
     if definition is None:
         return _blocked_execution_planner_response(
             state,
@@ -1432,7 +2355,7 @@ def _execute_planner_capability_action(
             details={"requested_capability": capability},
         )
 
-    tool_input = dict(action.arguments or {})
+    tool_input = _skill_capability_runtime_input(capability, dict(action.arguments or {}), state=state)
     validation_error = _validate_native_tool_input(definition.input_schema, tool_input)
     if validation_error is not None:
         return _blocked_execution_planner_response(
@@ -1512,6 +2435,7 @@ def _blocked_execution_planner_response(state: AgentState, *, reason: str, detai
 def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDependencies) -> AgentState:
     if dependencies.llm_client is None or dependencies.db_session is None:
         return state
+    capability_registry = _runtime_capability_registry(dependencies)
 
     context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
     if not isinstance(context_pack, dict):
@@ -1520,7 +2444,7 @@ def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
     if not allowed_capabilities:
         return state
 
-    tool_bundle = _build_native_tool_schema_bundle(dependencies.registry, allowed_capabilities)
+    tool_bundle = _build_native_tool_schema_bundle(capability_registry, allowed_capabilities)
     if not tool_bundle["tools"]:
         return state
 
@@ -1544,7 +2468,7 @@ def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
         )
 
     allowed_capabilities = react_policy.allowed_capabilities
-    tool_bundle = _build_native_tool_schema_bundle(dependencies.registry, allowed_capabilities)
+    tool_bundle = _build_native_tool_schema_bundle(capability_registry, allowed_capabilities)
     if not tool_bundle["tools"]:
         return state
 
@@ -1608,7 +2532,40 @@ def _native_tool_loop_node(state: AgentState, *, dependencies: AgentGraphDepende
             tool_call = tool_calls[0]
             prepared = _prepare_native_tool_call(tool_call, tool_bundle, allowed_capabilities, state, dependencies)
             if isinstance(prepared, AgentState):
-                return prepared
+                # OpenClaw-style recovery: a native tool call that was blocked
+                # before execution still produces a tool result. Feed that
+                # result back into the same bounded loop so the model can
+                # repair its call instead of treating the block as a final answer.
+                state = prepared
+                blocked_payload = _latest_tool_result_payload(state, state.requested_tool_name or "")
+                blocked_trace = _native_blocked_tool_trace_entry(
+                    len(loop_trace) + 1,
+                    state.requested_tool_name or "unknown_tool",
+                    blocked_payload,
+                    state,
+                )
+                loop_trace.append(blocked_trace)
+                state = state.with_updates(
+                    context_metadata=_with_loop_agent_metadata(
+                        state.context_metadata,
+                        {
+                            **_loop_agent_progress_metadata(loop_trace),
+                            "last_outcome": "blocked",
+                        },
+                    )
+                )
+                if state.current_step in {"wait_confirmation", "wait_user_input"}:
+                    state = state.with_updates(
+                        context_metadata=_with_loop_agent_metadata(
+                            state.context_metadata,
+                            _loop_agent_completion_metadata(
+                                loop_trace,
+                                stop_reason=LoopAgentStopReason.WAITING_USER,
+                            ),
+                        )
+                    )
+                    return state
+                continue
             requested_tool_name, tool_input = prepared
             state = state.with_updates(
                 requested_tool_name=requested_tool_name,
@@ -1844,26 +2801,44 @@ def _prepare_native_tool_call(
     dependencies: AgentGraphDependencies,
 ) -> tuple[str, dict[str, Any]] | AgentState:
     requested_tool_name = tool_bundle["alias_to_tool_name"].get(str(tool_call.name), str(tool_call.name))
+    tool_input = dict(getattr(tool_call, "arguments", {}) or {})
+    tool_call_id = str(getattr(tool_call, "id", "") or "") or None
     if requested_tool_name not in allowed_capabilities:
         return _blocked_native_tool_call_response(
             state,
+            dependencies=dependencies,
+            requested_tool_name=requested_tool_name,
+            tool_input=tool_input,
+            tool_call_id=tool_call_id,
             reason=f"Model requested a tool outside this turn's ContextPack: {requested_tool_name}",
             details={"requested_tool_name": requested_tool_name, "allowed_capabilities": allowed_capabilities},
         )
 
-    definition = dependencies.registry.get(requested_tool_name)
+    definition = _runtime_capability_definition(requested_tool_name, dependencies=dependencies)
     if definition is None:
         return _blocked_native_tool_call_response(
             state,
-            reason=f"Model requested an unregistered tool: {requested_tool_name}",
+            dependencies=dependencies,
+            requested_tool_name=requested_tool_name,
+            tool_input=tool_input,
+            tool_call_id=tool_call_id,
+            reason=f"Model requested an unregistered capability: {requested_tool_name}",
             details={"requested_tool_name": requested_tool_name},
         )
 
-    tool_input = dict(getattr(tool_call, "arguments", {}) or {})
+    tool_input = _skill_capability_runtime_input(
+        requested_tool_name,
+        tool_input,
+        state=state,
+    )
     validation_error = _validate_native_tool_input(definition.input_schema, tool_input)
     if validation_error is not None:
         return _blocked_native_tool_call_response(
             state,
+            dependencies=dependencies,
+            requested_tool_name=requested_tool_name,
+            tool_input=tool_input,
+            tool_call_id=tool_call_id,
             reason=validation_error,
             details={"requested_tool_name": requested_tool_name, "tool_input": tool_input},
         )
@@ -1957,7 +2932,7 @@ def _finalize_native_tool_loop_after_approval(state: AgentState, *, dependencies
     )
 
 
-def _build_native_tool_schema_bundle(registry: AgentToolRegistry, allowed_capabilities: list[str]) -> dict[str, Any]:
+def _build_native_tool_schema_bundle(registry: Any, allowed_capabilities: list[str]) -> dict[str, Any]:
     tools: list[dict[str, Any]] = []
     alias_to_tool_name: dict[str, str] = {}
     used_aliases: set[str] = set()
@@ -2037,14 +3012,157 @@ def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:
     return True
 
 
-def _blocked_native_tool_call_response(state: AgentState, *, reason: str, details: dict[str, Any]) -> AgentState:
+def _blocked_native_tool_call_response(
+    state: AgentState,
+    *,
+    dependencies: AgentGraphDependencies,
+    requested_tool_name: str,
+    tool_input: dict[str, Any],
+    tool_call_id: str | None,
+    reason: str,
+    details: dict[str, Any],
+) -> AgentState:
+    """Finalize a blocked native call as a model-readable tool outcome.
+
+    Native tool calls happen before ``_maybe_tool_node``. Previously a guard or
+    schema failure therefore only changed ``final_response`` and skipped the
+    transcript, tool log, and ReAct observation. This helper keeps the blocked
+    path aligned with normal execution: record the attempt, append a synthetic
+    tool result, and let the bounded loop decide whether to retry or stop.
+    """
+    error_code = "NATIVE_TOOL_CALL_BLOCKED"
+    next_action = "select_alternative_tool"
+    if "missing required arguments" in reason.lower() or "invalid type" in reason.lower():
+        error_code = "NATIVE_TOOL_INPUT_INVALID"
+        next_action = "continue"
+    result_payload = _tool_failure_result_payload(
+        requested_tool_name,
+        error=reason,
+        error_code=error_code,
+        retryable=True,
+        next_action=next_action,
+        state=state,
+        definition=_runtime_capability_definition(requested_tool_name, dependencies=dependencies),
+        result={
+            "message": reason,
+            "execution": "blocked_before_execution",
+            "tool_call_id": tool_call_id,
+            "details": details,
+        },
+    )
+    tool_call = dependencies.automation_service.record_tool_call(
+        ToolCallLogCreate(
+            workflow_run_id=state.workflow_run_id,
+            tool_name=requested_tool_name,
+            tool_group="agent",
+            status=ToolCallStatus.BLOCKED,
+            input_payload=tool_input,
+            output_payload={
+                "execution": "native_tool_loop",
+                "tool_call_id": tool_call_id,
+                "result": result_payload,
+                "details": details,
+            },
+            error=reason,
+        )
+    )
+    tool_messages = _append_tool_pair_messages(
+        state,
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        tool_name=requested_tool_name,
+        tool_input=tool_input,
+        status="blocked",
+        result=result_payload,
+        error=reason,
+        tool_call_id=tool_call_id,
+    )
+    command = AgentRunCommand(
+        session_id=state.session_id,
+        user_message=state.user_message,
+        requested_tool_name=requested_tool_name,
+        source_type="agent_chat",
+        tool_input=tool_input,
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "tool_finished",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        tool_call_id=tool_call.id,
+        status="blocked",
+        summary=reason,
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "tool_result_summary",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        tool_call_id=tool_call.id,
+        status="blocked",
+        summary=reason,
+        result_summary=_runtime_result_summary_metadata(result_payload),
+    )
+    logger.warning(
+        "Native tool call blocked; synthetic outcome appended for ReAct recovery: tool=%s call_id=%s error_code=%s next_action=%s",
+        requested_tool_name,
+        tool_call_id,
+        error_code,
+        next_action,
+    )
     return state.with_updates(
-        final_response=f"工具调用已被拦截：{reason}",
-        response_mode="tool_call_blocked",
+        current_step="maybe_tool",
+        requested_tool_name=requested_tool_name,
+        guard_result={
+            "ok": False,
+            "error_code": error_code,
+            "reason": reason,
+            "next_action": next_action,
+            "retryable": True,
+            "error_details": details,
+        },
+        tool_call_ids=[*state.tool_call_ids, tool_call.id],
+        llm_messages=[*state.llm_messages, *tool_messages],
+        final_response=reason,
+        response_mode="llm_tool_loop",
         context_metadata=_with_tool_loop_metadata(
             state.context_metadata,
-            {"enabled": True, "blocked": True, "reason": reason, "details": details},
+            {
+                "enabled": True,
+                "blocked": True,
+                "last_blocked_tool_call_id": tool_call.id,
+                "last_provider_tool_call_id": tool_call_id,
+                "last_outcome": "blocked",
+                "reason": reason,
+                "details": details,
+                "result": result_payload,
+            },
         ),
+    )
+
+
+def _native_blocked_tool_trace_entry(
+    iteration: int,
+    requested_tool_name: str,
+    payload: dict[str, Any] | None,
+    state: AgentState,
+) -> LoopAgentTraceEntry:
+    """Expose blocked attempts in loop metadata without counting them as executed."""
+    return LoopAgentTraceEntry(
+        iteration=iteration,
+        action=LoopAgentAction.WAIT_USER,
+        capability=requested_tool_name,
+        decision_reason="Runtime blocked the native call before execution and returned a synthetic tool result for recovery.",
+        observation_status="blocked",
+        observation_summary=_loop_agent_observation_summary(requested_tool_name, payload, state),
+        tool_call_id=state.tool_call_ids[-1] if state.tool_call_ids else None,
+        metadata={
+            "executed": False,
+            "blocked": True,
+            "result_observation": _runtime_result_summary_metadata(payload),
+        },
     )
 
 
@@ -2170,6 +3288,9 @@ def _loop_agent_observation_status(payload: dict[str, Any] | None, state: AgentS
     if _state_is_waiting_for_user(state):
         return "waiting_user"
     if isinstance(payload, dict):
+        goal_validation = _goal_validation_from_payload(payload)
+        if isinstance(goal_validation, dict) and goal_validation.get("completed") is False and goal_validation.get("recoverable"):
+            return "partial"
         return str(payload.get("status") or "unknown")
     return "unknown"
 
@@ -2186,6 +3307,11 @@ def _loop_agent_observation_summary(
         return str(guard_result.get("user_message") or guard_result.get("reason") or "工具参数还不完整，请补充后继续。")
     if not isinstance(payload, dict):
         return "Tool step completed without a structured observation payload."
+    goal_validation = _goal_validation_from_payload(payload)
+    if isinstance(goal_validation, dict) and goal_validation.get("completed") is False:
+        reason = str(goal_validation.get("reason") or "").strip()
+        if reason:
+            return reason
     tool_result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
     result = tool_result.get("result") if isinstance(tool_result.get("result"), dict) else {}
     envelope = tool_result.get("result_envelope") if isinstance(tool_result.get("result_envelope"), dict) else None
@@ -2205,10 +3331,185 @@ def _loop_agent_observation_summary(
         return _job_source_overview_summary_response(payload)
     if requested_tool_name == APPLICATION_FIND_APPLY_ENTRY_TOOL:
         return _apply_entry_task_summary_response(payload)
+    structured_error = _structured_runtime_error_summary(payload)
+    if structured_error:
+        return structured_error
     error = payload.get("error") or tool_result.get("error") or result.get("error")
     if error:
         return str(error)
     return f"Tool step {payload.get('status') or 'completed'}."
+
+
+def _structured_runtime_error_summary(payload: dict[str, Any]) -> str | None:
+    """Expose runtime-owned recovery fields instead of collapsing them to a generic error."""
+
+    candidates: list[dict[str, Any]] = []
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    while queue and len(candidates) < 12:
+        current = queue.pop(0)
+        if not isinstance(current, dict) or id(current) in visited:
+            continue
+        visited.add(id(current))
+        candidates.append(current)
+        for key in ("result", "raw_result", "result_envelope", "error_details"):
+            child = current.get(key)
+            if isinstance(child, dict):
+                queue.append(child)
+
+    for candidate in candidates:
+        error_code = str(candidate.get("error_code") or candidate.get("guard_error_code") or "").strip()
+        error = str(candidate.get("error") or candidate.get("reason") or "").strip()
+        missing = candidate.get("missing_args") or candidate.get("missing_information") or candidate.get("missing_required_fields")
+        if isinstance(missing, str):
+            missing = [missing]
+        missing_fields = [str(item).strip() for item in missing or [] if str(item).strip()]
+        next_action = str(candidate.get("next_action") or "").strip()
+        recoverable = candidate.get("recoverable") is True or candidate.get("retryable") is True
+        if not (error_code or missing_fields or (error and (candidate.get("ok") is False or recoverable))):
+            continue
+        parts = ["runtime 结构化错误"]
+        if error_code:
+            parts.append(error_code)
+        if error:
+            parts.append(error)
+        if missing_fields:
+            parts.append(f"缺少字段：{', '.join(missing_fields)}")
+        if next_action:
+            parts.append(f"下一步：{next_action}")
+        return "；".join(parts) + "。"
+    return None
+
+
+def _goal_recovery_decision_from_validation(
+    requested_tool_name: str,
+    tool_input: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> LoopAgentDecision | None:
+    goal_validation = _goal_validation_from_payload(payload)
+    if not isinstance(goal_validation, dict):
+        return None
+    if goal_validation.get("completed") is True or not goal_validation.get("recoverable"):
+        return None
+    next_action = str(goal_validation.get("next_action") or "").strip()
+    reason = str(goal_validation.get("reason") or "目标校验未完成。").strip()
+    if next_action == "continue_loop":
+        suggested_capability = str(goal_validation.get("suggested_capability") or requested_tool_name or "").strip()
+        suggested_operation = str(goal_validation.get("suggested_operation") or "").strip()
+        recovery_input = {**dict(tool_input), "goal_recovery": True}
+        if suggested_operation:
+            recovery_input["operation"] = suggested_operation
+        # No-dead-end recovery: the next loop step receives an explicit route
+        # instead of only seeing a vague "tool succeeded" observation.
+        return LoopAgentDecision(
+            action=LoopAgentAction.CALL_TOOL,
+            capability=suggested_capability or requested_tool_name,
+            tool_input=recovery_input,
+            reason=f"目标校验未完成：{reason}",
+            metadata={"source": "goal_validation", "goal_validation": goal_validation},
+        )
+    if next_action in {"ask_user", "ask_user_or_search_text", "wait_user_input"}:
+        return LoopAgentDecision(
+            action=LoopAgentAction.WAIT_USER,
+            capability=requested_tool_name,
+            message=reason or "需要补充信息后继续。",
+            reason=reason,
+            metadata={"source": "goal_validation", "goal_validation": goal_validation},
+        )
+    return None
+
+
+def _no_dead_end_recovery_decision_from_payload(
+    requested_tool_name: str,
+    tool_input: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> LoopAgentDecision | None:
+    outcome = _no_dead_end_outcome_from_payload(payload)
+    if not isinstance(outcome, dict) or outcome.get("recoverable") is not True:
+        return None
+    next_action = str(outcome.get("next_action") or "").strip()
+    reason = str(outcome.get("reason") or outcome.get("summary") or "工具结果未完成。").strip()
+    if next_action == "retry_operation":
+        suggested_operation = str(outcome.get("suggested_operation") or "").strip()
+        if not suggested_operation:
+            return None
+        recovery_input = {**dict(tool_input), "operation": suggested_operation, "no_dead_end_recovery": True}
+        return LoopAgentDecision(
+            action=LoopAgentAction.CALL_TOOL,
+            capability=requested_tool_name,
+            tool_input=recovery_input,
+            reason=f"工具结果未完成，按 no-dead-end 路标继续：{reason}",
+            metadata={"source": "no_dead_end", "no_dead_end_outcome": outcome},
+        )
+    if next_action == "read_before_write":
+        read_before_write = outcome.get("read_before_write") if isinstance(outcome.get("read_before_write"), dict) else {}
+        read_path = str(
+            read_before_write.get("path")
+            or (tool_input.get("src") if isinstance(tool_input, dict) else "")
+            or (tool_input.get("path") if isinstance(tool_input, dict) else "")
+            or ""
+        ).strip()
+        if not read_path:
+            return None
+        return LoopAgentDecision(
+            action=LoopAgentAction.CALL_TOOL,
+            capability=requested_tool_name,
+            tool_input={"operation": "read_file", "path": read_path},
+            reason=f"{reason}，运行时先读取文件内容，再继续选择文件名。",
+            metadata={"source": "no_dead_end", "read_before_write": True, "no_dead_end_outcome": outcome},
+        )
+    if next_action in {"ask_user", "wait_user_input"}:
+        return LoopAgentDecision(
+            action=LoopAgentAction.WAIT_USER,
+            capability=requested_tool_name,
+            message=str(outcome.get("ask_user_message") or reason or "需要补充信息后继续。"),
+            reason=reason,
+            metadata={"source": "no_dead_end", "no_dead_end_outcome": outcome},
+        )
+    return None
+
+
+def _no_dead_end_outcome_from_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    while queue:
+        candidate = queue.pop(0)
+        if not isinstance(candidate, dict) or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if candidate.get("ok") is False and candidate.get("recoverable") is True and candidate.get("next_action"):
+            return candidate
+        for child_key in ("result", "raw_result", "result_envelope", "error_details", "output_payload"):
+            child = candidate.get(child_key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return None
+
+
+def _goal_validation_from_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = [payload.get("goal_validation")]
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    nested_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+    envelope = payload.get("result_envelope") if isinstance(payload.get("result_envelope"), dict) else None
+    if envelope is None and isinstance(result.get("result_envelope"), dict):
+        envelope = result.get("result_envelope")
+    if envelope is None and isinstance(nested_result.get("result_envelope"), dict):
+        envelope = nested_result.get("result_envelope")
+    candidates.extend(
+        [
+            result.get("goal_validation"),
+            nested_result.get("goal_validation"),
+            envelope.get("goal_validation") if isinstance(envelope, dict) else None,
+        ]
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 def _with_execution_planner_metadata(metadata: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -2217,7 +3518,61 @@ def _with_execution_planner_metadata(metadata: dict[str, Any], updates: dict[str
 
 
 def _with_capability_routing_metadata(metadata: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
-    return {**metadata, "capability_routing": decision.to_metadata_dict()}
+    decision_metadata = decision.to_metadata_dict()
+    return _with_runtime_decision_trace(
+        {**metadata, "capability_routing": decision_metadata},
+        "capability_routing",
+        decision_metadata,
+    )
+
+
+def _with_runtime_decision_trace(metadata: dict[str, Any], stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+    existing = metadata.get("runtime_decision_trace") if isinstance(metadata.get("runtime_decision_trace"), list) else []
+    entry = {
+        "stage": stage,
+        "payload": _compact_runtime_decision_payload(payload),
+    }
+    # Keep only the latest entries: this trace is for debugging runtime routing,
+    # not for storing the full conversation or tool output in every checkpoint.
+    return {**metadata, "runtime_decision_trace": [*existing, entry][-30:]}
+
+
+def _compact_runtime_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    allowed_keys = {
+        "intent",
+        "intent_reason",
+        "allowed_capabilities",
+        "excluded_capabilities",
+        "active_file",
+        "filesystem_operation",
+        "operation_intent",
+        "goal_state",
+        "capabilities",
+        "signals",
+        "reasons",
+        "route",
+        "capability",
+        "reason",
+        "tool_name",
+        "status",
+        "tool_input",
+        "error",
+        "filesystem_trace",
+        "goal_validation",
+        "goal_completed",
+        "goal_next_action",
+    }
+    for key, value in payload.items():
+        if key not in allowed_keys or value in (None, "", [], {}):
+            continue
+        if key == "tool_input" and isinstance(value, dict):
+            compact[key] = _public_tool_input_preview(value)
+        elif key == "filesystem_trace" and isinstance(value, dict):
+            compact[key] = _runtime_filesystem_trace({"filesystem_trace": value})
+        else:
+            compact[key] = value
+    return compact
 
 
 def _pending_runtime_tool_input(state: AgentState) -> dict[str, Any]:
@@ -2261,7 +3616,7 @@ def _has_prepared_final_response(state: AgentState) -> bool:
 
 
 def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependencies) -> AgentState:
-    config = ContextBuildConfig()
+    config = dependencies.context_build_config
     if dependencies.skill_repository is not None:
         dependencies.skill_repository.ensure_builtin_content_source_skills()
     built = MemoryContextBuilder(
@@ -2312,21 +3667,59 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
             }
     metadata = built.context_metadata
     metadata = {**metadata, **auto_compaction_metadata}
+    file_context_hints = build_file_context_hints(
+        user_message=state.user_message,
+        recent_user_context=_recent_user_context_from_messages(built.llm_messages, current_user_message=state.user_message),
+        context=metadata,
+    )
     intent_frame, context_pack = _build_context_pack(
         state.user_message,
+        recent_user_context=_recent_user_context_from_messages(
+            built.llm_messages,
+            current_user_message=state.user_message,
+        ),
         registry=dependencies.registry,
         intent_detector=dependencies.intent_detector,
+        capability_registry=_runtime_capability_registry(dependencies),
+        source_type=state.source_type,
     )
+    context_pack_metadata = context_pack.to_metadata_dict()
     metadata = {
         **metadata,
+        **file_context_hints,
         "intent_frame": intent_frame.model_dump(mode="json"),
-        "context_pack": context_pack.to_metadata_dict(),
+        "context_pack": context_pack_metadata,
         "context_engineering": {
             "version": "intent_context_pack_v1",
+            "file_context_version": "active_file_context_v1",
+            "structured_filesystem_intent_version": "v2",
             "planner_enabled": dependencies.execution_planner is not None,
         },
     }
-    llm_messages = _prepend_context_pack_message(built.llm_messages, context_pack)
+    # GoalState is the runtime's explicit answer to "what does success mean for this turn?".
+    # Tool execution can succeed while the user goal is still unfinished, so later nodes
+    # validate tool output against this structured target instead of only checking ok=true.
+    goal_state = build_goal_state(
+        user_message=state.user_message,
+        intent=str(intent_frame.intent),
+        context_metadata=metadata,
+    )
+    metadata = {**metadata, GOAL_STATE_METADATA_KEY: goal_state.to_metadata_dict()}
+    metadata = _with_runtime_decision_trace(
+        metadata,
+        "context_built",
+        {
+            "intent": intent_frame.intent,
+            "intent_reason": intent_frame.reason,
+            "allowed_capabilities": context_pack_metadata.get("allowed_capabilities"),
+            "excluded_capabilities": context_pack_metadata.get("excluded_capabilities"),
+            "active_file": metadata.get("active_file"),
+            "filesystem_operation": metadata.get("filesystem_operation"),
+            "operation_intent": metadata.get("operation_intent"),
+            "goal_state": goal_state.to_metadata_dict(),
+        },
+    )
+    llm_messages = _prepend_context_pack_message(built.llm_messages, context_pack_metadata)
     return state.with_updates(
         current_step="build_context",
         latest_summary_id=metadata.get("summary_id"),
@@ -2343,23 +3736,35 @@ def _build_context_node(state: AgentState, *, dependencies: AgentGraphDependenci
 def _build_context_pack(
     user_message: str,
     *,
+    recent_user_context: str = "",
     registry: AgentToolRegistry,
     intent_detector: Any | None,
+    capability_registry: AgentCapabilityRegistry | None = None,
+    source_type: str = "agent_chat",
 ) -> tuple[IntentFrame, ContextPack]:
-    detector = intent_detector or HybridIntentDetector(llm_client=None)
-    try:
-        intent_frame = detector.detect(user_message)
-    except Exception:
-        intent_frame = HybridIntentDetector(llm_client=None).detect(user_message)
-    context_pack = ContextPackBuilder(CapabilityCatalog.from_registry(registry)).build(intent_frame)
+    # Intent detection is telemetry only. The main Agent already receives the
+    # full conversation and capability directory; calling a second LLM here
+    # would duplicate context tokens and could reintroduce a semantic gate.
+    # Keep the deterministic frame for observability and goal metadata.
+    intent_frame = HybridIntentDetector(llm_client=None).detect(
+        user_message,
+        recent_user_context=recent_user_context,
+    )
+    catalog = (
+        CapabilityCatalog.from_agent_registry(capability_registry)
+        if capability_registry is not None
+        else CapabilityCatalog.from_registry(registry)
+    )
+    context_pack = ContextPackBuilder(catalog).build(intent_frame, source_type=source_type)
     return intent_frame, context_pack
 
 
-def _prepend_context_pack_message(messages: list[dict[str, Any]], context_pack: ContextPack) -> list[dict[str, Any]]:
-    payload = context_pack.to_metadata_dict()
+def _prepend_context_pack_message(messages: list[dict[str, Any]], context_pack: ContextPack | dict[str, Any]) -> list[dict[str, Any]]:
+    payload = context_pack.to_metadata_dict() if isinstance(context_pack, ContextPack) else dict(context_pack)
     content = (
-        "OfferMaster ContextPack for this turn. Use it to decide whether a model-native tool call is appropriate; "
-        "the runtime will validate allowed capabilities and tool arguments before execution. Planner is not enabled.\n"
+        "OfferMaster capability catalog for this turn. Use the conversation history and this registered capability "
+        "directory to decide whether a model-native tool call is appropriate. The runtime validates capability "
+        "permission, arguments, risk and approval before execution.\n"
         f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
     )
     return [{"role": "system", "content": content, "metadata": {"source": "context_pack"}}, *messages]
@@ -2369,16 +3774,26 @@ def _complete_runtime_tool_command(
     command: AgentRunCommand,
     *,
     state: AgentState,
-    definition: AgentToolDefinition | None,
+    definition: AgentToolDefinition | AgentCapabilityDefinition | None,
 ) -> tuple[AgentRunCommand, dict[str, Any], ToolInputCompletionResult]:
-    resolved_input = _resolved_tool_input(command, state)
+    resolved_input = _skill_capability_runtime_input(
+        command.requested_tool_name,
+        _resolved_tool_input(command, state),
+        state=state,
+    )
+    recent_user_context = _recent_user_context_for_tool_choice(state)
+    file_context_hints = build_file_context_hints(
+        user_message=state.user_message,
+        recent_user_context=recent_user_context,
+        context=state.context_metadata,
+    )
     completion = complete_tool_input(
         tool_name=command.requested_tool_name or "",
         tool_input=resolved_input,
         input_schema=definition.input_schema if definition is not None else {},
         user_message=state.user_message,
-        recent_user_context=_recent_user_context_for_tool_choice(state),
-        context={"recent_file_paths": _extract_local_file_references(_recent_user_context_for_tool_choice(state))},
+        recent_user_context=recent_user_context,
+        context={**state.context_metadata, **file_context_hints},
     )
     return replace(command, tool_input=completion.tool_input), completion.tool_input, completion
 
@@ -2390,7 +3805,7 @@ def _with_tool_input_completion_metadata(
 ) -> dict[str, Any]:
     if not completion.filled_fields and not completion.missing_required_fields:
         return {key: value for key, value in metadata.items() if key != "tool_input_completion"}
-    return {
+    next_metadata = {
         **metadata,
         "tool_input_completion": {
             "tool_name": command.requested_tool_name,
@@ -2398,6 +3813,17 @@ def _with_tool_input_completion_metadata(
             **completion.to_metadata_dict(),
         },
     }
+    pending = build_pending_operation_from_tool_input_completion(
+        tool_name=command.requested_tool_name or "",
+        completion=completion,
+        context_metadata=metadata,
+        user_message=command.user_message,
+    )
+    if pending is not None:
+        # tool_input_completion describes this attempt; pending_operation is the
+        # resumable user task that a later follow-up can continue.
+        next_metadata = with_pending_operation(next_metadata, pending)
+    return next_metadata
 
 
 def _tool_input_validation_guard_payload(
@@ -2432,10 +3858,12 @@ def _maybe_tool_node(
     command: AgentRunCommand,
     dependencies: AgentGraphDependencies,
 ) -> AgentState:
+    capability_definition = _runtime_capability_definition(command.requested_tool_name, dependencies=dependencies)
     definition = dependencies.registry.get(command.requested_tool_name or "")
-    command, tool_input, completion = _complete_runtime_tool_command(command, state=state, definition=definition)
+    runtime_definition = capability_definition or definition
+    command, tool_input, completion = _complete_runtime_tool_command(command, state=state, definition=runtime_definition)
     state = state.with_updates(context_metadata=_with_tool_input_completion_metadata(state.context_metadata, command, completion))
-    validation_error = _validate_native_tool_input(definition.input_schema, tool_input) if definition is not None else None
+    validation_error = _validate_native_tool_input(runtime_definition.input_schema, tool_input) if runtime_definition is not None else None
     if validation_error is not None:
         guard_payload = _tool_input_validation_guard_payload(command, validation_error=validation_error, completion=completion)
         return state.with_updates(
@@ -2445,38 +3873,64 @@ def _maybe_tool_node(
             response_mode="tool_input_ask_user",
         )
 
-    skill_permission_policy = _skill_permission_policy_from_state(state)
-    guard_result = dependencies.guard.pre_check(
-        AgentToolCallContext(
-            stage="maybe_tool",
-            tool_name=command.requested_tool_name or "",
-            source_type=command.source_type,
-            tool_call_count=len(state.tool_call_ids),
-            user_confirmed=command.user_confirmed,
-            agent_run_id=state.agent_run_id,
-            session_id=state.session_id,
-        ),
-        registry=dependencies.registry,
-        skill_permission_policy=skill_permission_policy,
-    )
-    guard_payload = {
-        "ok": guard_result.ok,
-        "error_code": guard_result.error_code,
-        "reason": guard_result.reason,
-        "user_message": guard_result.user_message,
-        "next_action": guard_result.next_action,
-        "retryable": guard_result.retryable,
-        "error_details": guard_result.error_details,
-        "cost": guard_result.cost,
-        "artifacts": guard_result.artifacts,
-    }
-    if guard_result.next_action == AgentToolNextAction.REQUEST_USER_CONFIRMATION.value:
-        return state.with_updates(current_step="wait_confirmation", guard_result=guard_payload)
-    if not guard_result.ok:
+    # Declared Agent/Skill capabilities use their own executor-level policy.
+    # The registry facade is only present so the model can select the
+    # capability; applying the legacy Skill permission snapshot to that facade
+    # compares `skill.filesystem` with inner names such as
+    # `filesystem.copy_file` and incorrectly asks for an outer approval.
+    if command.requested_tool_name != FILESYSTEM_SKILL_CAPABILITY and definition is not None and (
+        capability_definition is None
+        or getattr(capability_definition, "kind", "") == "tool"
+    ):
+        skill_permission_policy = _skill_permission_policy_from_state(state)
+        guard_result = dependencies.guard.pre_check(
+            AgentToolCallContext(
+                stage="maybe_tool",
+                tool_name=command.requested_tool_name or "",
+                source_type=command.source_type,
+                tool_call_count=len(state.tool_call_ids),
+                user_confirmed=command.user_confirmed,
+                agent_run_id=state.agent_run_id,
+                session_id=state.session_id,
+            ),
+            registry=dependencies.registry,
+            skill_permission_policy=skill_permission_policy,
+        )
+        guard_payload = {
+            "ok": guard_result.ok,
+            "error_code": guard_result.error_code,
+            "reason": guard_result.reason,
+            "user_message": guard_result.user_message,
+            "next_action": guard_result.next_action,
+            "retryable": guard_result.retryable,
+            "error_details": guard_result.error_details,
+            "cost": guard_result.cost,
+            "artifacts": guard_result.artifacts,
+        }
+        if guard_result.next_action == AgentToolNextAction.REQUEST_USER_CONFIRMATION.value:
+            return state.with_updates(current_step="wait_confirmation", guard_result=guard_payload)
+        if not guard_result.ok:
+            return state.with_updates(current_step="maybe_tool", guard_result=guard_payload)
+    elif capability_definition is not None:
+        # High-level Skill capabilities are not ToolRegistry entries. The
+        # runtime-level capability permission check runs inside AgentRuntime.
+        guard_payload = _runtime_capability_guard_payload(capability_definition)
+    else:
+        guard_payload = {
+            "ok": False,
+            "error_code": "TOOL_NOT_REGISTERED",
+            "reason": f"未注册的能力：{command.requested_tool_name or ''}",
+            "user_message": "模型请求了当前系统没有注册的能力。",
+            "next_action": AgentToolNextAction.SELECT_ALTERNATIVE_TOOL.value,
+            "retryable": False,
+            "error_details": {"requested_tool_name": command.requested_tool_name or ""},
+            "cost": {},
+            "artifacts": {},
+        }
         return state.with_updates(current_step="maybe_tool", guard_result=guard_payload)
 
     agent_runtime_executor_id = _agent_runtime_executor_id(command, dependencies=dependencies)
-    direct_agent_registered = agent_runtime_executor_id != TOOL_REGISTRY_EXECUTOR_ID and agent_runtime_executor_id in dependencies.agent_executors
+    direct_agent_registered = agent_runtime_executor_id != TOOL_REGISTRY_EXECUTOR_ID and agent_runtime_executor_id in _runtime_agent_executors(dependencies)
     input_preview = _public_tool_input_preview(tool_input)
     _emit_runtime_tool_event(
         dependencies,
@@ -2512,17 +3966,26 @@ def _maybe_tool_node(
         dependencies=dependencies,
         tool_input=tool_input,
     )
-    if definition is None or dependencies.db_session is None or (definition.handler is None and not direct_agent_registered):
+    runtime_execution_trace: dict[str, Any] | None = None
+    tool_ok = False
+    if capability_definition is None or dependencies.db_session is None or (definition is not None and definition.handler is None and not direct_agent_registered):
         failure_error = "Agent tool handler or database session is unavailable."
         failure_payload = _tool_failure_result_payload(
             command.requested_tool_name or "",
             error=failure_error,
-            error_code="TOOL_HANDLER_UNAVAILABLE" if definition is not None else "TOOL_NOT_REGISTERED",
+            error_code="TOOL_HANDLER_UNAVAILABLE" if capability_definition is not None else "TOOL_NOT_REGISTERED",
             retryable=False,
             next_action=AgentToolNextAction.SELECT_ALTERNATIVE_TOOL.value,
             state=state,
             definition=definition,
             result={"message": failure_error, "execution": "handler_unavailable"},
+        )
+        failure_payload = _with_goal_validation(
+            command.requested_tool_name or "",
+            tool_input,
+            failure_payload,
+            state=state,
+            registry=dependencies.registry,
         )
         tool_call = dependencies.automation_service.record_tool_call(
             ToolCallLogCreate(
@@ -2592,7 +4055,7 @@ def _maybe_tool_node(
             tool_call_id=tool_call.id,
             status="failed",
             summary=tool_call.error or "工具执行失败，暂无可用结果摘要。",
-            result_summary={},
+            result_summary=_runtime_result_summary_metadata(failure_payload),
         )
         return state.with_updates(
             current_step="maybe_tool",
@@ -2607,10 +4070,121 @@ def _maybe_tool_node(
             dependencies=dependencies,
             tool_input=tool_input,
         )
+        runtime_approval_payload = _runtime_capability_approval_payload_from_result(
+            agent_result,
+            outer_capability=command.requested_tool_name or "",
+            outer_tool_input=tool_input,
+            executor_id=agent_runtime_executor_id,
+        )
+        if runtime_approval_payload is not None:
+            guard_payload = runtime_approval_payload["guard_result"]
+            _emit_runtime_tool_event(
+                dependencies,
+                "tool_finished",
+                state=state,
+                command=command,
+                tool_input=tool_input,
+                status="waiting_user",
+                summary=str(guard_payload.get("user_message") or guard_payload.get("reason") or agent_result.summary),
+            )
+            return state.with_updates(
+                current_step="wait_confirmation",
+                guard_result=guard_payload,
+                context_metadata=_with_runtime_capability_approval_metadata(state.context_metadata, runtime_approval_payload),
+            )
+        sdk_approval_payload = sdk_agent_approval_payload_from_result(
+            agent_result,
+            outer_capability=command.requested_tool_name or "",
+            outer_tool_input=tool_input,
+            executor_id=agent_runtime_executor_id,
+        )
+        if sdk_approval_payload is not None:
+            guard_payload = sdk_approval_payload["guard_result"]
+            result_payload = _jsonable(agent_result.raw_result)
+            tool_error = f"{guard_payload.get('error_code')}: {guard_payload.get('reason')}"
+            tool_call = dependencies.automation_service.record_tool_call(
+                ToolCallLogCreate(
+                    workflow_run_id=state.workflow_run_id,
+                    tool_name=command.requested_tool_name or "",
+                    tool_group="agent",
+                    status=ToolCallStatus.BLOCKED,
+                    input_payload=tool_input,
+                    output_payload={
+                        "guard_result": guard_payload,
+                        "execution": "sdk_agent_approval",
+                        "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=agent_runtime_executor_id),
+                        "result": result_payload,
+                        "sdk_agent_approval": sdk_approval_payload,
+                    },
+                    error=tool_error,
+                )
+            )
+            _mark_durable_tool_step_waiting_user(
+                durable_step_id,
+                state=state,
+                command=command,
+                tool_input=tool_input,
+                dependencies=dependencies,
+                tool_call_log_id=tool_call.id,
+                output_payload={
+                    "guard_result": guard_payload,
+                    "execution": "sdk_agent_approval",
+                    "agent_runtime": _agent_runtime_result_metadata(agent_result, executor_id=agent_runtime_executor_id),
+                    "result": result_payload,
+                    "error": tool_error,
+                    "sdk_agent_approval": sdk_approval_payload,
+                },
+            )
+            tool_messages = _append_tool_pair_messages(
+                state,
+                dependencies=dependencies,
+                tool_call_log_id=tool_call.id,
+                tool_name=command.requested_tool_name or "",
+                tool_input=tool_input,
+                status="waiting_user",
+                result=result_payload,
+                error=tool_error,
+            )
+            _emit_runtime_tool_event(
+                dependencies,
+                "tool_finished",
+                state=state,
+                command=command,
+                tool_input=tool_input,
+                tool_call_id=tool_call.id,
+                status="waiting_user",
+                summary=str(guard_payload.get("user_message") or guard_payload.get("reason") or agent_result.summary),
+            )
+            return state.with_updates(
+                current_step="wait_confirmation",
+                guard_result=guard_payload,
+                tool_call_ids=[*state.tool_call_ids, tool_call.id],
+                llm_messages=[*state.llm_messages, *tool_messages],
+                context_metadata=with_sdk_agent_approval_metadata(state.context_metadata, sdk_approval_payload),
+            )
         result_payload = _jsonable(agent_result.raw_result)
         if not result_payload and agent_result.status == "failed":
             result_payload = {"tool_name": command.requested_tool_name or "", "ok": False, "error": agent_result.summary}
+        missing_input_state = _maybe_wait_for_missing_runtime_tool_input(
+            state,
+            command=command,
+            tool_input=tool_input,
+            agent_result=agent_result,
+            result_payload=result_payload,
+            guard_payload=guard_payload,
+            durable_step_id=durable_step_id,
+            dependencies=dependencies,
+        )
+        if missing_input_state is not None:
+            return missing_input_state
         result_payload = _with_result_envelope(command.requested_tool_name or "", result_payload, state=state)
+        result_payload = _with_goal_validation(
+            command.requested_tool_name or "",
+            tool_input,
+            result_payload,
+            state=state,
+            registry=dependencies.registry,
+        )
         tool_ok = agent_result.status != "failed" and _tool_result_ok(result_payload)
         tool_error = None if tool_ok else _tool_result_error(result_payload)
         tool_call = dependencies.automation_service.record_tool_call(
@@ -2660,7 +4234,7 @@ def _maybe_tool_node(
         _record_skill_runtime_event(
             state,
             dependencies=dependencies,
-            event="tool_succeeded",
+            event="tool_succeeded" if tool_ok else "tool_failed",
             evidence=_tool_runtime_evidence(
                 state,
                 command=command,
@@ -2686,6 +4260,14 @@ def _maybe_tool_node(
             ),
         )
         result_summary = _runtime_result_summary_metadata(result_payload)
+        runtime_execution_trace = _runtime_tool_execution_trace(
+            command=command,
+            tool_input=tool_input,
+            status="succeeded" if tool_ok else "failed",
+            result_payload=result_payload,
+            result_summary=result_summary,
+            error=tool_error,
+        )
         _emit_runtime_tool_event(
             dependencies,
             "tool_result_summary",
@@ -2707,6 +4289,22 @@ def _maybe_tool_node(
             state=state,
             definition=definition,
             result={"message": str(exc), "error_type": exc.__class__.__name__},
+        )
+        failure_payload = _with_goal_validation(
+            command.requested_tool_name or "",
+            tool_input,
+            failure_payload,
+            state=state,
+            registry=dependencies.registry,
+        )
+        failure_result_summary = _runtime_result_summary_metadata(failure_payload)
+        runtime_execution_trace = _runtime_tool_execution_trace(
+            command=command,
+            tool_input=tool_input,
+            status="failed",
+            result_payload=failure_payload,
+            result_summary=failure_result_summary,
+            error=str(exc),
         )
         tool_call = dependencies.automation_service.record_tool_call(
             ToolCallLogCreate(
@@ -2782,14 +4380,157 @@ def _maybe_tool_node(
             tool_call_id=tool_call.id,
             status="failed",
             summary=str(exc) or "工具执行失败，暂无可用结果摘要。",
-            result_summary={},
+            result_summary=failure_result_summary,
         )
+    context_metadata = state.context_metadata
+    if runtime_execution_trace is not None:
+        context_metadata = _with_runtime_decision_trace(context_metadata, "tool_execution", runtime_execution_trace)
+    if tool_ok:
+        context_metadata = clear_pending_operation(context_metadata)
+        context_metadata = promote_contract_resource_effects_context(
+            context_metadata,
+            result_payload,
+            tool_input=tool_input,
+            semantic_profile=getattr(runtime_definition, "semantic_profile", None),
+        )
+        context_metadata = promote_declared_resource_effects_context(context_metadata, result_payload)
+        context_metadata = promote_filesystem_result_context(context_metadata, result_payload)
     return state.with_updates(
         current_step="maybe_tool",
         guard_result=guard_payload,
         tool_call_ids=[*state.tool_call_ids, tool_call.id],
         llm_messages=[*state.llm_messages, *tool_messages],
+        context_metadata=context_metadata,
     )
+
+
+def _maybe_wait_for_missing_runtime_tool_input(
+    state: AgentState,
+    *,
+    command: AgentRunCommand,
+    tool_input: dict[str, Any],
+    agent_result: StandardAgentResult,
+    result_payload: dict[str, Any],
+    guard_payload: dict[str, Any],
+    durable_step_id: str | None,
+    dependencies: AgentGraphDependencies,
+) -> AgentState | None:
+    missing = _missing_runtime_tool_input_fields(agent_result=agent_result, result_payload=result_payload)
+    if not missing:
+        return None
+    operation_args = result_payload.get("arguments") if isinstance(result_payload.get("arguments"), dict) else tool_input
+    completion = ToolInputCompletionResult(
+        tool_input=dict(operation_args),
+        missing_required_fields=tuple(missing),
+    )
+    pending = build_pending_operation_from_tool_input_completion(
+        tool_name=command.requested_tool_name or "",
+        completion=completion,
+        context_metadata=state.context_metadata,
+        user_message=state.user_message,
+    )
+    if pending is None:
+        return None
+
+    logger.info(
+        "Runtime tool input incomplete; persisted pending operation: capability=%s operation=%s missing=%s known_keys=%s",
+        pending.capability,
+        pending.operation,
+        list(pending.missing_args),
+        sorted(pending.known_args.keys()),
+    )
+
+    user_message = f"工具参数还不完整：缺少 {'、'.join(missing)}。"
+    wait_payload = {
+        "ok": False,
+        "error_code": "TOOL_INPUT_INVALID",
+        "reason": str(result_payload.get("error") or result_payload.get("reason") or user_message),
+        "user_message": user_message,
+        "next_action": "wait_user_input",
+        "retryable": True,
+        "error_details": {
+            "requested_tool_name": command.requested_tool_name,
+            "tool_input": dict(operation_args),
+            "missing_required_fields": list(missing),
+            "pending_operation": pending.to_metadata_dict(),
+        },
+        "cost": {},
+        "artifacts": {},
+    }
+    tool_call = dependencies.automation_service.record_tool_call(
+        ToolCallLogCreate(
+            workflow_run_id=state.workflow_run_id,
+            tool_name=command.requested_tool_name or "",
+            tool_group="agent",
+            status=ToolCallStatus.BLOCKED,
+            input_payload=tool_input,
+            output_payload={"guard_result": wait_payload, "execution": "missing_tool_input", "result": result_payload},
+            error=user_message,
+        )
+    )
+    _mark_durable_tool_step_waiting_user(
+        durable_step_id,
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        output_payload={"guard_result": wait_payload, "execution": "missing_tool_input", "result": result_payload, "error": user_message},
+    )
+    tool_messages = _append_tool_pair_messages(
+        state,
+        dependencies=dependencies,
+        tool_call_log_id=tool_call.id,
+        tool_name=command.requested_tool_name or "",
+        tool_input=tool_input,
+        status="waiting_user",
+        result=result_payload,
+        error=user_message,
+    )
+    _emit_runtime_tool_event(
+        dependencies,
+        "tool_finished",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        tool_call_id=tool_call.id,
+        status="waiting_user",
+        summary=user_message,
+    )
+    return state.with_updates(
+        current_step="wait_user_input",
+        guard_result=wait_payload,
+        tool_call_ids=[*state.tool_call_ids, tool_call.id],
+        llm_messages=[*state.llm_messages, *tool_messages],
+        context_metadata=with_pending_operation(state.context_metadata, pending),
+        final_response=user_message,
+        response_mode="tool_input_ask_user",
+    )
+
+
+def _missing_runtime_tool_input_fields(*, agent_result: StandardAgentResult, result_payload: dict[str, Any]) -> tuple[str, ...]:
+    # Only an explicit runtime argument error can create a pending tool-input
+    # frame. High-level semantic gaps such as ``filesystem_operation`` mean
+    # "the action is unclear", not "the tool schema is missing a field".
+    # Treating generic missing_information as a schema error leaks internal
+    # names to users and overwrites the Skill's natural clarification message.
+    error_code = str(result_payload.get("error_code") or "").strip()
+    if error_code != "MISSING_REQUIRED_ARGUMENT":
+        semantic_missing = result_payload.get("missing_information") or agent_result.missing_information
+        if semantic_missing:
+            logger.info(
+                "Runtime kept semantic gap out of pending tool-input state: fields=%s error_code=%s",
+                list(semantic_missing) if isinstance(semantic_missing, (list, tuple)) else semantic_missing,
+                error_code or "none",
+            )
+        return ()
+
+    missing = result_payload.get("missing_args")
+    if not isinstance(missing, (list, tuple)):
+        return ()
+    if str(result_payload.get("next_action") or "") not in {"wait_user_input", "ask_user", "ask_user_or_complete_from_pending_operation", ""}:
+        return ()
+    return tuple(str(field) for field in missing if str(field or "").strip())
 
 
 def _run_agent_tool_through_runtime(
@@ -2799,39 +4540,158 @@ def _run_agent_tool_through_runtime(
     dependencies: AgentGraphDependencies,
     tool_input: dict[str, Any],
 ) -> StandardAgentResult:
+    capability_name = command.requested_tool_name or "unknown_agent"
+    executor_id = _agent_runtime_executor_id(command, dependencies=dependencies)
+    delegation_id = f"delegation:{state.workflow_run_id}:{uuid4().hex}"
     executors: dict[str, AbilityAgent] = {
         TOOL_REGISTRY_EXECUTOR_ID: ToolRegistryAgentExecutor(
             dependencies.registry,
             session_provider=lambda _context: dependencies.db_session,
         ),
-        **dependencies.agent_executors,
+        **_runtime_agent_executors(dependencies),
     }
     runtime = AgentRuntime(
-        registry=create_default_agent_capability_registry(
-            tool_registry=dependencies.registry,
-            executor_id_by_capability=dependencies.capability_executor_ids,
-        ),
+        registry=_runtime_capability_registry(dependencies),
         executors=executors,
     )
-    return runtime.call(
-        AgentTask(
-            capability_id=command.requested_tool_name or "",
-            goal=state.user_message,
-            input_payload=tool_input,
-        ),
-        AgentRuntimeContext(
-            session_id=state.session_id,
-            run_id=state.workflow_run_id,
-            task_id=f"{state.workflow_run_id}:tool-{len(state.tool_call_ids) + 1}",
-            permission_scope={"source_type": command.source_type, "user_confirmed": command.user_confirmed},
-            metadata={"agent_run_id": state.agent_run_id},
-        ),
+    context = AgentRuntimeContext(
+        session_id=state.session_id,
+        run_id=state.workflow_run_id,
+        task_id=f"{state.workflow_run_id}:tool-{len(state.tool_call_ids) + 1}",
+        permission_scope={"source_type": command.source_type, "user_confirmed": command.user_confirmed},
+        metadata={"agent_run_id": state.agent_run_id, "delegation_id": delegation_id},
+        capability_id=command.requested_tool_name,
+        event_sink=dependencies.event_sink,
     )
+    _emit_subagent_lifecycle_event(
+        dependencies,
+        "subagent_started",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        executor_id=executor_id,
+        delegation_id=delegation_id,
+        status="running",
+        summary=f"已委派 {capability_name}，子 Agent 开始执行。",
+    )
+    logger.info(
+        "Child agent delegation started: capability=%s delegation_id=%s workflow_run_id=%s",
+        capability_name,
+        delegation_id,
+        state.workflow_run_id,
+    )
+    try:
+        result = runtime.call(
+            AgentTask(
+                capability_id=capability_name,
+                goal=state.user_message,
+                input_payload=tool_input,
+            ),
+            context,
+        )
+    except Exception as exc:
+        _emit_subagent_lifecycle_event(
+            dependencies,
+            "subagent_finished",
+            state=state,
+            command=command,
+            tool_input=tool_input,
+            executor_id=executor_id,
+            delegation_id=delegation_id,
+            status="failed",
+            summary=f"子 Agent 执行失败：{type(exc).__name__}。",
+        )
+        logger.exception(
+            "Child agent delegation failed: capability=%s delegation_id=%s workflow_run_id=%s",
+            capability_name,
+            delegation_id,
+            state.workflow_run_id,
+        )
+        raise
+
+    result_status = str(result.status or "").strip().lower()
+    lifecycle_status = "waiting_user" if result_status in {"needs_approval", "waiting_user"} or result.requires_user_action else (
+        "failed" if result_status in {"failed", "error"} else "succeeded"
+    )
+    _emit_subagent_lifecycle_event(
+        dependencies,
+        "subagent_finished",
+        state=state,
+        command=command,
+        tool_input=tool_input,
+        executor_id=executor_id,
+        delegation_id=delegation_id,
+        status=lifecycle_status,
+        summary=result.summary or f"子 Agent {lifecycle_status}。",
+    )
+    logger.info(
+        "Child agent delegation finished: capability=%s delegation_id=%s status=%s",
+        capability_name,
+        delegation_id,
+        lifecycle_status,
+    )
+    return result
+
+
+def _emit_subagent_lifecycle_event(
+    dependencies: AgentGraphDependencies,
+    event_type: str,
+    *,
+    state: AgentState,
+    command: AgentRunCommand,
+    tool_input: dict[str, Any],
+    executor_id: str,
+    delegation_id: str,
+    status: str,
+    summary: str,
+) -> None:
+    """Emit one durable UI boundary for a delegated Agent run.
+
+    Nested MCP events describe work performed inside the child Agent. This
+    boundary describes the child Agent itself so clients can distinguish
+    "delegated" from "registered" and correlate all nested calls reliably.
+    """
+    if dependencies.event_sink is None:
+        return
+    capability = command.requested_tool_name or "unknown_agent"
+    definition = _runtime_capability_definition(capability, dependencies=dependencies)
+    if definition is None or getattr(definition, "kind", None) != "agent":
+        return
+    payload: dict[str, Any] = {
+        "event_type": event_type,
+        "event_label": "子 Agent 已委派" if event_type == "subagent_started" else "子 Agent 已返回",
+        "session_id": state.session_id,
+        "workflow_run_id": state.workflow_run_id,
+        "agent_run_id": state.agent_run_id,
+        "delegation_id": delegation_id,
+        "step_index": len(state.tool_call_ids) + 1,
+        "tool_name": capability,
+        "capability": capability,
+        "capability_kind": "agent",
+        "executor_id": executor_id,
+        "status": status,
+        "summary": summary,
+        "tool_input_keys": sorted(str(key) for key in tool_input),
+        "parent_capability": capability,
+        "subagent_name": getattr(definition, "name", None) if definition is not None else None,
+    }
+    try:
+        dependencies.event_sink(payload)
+    except Exception:
+        logger.exception(
+            "Failed to emit child-agent lifecycle event: event_type=%s capability=%s delegation_id=%s",
+            event_type,
+            capability,
+            delegation_id,
+        )
 
 
 def _agent_runtime_executor_id(command: AgentRunCommand, *, dependencies: AgentGraphDependencies) -> str:
     capability = command.requested_tool_name or ""
-    return dependencies.capability_executor_ids.get(capability, TOOL_REGISTRY_EXECUTOR_ID)
+    definition = _runtime_capability_definition(capability, dependencies=dependencies)
+    if definition is not None:
+        return definition.executor_id
+    return _runtime_capability_executor_ids(dependencies).get(capability, TOOL_REGISTRY_EXECUTOR_ID)
 
 
 def _emit_runtime_tool_event(
@@ -2854,6 +4714,7 @@ def _emit_runtime_tool_event(
     if dependencies.event_sink is None:
         return
     tool_name = command.requested_tool_name or "unknown_tool"
+    capability_definition = _runtime_capability_definition(tool_name, dependencies=dependencies)
     payload: dict[str, Any] = {
         "event_type": event_type,
         "event_label": _runtime_tool_event_label(event_type),
@@ -2862,6 +4723,9 @@ def _emit_runtime_tool_event(
         "agent_run_id": state.agent_run_id,
         "step_index": step_index or len(state.tool_call_ids) + 1,
         "tool_name": tool_name,
+        "capability_kind": capability_definition.kind if capability_definition is not None else None,
+        # Let clients render the actual executor path instead of guessing from the tool name.
+        "executor_id": _agent_runtime_executor_id(command, dependencies=dependencies),
         "tool_call_id": tool_call_id,
         "status": status,
         "summary": summary,
@@ -2906,6 +4770,8 @@ def _runtime_reasoning_summary(tool_name: str, *, tool_input: dict[str, Any], us
         return "当前问题可以先查本地企业库，主 agent 会优先使用本地只读工具。"
     if tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
         return "当前问题涉及岗位来源概览，主 agent 会读取本地岗位来源统计。"
+    if tool_name == FILESYSTEM_SKILL_CAPABILITY:
+        return "当前问题属于本地文件操作，主 agent 只选择文件系统 Skill；具体读、查存在、改名、替换或复制由 Skill 内部判断。"
     return f"模型选择了能力 {tool_name}，运行时会先校验权限和输入再执行。"
 
 
@@ -2937,6 +4803,10 @@ def _runtime_result_summary_metadata(result_payload: Any) -> dict[str, Any]:
         envelope = nested.get("result_envelope")
     if envelope is None and isinstance(deeper.get("result_envelope"), dict):
         envelope = deeper.get("result_envelope")
+    goal_validation = result_payload.get("goal_validation") if isinstance(result_payload.get("goal_validation"), dict) else None
+    if goal_validation is None and isinstance(envelope, dict) and isinstance(envelope.get("goal_validation"), dict):
+        goal_validation = envelope.get("goal_validation")
+    filesystem_trace = _runtime_filesystem_trace(result_payload, nested, deeper)
 
     result_items = _first_list(deeper.get("results"), nested.get("results"), result_payload.get("results"))
     source_items = _first_list(deeper.get("sources"), nested.get("sources"), result_payload.get("sources"))
@@ -2959,7 +4829,57 @@ def _runtime_result_summary_metadata(result_payload: Any) -> dict[str, Any]:
         summary["source_count"] = len(source_items)
     if domains:
         summary["source_domains"] = domains[:8]
+    if isinstance(goal_validation, dict):
+        # Keep the no-dead-end signal in the compact event summary so callers
+        # can see whether the next step should continue, ask, or finish.
+        summary["goal_validation"] = goal_validation
+        summary["goal_completed"] = bool(goal_validation.get("completed"))
+        summary["goal_next_action"] = goal_validation.get("next_action")
+    if filesystem_trace is not None:
+        summary["filesystem_trace"] = filesystem_trace
     return summary
+
+
+def _runtime_filesystem_trace(*payloads: Any) -> dict[str, Any] | None:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        trace = payload.get("filesystem_trace")
+        if not isinstance(trace, dict):
+            continue
+        postcheck = trace.get("postcheck") if isinstance(trace.get("postcheck"), dict) else {}
+        return {
+            "operation": trace.get("operation"),
+            "precheck": _compact_filesystem_trace_section(trace.get("precheck")),
+            "script": _compact_filesystem_trace_section(trace.get("script")),
+            "postcheck": _compact_filesystem_trace_section(postcheck),
+        }
+    return None
+
+
+def _compact_filesystem_trace_section(section: Any) -> dict[str, Any]:
+    if not isinstance(section, dict):
+        return {}
+    allowed = {
+        "completed",
+        "reason",
+        "source_path",
+        "target_path",
+        "path",
+        "source_exists_before",
+        "target_exists_before",
+        "source_exists_after",
+        "target_exists_after",
+        "path_exists_after",
+        "internal_tool",
+        "internal_script",
+        "ok",
+        "error",
+        "return_code",
+    }
+    # Keep runtime events compact: enough to debug routing/execution, without
+    # copying file contents or long subprocess output into every event.
+    return {key: value for key, value in section.items() if key in allowed}
 
 
 def _first_list(*values: Any) -> list[Any]:
@@ -3005,6 +4925,11 @@ def _runtime_source_domains(evidence: list[dict[str, Any]], source_items: list[A
 
 
 def _runtime_result_summary_text(result_summary: dict[str, Any]) -> str:
+    filesystem_trace = result_summary.get("filesystem_trace") if isinstance(result_summary.get("filesystem_trace"), dict) else None
+    if filesystem_trace is not None:
+        text = _filesystem_trace_summary_text(filesystem_trace)
+        if text:
+            return text
     parts: list[str] = []
     result_count = result_summary.get("result_count")
     source_count = result_summary.get("source_count")
@@ -3016,6 +4941,21 @@ def _runtime_result_summary_text(result_summary: dict[str, Any]) -> str:
     if domains:
         parts.append("来源包括 " + "、".join(str(domain) for domain in domains[:3]))
     return "，".join(parts) + "。" if parts else "工具结果已完成，暂无可展示的来源摘要。"
+
+
+def _filesystem_trace_summary_text(filesystem_trace: dict[str, Any]) -> str:
+    operation = str(filesystem_trace.get("operation") or "文件操作").strip()
+    postcheck = filesystem_trace.get("postcheck") if isinstance(filesystem_trace.get("postcheck"), dict) else {}
+    source = str(postcheck.get("source_path") or "").strip()
+    target = str(postcheck.get("target_path") or "").strip()
+    path_text = f"{source} -> {target}" if source and target else str(postcheck.get("path") or "").strip()
+    reason = str(postcheck.get("reason") or "").strip()
+    if postcheck.get("completed") is False:
+        suffix = f"，原因：{reason}" if reason else ""
+        return f"文件动作复核失败：{operation}，{path_text}{suffix}。" if path_text else f"文件动作复核失败：{operation}{suffix}。"
+    if postcheck.get("completed") is True:
+        return f"文件动作已执行并复核：{operation}，{path_text}。" if path_text else f"文件动作已执行并复核：{operation}。"
+    return ""
 
 
 def _realtime_tool_finished_summary(
@@ -3135,12 +5075,40 @@ def _runtime_evidence_summary(evidence: list[dict[str, Any]]) -> str:
 
 
 def _agent_runtime_result_metadata(result: StandardAgentResult, *, executor_id: str) -> dict[str, Any]:
-    return {
+    metadata = {
         "executor_id": executor_id,
         "status": result.status,
         "summary": result.summary,
         "requires_user_action": result.requires_user_action,
     }
+    telemetry = _agent_runtime_compact_telemetry(result.raw_result)
+    if telemetry is not None:
+        metadata["telemetry"] = telemetry
+    return metadata
+
+
+def _agent_runtime_compact_telemetry(raw_result: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(raw_result, dict):
+        return None
+    raw_metadata = raw_result.get("metadata") if isinstance(raw_result.get("metadata"), dict) else None
+    telemetry = raw_metadata.get("telemetry") if isinstance(raw_metadata, dict) and isinstance(raw_metadata.get("telemetry"), dict) else None
+    if telemetry is None:
+        return None
+    allowed_keys = {
+        "schema_version",
+        "subagent_name",
+        "capability_id",
+        "status",
+        "allowed_tool_count",
+        "tool_call_count",
+        "retry_count",
+        "approval_required",
+        "operation_ref_count",
+        "sandbox",
+        "delegation",
+    }
+    # Runtime logs need enough counters for dashboards, but should not duplicate raw child-agent traces.
+    return {key: value for key, value in telemetry.items() if key in allowed_keys}
 
 
 def _begin_durable_tool_step(
@@ -3209,6 +5177,36 @@ def _mark_durable_tool_step_completed(
             return
         service.mark_step_failed(
             step_id,
+            output_payload={**output_payload, "tool_call_log_id": tool_call_log_id},
+        )
+    except Exception:
+        return
+
+
+def _mark_durable_tool_step_waiting_user(
+    step_id: str | None,
+    *,
+    state: AgentState,
+    command: AgentRunCommand,
+    tool_input: dict[str, Any],
+    dependencies: AgentGraphDependencies,
+    tool_call_log_id: str,
+    output_payload: dict[str, Any],
+) -> None:
+    service = dependencies.durable_state_service
+    if service is None or step_id is None:
+        return
+    try:
+        _ensure_durable_tool_step(
+            step_id,
+            state=state,
+            command=command,
+            tool_input=tool_input,
+            dependencies=dependencies,
+        )
+        service.mark_step_waiting_user(
+            step_id,
+            tool_call_log_id=tool_call_log_id,
             output_payload={**output_payload, "tool_call_log_id": tool_call_log_id},
         )
     except Exception:
@@ -3591,6 +5589,32 @@ def _tool_runtime_evidence(
     }
 
 
+def _runtime_tool_execution_trace(
+    *,
+    command: AgentRunCommand,
+    tool_input: dict[str, Any],
+    status: str,
+    result_payload: Any,
+    result_summary: dict[str, Any],
+    error: str | None,
+) -> dict[str, Any]:
+    trace: dict[str, Any] = {
+        "tool_name": command.requested_tool_name,
+        "status": status,
+        "tool_input": dict(tool_input),
+        "error": error,
+    }
+    if isinstance(result_summary, dict):
+        for key in ("goal_validation", "goal_completed", "goal_next_action", "filesystem_trace"):
+            if key in result_summary:
+                trace[key] = result_summary[key]
+    if "filesystem_trace" not in trace:
+        filesystem_trace = _runtime_filesystem_trace(result_payload)
+        if filesystem_trace is not None:
+            trace["filesystem_trace"] = filesystem_trace
+    return trace
+
+
 def _resolved_tool_input(command: AgentRunCommand, state: AgentState) -> dict[str, Any]:
     if command.tool_input:
         return dict(command.tool_input)
@@ -3615,6 +5639,11 @@ def _resolved_tool_input(command: AgentRunCommand, state: AgentState) -> dict[st
     if command.requested_tool_name == LOCAL_COMPANY_DATABASE_OVERVIEW_TOOL:
         return {"sample_limit": requested_sample_limit_from_text(state.user_message)}
     if command.requested_tool_name == LOCAL_JOB_SOURCE_OVERVIEW_TOOL:
+        context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
+        context_pack = context_pack if isinstance(context_pack, dict) else {}
+        sync_policy = context_pack.get("sync_policy") if isinstance(context_pack.get("sync_policy"), dict) else {}
+        if sync_policy.get("mode") == "company_board_count":
+            return {"mode": "company_board_count"}
         return {"sample_limit": requested_sample_limit_from_text(state.user_message), "include_external_job_board": True}
     if command.requested_tool_name == APPLICATION_FIND_APPLY_ENTRY_TOOL:
         job_id = _extract_application_job_id(state.user_message)
@@ -3691,13 +5720,20 @@ def _append_tool_pair_messages(
     status: str,
     result: Any,
     error: str | None,
+    tool_call_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    # Keep the provider call id in the transcript when one exists. Normal
+    # runtime calls use the database log id; native calls also have a model-side
+    # id that is needed to diagnose blocked or unstarted requests.
+    call_content_json = {"tool_name": tool_name, "input": tool_input}
+    if tool_call_id:
+        call_content_json["tool_call_id"] = tool_call_id
     call_message = dependencies.conversation_service.append_message(
         state.session_id,
         AgentMessageCreate(
             role=AgentMessageRole.TOOL_CALL,
             content_text=f"Tool call: {tool_name}",
-            content_json={"tool_name": tool_name, "input": tool_input},
+            content_json=call_content_json,
             agent_run_id=state.agent_run_id,
             workflow_run_id=state.workflow_run_id,
             tool_call_log_id=tool_call_log_id,
@@ -3709,7 +5745,13 @@ def _append_tool_pair_messages(
         AgentMessageCreate(
             role=AgentMessageRole.TOOL_RESULT,
             content_text=f"Tool result: {tool_name} {status}",
-            content_json={"tool_name": tool_name, "status": status, "result": result, "error": error},
+            content_json={
+                "tool_name": tool_name,
+                "status": status,
+                "result": result,
+                "error": error,
+                **({"tool_call_id": tool_call_id} if tool_call_id else {}),
+            },
             agent_run_id=state.agent_run_id,
             workflow_run_id=state.workflow_run_id,
             tool_call_log_id=tool_call_log_id,
@@ -3820,10 +5862,70 @@ def _with_result_envelope(tool_name: str, result_payload: Any, *, state: AgentSt
     return {**result_payload, "result_envelope": envelope.to_dict()}
 
 
+def _with_goal_validation(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    result_payload: Any,
+    *,
+    state: AgentState,
+    registry: Any | None = None,
+) -> Any:
+    if not isinstance(result_payload, dict):
+        return result_payload
+    goal_state = GoalState.from_metadata_dict(state.context_metadata.get(GOAL_STATE_METADATA_KEY))
+    if goal_state is None or not goal_state.expected_operation:
+        return result_payload
+    semantic_profile = _semantic_profile_for_tool(registry, tool_name)
+    expected_operation = str(goal_state.expected_operation or "").strip()
+    filesystem_goal = get_filesystem_operation_spec(expected_operation) is not None
+    if goal_state.intent != "filesystem_operation" and not filesystem_goal and semantic_profile is None:
+        return result_payload
+
+    # This is the runtime-level afterToolCall checkpoint. It does not replace
+    # tool success/failure; it adds a second judgment: did the tool result satisfy
+    # the user's actual target for this turn?
+    validation = validate_goal_completion(
+        goal_state=goal_state,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        result_payload=result_payload,
+        semantic_profile=semantic_profile,
+    )
+    validation_payload = validation.to_metadata_dict()
+    enriched = {
+        **result_payload,
+        "goal_validation": validation_payload,
+        "goal_completed": validation.completed,
+        "goal_advanced": validation.advanced,
+    }
+    envelope = enriched.get("result_envelope")
+    if isinstance(envelope, dict):
+        enriched["result_envelope"] = {
+            **envelope,
+            "goal_validation": validation_payload,
+            "goal_completed": validation.completed,
+            "goal_advanced": validation.advanced,
+        }
+    return enriched
+
+
+def _semantic_profile_for_tool(registry: Any | None, tool_name: str) -> Any | None:
+    if registry is None or not tool_name:
+        return None
+    get_definition = getattr(registry, "get", None)
+    if not callable(get_definition):
+        return None
+    definition = get_definition(tool_name)
+    return getattr(definition, "semantic_profile", None) if definition is not None else None
+
+
 def _generate_final_response(state: AgentState, *, dependencies: AgentGraphDependencies) -> tuple[str, str]:
     unreliable_search_response = _unreliable_external_web_search_response(state)
     if unreliable_search_response is not None:
         return unreliable_search_response, "tool_result_summary_unreliable"
+    grounded_filesystem_response = _grounded_filesystem_mutation_response(state)
+    if grounded_filesystem_response is not None:
+        return grounded_filesystem_response
     if _has_prepared_final_response(state):
         return state.final_response, state.response_mode
     synthesis_messages = external_web_search_synthesis_messages(state)
@@ -3833,6 +5935,19 @@ def _generate_final_response(state: AgentState, *, dependencies: AgentGraphDepen
             return completion.content, "llm_tool_result_summary"
         except Exception:
             pass
+    generic_tool_answer = _tool_observation_final_answer_response(state, dependencies=dependencies)
+    if generic_tool_answer is not None:
+        return generic_tool_answer
+    filesystem_synthesis_messages = filesystem_answer_synthesis_messages(state)
+    if filesystem_synthesis_messages is not None and dependencies.llm_client is not None:
+        try:
+            completion = dependencies.llm_client.complete(messages=filesystem_synthesis_messages)
+            return completion.content, "llm_filesystem_answer_synthesis"
+        except Exception:
+            payload = _latest_tool_result_payload(state, FILESYSTEM_SKILL_CAPABILITY)
+            fallback = _filesystem_answer_intent_fallback_response(state, payload)
+            if fallback is not None:
+                return fallback, "filesystem_answer_synthesis_fallback"
     tool_response = tool_result_summary_response(state, dependencies=dependencies)
     if tool_response is not None:
         return tool_response
@@ -3840,6 +5955,31 @@ def _generate_final_response(state: AgentState, *, dependencies: AgentGraphDepen
         return "Agent runtime completed deterministic workflow skeleton.", "deterministic_stub"
     completion = dependencies.llm_client.complete(messages=state.llm_messages)
     return completion.content, "llm"
+
+
+def _grounded_filesystem_mutation_response(state: AgentState) -> tuple[str, str] | None:
+    """Prefer verified file mutation evidence over stale generic assistant text."""
+
+    if state.requested_tool_name != FILESYSTEM_SKILL_CAPABILITY:
+        return None
+    payload = _latest_tool_result_payload(state, FILESYSTEM_SKILL_CAPABILITY)
+    if payload is None:
+        return None
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    operation = str(result_payload.get("operation") or "").strip()
+    if operation not in {"copy_file", "rename_file"}:
+        return None
+    if payload.get("status") != "succeeded" or not _tool_result_ok(result_payload):
+        return None
+    return _filesystem_skill_summary_response(payload), "tool_result_summary"
+
+
+def _tool_observation_final_answer_response(
+    state: AgentState,
+    *,
+    dependencies: AgentGraphDependencies,
+) -> tuple[str, str] | None:
+    return complete_tool_observation_final_answer(state, llm_client=dependencies.llm_client)
 
 
 def tool_result_summary_response(
@@ -3867,6 +6007,11 @@ def tool_result_summary_response(
         payload = _latest_tool_result_payload(state, LOCAL_JOB_SOURCE_OVERVIEW_TOOL)
         if payload is None:
             return None
+        context_pack = state.context_metadata.get("context_pack") if isinstance(state.context_metadata, dict) else None
+        context_pack = context_pack if isinstance(context_pack, dict) else {}
+        sync_policy = context_pack.get("sync_policy") if isinstance(context_pack.get("sync_policy"), dict) else {}
+        if sync_policy.get("mode") == "company_board_count":
+            return _company_board_count_summary_response(payload), "tool_result_summary"
         return _job_source_overview_summary_response(payload), "tool_result_summary"
     if state.requested_tool_name == OFFERIO_COMPANY_JOBS_TOOL:
         payload = _latest_tool_result_payload(state, OFFERIO_COMPANY_JOBS_TOOL)
@@ -3878,6 +6023,14 @@ def tool_result_summary_response(
         if payload is None:
             return None
         return _apply_entry_task_summary_response(payload), "tool_result_summary"
+    if state.requested_tool_name == FILESYSTEM_SKILL_CAPABILITY:
+        payload = _latest_tool_result_payload(state, FILESYSTEM_SKILL_CAPABILITY)
+        if payload is None:
+            return None
+        fallback = _filesystem_answer_intent_fallback_response(state, payload)
+        if fallback is not None:
+            return fallback, "filesystem_answer_intent_fallback"
+        return _filesystem_skill_summary_response(payload), "tool_result_summary"
     if state.requested_tool_name == EXTERNAL_WEB_SEARCH_TOOL:
         unreliable_search_response = _unreliable_external_web_search_response(state)
         if unreliable_search_response is not None:
@@ -3887,6 +6040,225 @@ def tool_result_summary_response(
             return None
         return _external_web_search_summary_response(payload), "tool_result_summary"
     return None
+
+
+def _filesystem_skill_summary_response(payload: dict[str, Any]) -> str:
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    operation = str(result_payload.get("operation") or "").strip()
+    spec = get_filesystem_operation_spec(operation)
+    arguments = result_payload.get("arguments") if isinstance(result_payload.get("arguments"), dict) else {}
+    raw_tool_result = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    inner_result = raw_tool_result.get("result") if isinstance(raw_tool_result.get("result"), dict) else {}
+    ok = payload.get("status") == "succeeded" and _tool_result_ok(result_payload)
+    if spec is None:
+        envelope = result_payload.get("result_envelope") if isinstance(result_payload.get("result_envelope"), dict) else {}
+        # Unknown operation is already an execution failure. Prefer the executor
+        # or envelope error summary; never turn an unclassified failure into a
+        # misleading user-facing "completed" message.
+        summary = str(
+            result_payload.get("summary")
+            or envelope.get("summary")
+            or raw_tool_result.get("error")
+            or payload.get("error")
+            or ("filesystem Skill 已完成。" if ok else "filesystem Skill 执行失败。")
+        )
+        return summary
+
+    if not ok:
+        error = str(result_payload.get("error") or raw_tool_result.get("error") or payload.get("error") or f"{spec.summary}失败。")
+        return f"{spec.summary}失败：{error}"
+    if result_payload.get("no_op"):
+        return str(result_payload.get("summary") or "没有执行替换：新旧内容相同，文件已经满足当前目标。")
+    if spec.goal_kind == "read_content":
+        return _filesystem_read_summary(spec=spec, arguments=arguments, inner_result=inner_result)
+    if spec.goal_kind == "path_exists":
+        path = str(arguments.get("path") or "").strip()
+        exists = bool(inner_result.get("exists"))
+        return f"文件存在：{path}" if exists else f"文件不存在：{path}"
+    if spec.goal_kind == "file_to_file":
+        filesystem_trace = result_payload.get("filesystem_trace") if isinstance(result_payload.get("filesystem_trace"), dict) else None
+        return _filesystem_file_to_file_summary(spec=spec, arguments=arguments, filesystem_trace=filesystem_trace)
+
+    summary = str(result_payload.get("summary") or raw_tool_result.get("error") or "filesystem Skill 已完成。")
+    return summary
+
+
+def _filesystem_read_summary(*, spec: FilesystemOperationSpec, arguments: dict[str, Any], inner_result: dict[str, Any]) -> str:
+    path = str(arguments.get("path") or "").strip()
+    content = str(inner_result.get("content") or inner_result.get("stdout") or "")
+    if not content.strip():
+        return f"已读取文件 {path}，但文件内容为空。" if path else "已读取文件，但文件内容为空。"
+    title = f"已读取文件 {path} 的内容：" if path else "已读取文件内容："
+    return f"{title}\n\n```text\n{content.rstrip()}\n```"
+
+
+def filesystem_answer_synthesis_messages(state: AgentState) -> list[dict[str, Any]] | None:
+    if state.requested_tool_name != FILESYSTEM_SKILL_CAPABILITY:
+        return None
+    payload = _latest_tool_result_payload(state, FILESYSTEM_SKILL_CAPABILITY)
+    if payload is None:
+        return None
+
+    goal_state = GoalState.from_metadata_dict(state.context_metadata.get(GOAL_STATE_METADATA_KEY))
+    answer_intent, answer_policy = _filesystem_answer_profile(state, goal_state)
+    path = _filesystem_read_path_from_payload(payload) or _filesystem_path_from_goal(goal_state)
+    content = _filesystem_read_content_from_payload(payload)
+    tool_evidence = _filesystem_final_answer_evidence(payload, content=content)
+    if not tool_evidence.strip():
+        return None
+
+    policy = {"answer_intent": answer_intent, **answer_policy}
+    instruction = (
+        "你是 OfferMaster 的主 Agent。filesystem 工具或 Skill 已经执行完成。"
+        "工具结果只是 observation，不是最终回答。"
+        "不要把 read_file 的原始内容直接当成最终回答；"
+        "不要原样展示全文，除非用户明确要求展示原文；"
+        "必须回到用户原始目标，判断用户要展示、总结、提取、分析、对比还是确认执行结果。"
+        "如果用户明确要求显示全文、读出来、展示原文或 cat 文件，可以展示文件内容；"
+        "如果用户要求总结、分析、提取、对比、评价或给建议，必须基于文件内容加工后回答。"
+        "不要复述内部工具协议、Tool call、Tool result 或 JSON。用中文回答，表达简洁。"
+    )
+    evidence_message = (
+        f"用户原始问题：{state.user_message}\n"
+        f"目标文件：{path}\n"
+        f"最终回答策略 JSON：{json.dumps(policy, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "filesystem observation 如下，请把它当作证据，而不是直接当作最终答案：\n"
+        f"{tool_evidence}"
+    )
+    return [
+        {"role": "system", "content": instruction, "metadata": {"source": "filesystem_answer_synthesis"}},
+        {"role": "user", "content": evidence_message, "metadata": {"source": "filesystem_answer_synthesis"}},
+    ]
+
+
+def _filesystem_answer_profile(state: AgentState, goal_state: GoalState | None) -> tuple[str, dict[str, Any]]:
+    if goal_state is not None and goal_state.answer_intent:
+        return goal_state.answer_intent, dict(goal_state.answer_policy)
+    inferred = _filesystem_answer_intent_from_user_message(state.user_message)
+    policy: dict[str, Any] = {"language": "zh-CN"}
+    if inferred != "show_content":
+        policy["do_not_echo_full_content"] = True
+    return inferred, policy
+
+
+def _filesystem_answer_intent_from_user_message(user_message: str) -> str:
+    text = str(user_message or "")
+    lowered = text.lower()
+    if any(marker in text for marker in ("总结", "概括", "摘要", "归纳", "提炼", "主要内容", "讲了什么", "说了什么", "核心内容")):
+        return "summarize_document"
+    if any(marker in text for marker in ("提取", "列出", "找出", "抽取", "有哪些", "整理出")):
+        return "extract_document_information"
+    if any(marker in text for marker in ("分析", "评价", "适合", "匹配", "问题", "建议", "优化点")):
+        return "analyze_document"
+    if any(marker in lowered for marker in ("cat", "show", "display")) or any(marker in text for marker in ("显示", "展示", "全文", "原文", "读出来", "内容是什么", "告诉我这个文件的内容")):
+        return "show_content"
+    return "answer_from_filesystem_observation"
+
+
+def _filesystem_path_from_goal(goal_state: GoalState | None) -> str:
+    if goal_state is None:
+        return ""
+    for key in ("path", "source_path", "target_path"):
+        value = goal_state.target.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _filesystem_final_answer_evidence(payload: dict[str, Any], *, content: str) -> str:
+    if content.strip():
+        return _truncate_for_filesystem_synthesis(content)
+    # Non-read actions still need synthesis to answer from postcheck/status, but
+    # the prompt should stay compact and avoid leaking long internal envelopes.
+    compact_payload = _compact_filesystem_final_answer_payload(payload)
+    return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _compact_filesystem_final_answer_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    raw_tool_result = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    inner_result = raw_tool_result.get("result") if isinstance(raw_tool_result.get("result"), dict) else {}
+    allowed_inner = {
+        key: value
+        for key, value in inner_result.items()
+        if key in {"exists", "path", "source_path", "target_path", "operation", "replacement_count", "no_op"}
+    }
+    return {
+        "status": payload.get("status"),
+        "error": payload.get("error") or result_payload.get("error") or raw_tool_result.get("error"),
+        "operation": result_payload.get("operation"),
+        "summary": result_payload.get("summary") or raw_tool_result.get("summary"),
+        "arguments": result_payload.get("arguments") if isinstance(result_payload.get("arguments"), dict) else {},
+        "filesystem_trace": _runtime_result_summary_metadata(result_payload).get("filesystem_trace"),
+        "result": allowed_inner,
+        "goal_validation": result_payload.get("goal_validation") if isinstance(result_payload.get("goal_validation"), dict) else None,
+    }
+
+
+def _filesystem_answer_intent_fallback_response(state: AgentState, payload: dict[str, Any] | None) -> str | None:
+    goal_state = GoalState.from_metadata_dict(state.context_metadata.get(GOAL_STATE_METADATA_KEY))
+    answer_intent, _answer_policy = _filesystem_answer_profile(state, goal_state)
+    if answer_intent in {"show_content", "answer_from_filesystem_observation"}:
+        return None
+    if payload is not None and not _filesystem_read_result_ok(payload):
+        return None
+    path = _filesystem_read_path_from_payload(payload or {}) or _filesystem_path_from_goal(goal_state)
+    content = _filesystem_read_content_from_payload(payload or {})
+    if not content.strip():
+        return f"已读取文件 {path}，但文件内容为空，暂无可加工内容。" if path else "已读取文件，但文件内容为空，暂无可加工内容。"
+    if path:
+        return f"已读取文件 {path}，但当前无法稳定生成最终回答。为避免把原文误当答案返回，本轮不直接展示全文。"
+    return "已读取文件，但当前无法稳定生成最终回答。为避免把原文误当答案返回，本轮不直接展示全文。"
+
+
+def _filesystem_read_result_ok(payload: dict[str, Any]) -> bool:
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    operation = str(result_payload.get("operation") or "").strip()
+    return payload.get("status") == "succeeded" and operation == "read_file" and _tool_result_ok(result_payload)
+
+
+def _filesystem_read_content_from_payload(payload: dict[str, Any]) -> str:
+    inner_result = _filesystem_inner_result(payload)
+    return str(inner_result.get("content") or inner_result.get("stdout") or "")
+
+
+def _filesystem_read_path_from_payload(payload: dict[str, Any]) -> str:
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    arguments = result_payload.get("arguments") if isinstance(result_payload.get("arguments"), dict) else {}
+    return str(arguments.get("path") or "").strip()
+
+
+def _filesystem_inner_result(payload: dict[str, Any]) -> dict[str, Any]:
+    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    raw_tool_result = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    return raw_tool_result.get("result") if isinstance(raw_tool_result.get("result"), dict) else {}
+
+
+def _truncate_for_filesystem_synthesis(content: str, *, limit: int = 12000) -> str:
+    text = str(content or "")
+    if len(text) <= limit:
+        return text
+    # Keep the synthesis prompt bounded; the original tool result remains in
+    # structured runtime metadata, while the LLM only needs enough evidence to
+    # answer the user's summary request.
+    return f"{text[:limit]}\n\n[文件内容过长，已截断用于本轮摘要生成。]"
+
+
+def _filesystem_file_to_file_summary(
+    *,
+    spec: FilesystemOperationSpec,
+    arguments: dict[str, Any],
+    filesystem_trace: dict[str, Any] | None = None,
+) -> str:
+    source_key = spec.required_args[0] if spec.required_args else "src"
+    source = str(arguments.get(source_key) or arguments.get("path") or "").strip()
+    target = str(arguments.get(spec.result_path_arg) or "").strip()
+    if source and target:
+        postcheck = filesystem_trace.get("postcheck") if isinstance(filesystem_trace, dict) and isinstance(filesystem_trace.get("postcheck"), dict) else {}
+        if postcheck.get("completed") is True:
+            return f"已完成并复核：{spec.summary} {source} -> {target}"
+        return f"已完成：{spec.summary} {source} -> {target}"
+    return f"已完成：{spec.summary}"
 
 
 def external_web_search_synthesis_messages(state: AgentState) -> list[dict[str, Any]] | None:
@@ -4540,6 +6912,21 @@ def _job_source_overview_summary_response(payload: dict[str, Any]) -> str:
         response += f" 样例信息源：{samples}。"
     response += " 这里的“岗位来源”不是正式企业数量；如果你问的是公司展览下面的公司列表，就看开放岗位公司库和公司聚合岗位库两个外部公司库。文章/社媒信号字段不完整，暂不作为公司展示。"
     return response
+
+
+def _company_board_count_summary_response(payload: dict[str, Any]) -> str:
+    tool_result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    result = tool_result.get("result") if isinstance(tool_result.get("result"), dict) else {}
+    ok = payload.get("status") == "succeeded" and _tool_result_ok(tool_result)
+    if not ok:
+        error = payload.get("error") or tool_result.get("error") or result.get("message")
+        return f"公司展览公司数暂时无法读取：{error or '数据源未返回有效结果'}。我没有用本地历史企业表替代这个数字。"
+    company_board = result.get("company_board") if isinstance(result.get("company_board"), dict) else {}
+    count = company_board.get("company_count")
+    if count is None:
+        return "公司展览数据源没有返回公司总数，因此我不能给出猜测数字。"
+    label = str(company_board.get("label") or "公司展览当前公司库")
+    return f"公司展览当前的公司数是 { _safe_count(count) } 家，统计口径：{label}。"
 
 
 def _job_source_sample_text(result: dict[str, Any]) -> str:

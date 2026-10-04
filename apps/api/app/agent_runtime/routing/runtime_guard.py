@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent_runtime.routing.schemas import RouteDecision
-from app.agent_runtime.tool_registry import AgentToolRegistry
 
 
 _EXECUTABLE_ROUTES = {"external_agent", "local_tool", "local_workflow", "browser_executor"}
@@ -30,7 +29,7 @@ def validate_route_decision(
     decision: RouteDecision,
     *,
     context_pack: dict[str, Any],
-    registry: AgentToolRegistry,
+    registry: Any,
 ) -> CapabilityRouteGuardResult:
     allowed_capabilities = [str(name) for name in context_pack.get("allowed_capabilities") or [] if str(name).strip()]
     if decision.route not in _EXECUTABLE_ROUTES:

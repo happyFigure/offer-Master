@@ -368,6 +368,42 @@ export interface ApplicationBoardItem {
   created_at: string;
   updated_at: string;
   job: JobSummary;
+  mail_timing: ApplicationMailTiming | null;
+}
+
+export interface ApplicationMailTiming {
+  event_type: string;
+  title: string;
+  source_sent_at: string | null;
+  scheduled_at: string | null;
+  deadline_at: string | null;
+  deadline_offset_hours: number | null;
+  timezone: string | null;
+  timing_source: "explicit" | "relative" | "none" | string;
+  timing_note: string | null;
+}
+
+export interface ApplicationNotification {
+  id: string;
+  application_id: string;
+  event_type: string;
+  from_status: ApplicationStatus | null;
+  to_status: ApplicationStatus | null;
+  title: string;
+  body: string | null;
+  actor: string;
+  source: string;
+  event_metadata: Record<string, unknown> | null;
+  scheduled_at: string | null;
+  deadline_at: string | null;
+  timezone: string | null;
+  join_url: string | null;
+  source_message_id: string | null;
+  source_uid: string | null;
+  review_status: "pending" | "confirmed" | "rejected" | "synced" | null;
+  reviewed_at: string | null;
+  created_at: string;
+  application: ApplicationBoardItem;
 }
 
 export interface ApplicationCreateFromJobInput {

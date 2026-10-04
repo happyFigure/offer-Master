@@ -44,21 +44,31 @@ import {
   createAgentSession,
   deleteAgentSession,
   getAgentMessages,
+  getPendingAgentApproval,
   getAgentTaskPlan,
   listAgentSessions,
   rejectAgentApproval,
   streamAgentMessage,
   updateAgentSession,
 } from "../api/agent";
+import { ApiError } from "../api/client";
 import { getAgentRuntimePanel } from "../api/agentRuntime";
 import { archiveAgentSkill, importAgentSkill, listAgentSkills, pinAgentSkill } from "../api/agentSkills";
-import { createApplicationFromJob, listApplications, updateApplication } from "../api/applications";
+import {
+  confirmApplicationNotification,
+  createApplicationFromJob,
+  listApplicationNotifications,
+  listApplications,
+  rejectApplicationNotification,
+  updateApplication,
+} from "../api/applications";
 import { listOfferIOCompanies, listOfferIOCompanyOpenings, listOfferIOJobs } from "../api/jobBoard";
 import { createJobSource, disableJobSource, listJobSources, syncJobSource, updateJobSource } from "../api/jobSources";
 import { extractJobLeads, listJobLeads, verifyAndConvertJobLead, verifyJobLead } from "../api/jobLeads";
 import { listArticleCandidates } from "../api/recruitingSignals";
 import { importJobLeadsFromUrl, listDomainHealth, listDomainHealthByDomain, pollUrlImportRun, submitVisiblePageContent } from "../api/urlImport";
 import { AsciiArt } from "../components/ui/n-ascii";
+import { appendRuntimeEvent as appendRuntimeEventToTurn, summarizeRuntimeDelegations } from "./runtimeDelegations";
 import type {
   AgentApprovalRequiredPayload,
   AgentContextMetadata,
@@ -69,11 +79,12 @@ import type {
   AgentTaskPlan,
   AgentTaskPlanStage,
 } from "../types/agent";
-import type { AgentRuntimeCapability, AgentRuntimeHealth, AgentRuntimeMember, AgentRuntimePanel } from "../types/agentRuntime";
+import type { AgentRuntimeCapability, AgentRuntimeHealth, AgentRuntimeMcpIntegration, AgentRuntimeMember, AgentRuntimePanel } from "../types/agentRuntime";
 import type { AgentSkill, AgentSkillAvailabilityState, AgentSkillImportInput } from "../types/agentSkills";
 import type {
   ArticleCandidate,
   ApplicationBoardItem,
+  ApplicationNotification,
   ApplicationStatus,
   DomainHealth,
   ImportUrlAcceptedResponse,
@@ -98,6 +109,23 @@ type NoticeKind = "success" | "warning" | "danger" | "info";
 interface Notice {
   kind: NoticeKind;
   message: string;
+}
+
+type ApprovalDecision = "approved" | "rejected";
+
+// These words are control-plane signals only. File intent and paths stay in the backend checkpoint.
+function classifyApprovalDecision(content: string): ApprovalDecision | null {
+  const normalized = content.replace(/\s+/g, "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (["是", "确认", "同意", "可以", "执行", "好的", "好", "yes", "y", "approve", "approved", "confirm"].includes(normalized)) {
+    return "approved";
+  }
+  if (["否", "不", "拒绝", "取消", "不要", "不执行", "no", "n", "reject", "rejected", "cancel"].includes(normalized)) {
+    return "rejected";
+  }
+  return null;
 }
 
 interface SourceDraft {
@@ -176,10 +204,18 @@ type ChatRuntimeEventKind = "outer_session" | "tool";
 type ChatRuntimeEventTone = "running" | "success" | "warning" | "danger" | "muted";
 type ChatRuntimeEventGroup = "reasoning" | "tooling" | "observation" | "evidence" | "status";
 type ChatRuntimeActorType = "main_model" | "sub_agent" | "local_tool" | "runtime" | "observation";
+type RuntimeSubAgentRunStatus = "running" | "succeeded" | "failed" | "waiting_user" | "unknown";
 
 interface RuntimeEvidenceItem {
   title: string;
   url?: string;
+}
+
+interface RuntimeFilesystemTrace {
+  operation?: string | null;
+  precheck?: Record<string, unknown>;
+  script?: Record<string, unknown>;
+  postcheck?: Record<string, unknown>;
 }
 
 interface RuntimeActorInfo {
@@ -195,6 +231,12 @@ interface RuntimeActorVisual {
   className: string;
 }
 
+interface RuntimeUnfinishedToolCall {
+  key: string;
+  toolName: string;
+  summary: string;
+}
+
 interface ChatRuntimeTimelineEvent {
   id: string;
   kind: ChatRuntimeEventKind;
@@ -203,6 +245,13 @@ interface ChatRuntimeTimelineEvent {
   summary: string;
   status?: string | null;
   toolName?: string | null;
+  toolCallId?: string | null;
+  workflowRunId?: string | null;
+  delegationId?: string | null;
+  capabilityKind?: string | null;
+  executorId?: string | null;
+  parentCapability?: string | null;
+  agentName?: string | null;
   stepIndex?: number | null;
   inputHint?: string | null;
   candidateNames?: string[];
@@ -212,6 +261,14 @@ interface ChatRuntimeTimelineEvent {
   evidence?: RuntimeEvidenceItem[];
   createdAt: number;
   tone: ChatRuntimeEventTone;
+}
+
+interface RuntimeSubAgentRun {
+  id: string;
+  capability: string;
+  name: string;
+  status: RuntimeSubAgentRunStatus;
+  mcpCallCount: number;
 }
 
 interface SkillImportDraft {
@@ -350,6 +407,11 @@ const RUNTIME_EVENT_LABELS: Record<string, string> = {
   tool_input_preview: "工具输入",
   tool_started: "工具开始",
   tool_finished: "工具完成",
+  subagent_started: "子 Agent 已委派",
+  subagent_finished: "子 Agent 已返回",
+  subagent_tool_started: "子 Agent 调用 MCP",
+  subagent_tool_finished: "子 Agent MCP 返回",
+  subagent_tool_waiting_approval: "子 Agent 等待工具审批",
   tool_result_summary: "结果摘要",
   reflection_evaluation: "反思判断",
   evidence_selected: "证据选择",
@@ -371,6 +433,11 @@ const RUNTIME_EVENT_SUMMARIES: Record<string, (toolLabel: string) => string> = {
   tool_input_preview: (toolLabel) => `准备传给 ${toolLabel} 的输入已整理。`,
   tool_started: (toolLabel) => `开始调用：${toolLabel}。`,
   tool_finished: (toolLabel) => `已观察到 ${toolLabel} 的执行结果。`,
+  subagent_started: (toolLabel) => `主 agent 已委派 ${toolLabel}，子 Agent 开始执行。`,
+  subagent_finished: (toolLabel) => `子 Agent ${toolLabel} 已返回执行结果。`,
+  subagent_tool_started: (toolLabel) => `子 Agent 开始调用：${toolLabel}。`,
+  subagent_tool_finished: (toolLabel) => `子 Agent 已收到 ${toolLabel} 的结果。`,
+  subagent_tool_waiting_approval: (toolLabel) => `子 Agent 等待确认后调用：${toolLabel}。`,
   tool_result_summary: (toolLabel) => `${toolLabel} 的结果已整理成可读摘要。`,
   reflection_evaluation: () => "主 agent 已判断工具结果是否足够回答。",
   evidence_selected: () => "主 agent 已选择本轮回答要引用的证据。",
@@ -606,6 +673,7 @@ function App() {
   const [offerioJobs, setOfferioJobs] = useState<OfferIOJob[]>([]);
   const [selectedOfferioCompany, setSelectedOfferioCompany] = useState<string | null>(null);
   const [applications, setApplications] = useState<ApplicationBoardItem[]>([]);
+  const [applicationNotifications, setApplicationNotifications] = useState<ApplicationNotification[]>([]);
 
   const refreshData = useCallback(async (filters?: JobLeadFilters) => {
     const [nextSources, nextLeads, nextDomainHealth, nextCandidates] = await Promise.all([
@@ -657,7 +725,10 @@ function App() {
           primary_intent: "agent_chat",
         }));
       const nextSessions = existingSessions.some((item) => item.id === session.id) ? existingSessions : [session, ...existingSessions];
-      const messages = await getAgentMessages(session.id, 100);
+      const [messages, pendingApproval] = await Promise.all([
+        getAgentMessages(session.id, 100),
+        getPendingAgentApproval(session.id),
+      ]);
       const latestAssistantContext = [...messages]
         .reverse()
         .map(extractContextMetadata)
@@ -667,12 +738,47 @@ function App() {
       setAgentSession(session);
       setChatMessages(toChatMessages(messages));
       setChatContextMetadata(latestAssistantContext);
-      setPendingApproval(null);
+      setPendingApproval(pendingApproval);
       setRuntimeEvents([]);
       await refreshActiveTaskPlan(latestAssistantContext);
     } finally {
       setChatLoading(false);
     }
+  }, [refreshActiveTaskPlan]);
+
+  const resyncAgentSessionAfterApprovalStateChange = useCallback(async (session: AgentSession) => {
+    const messages = await getAgentMessages(session.id, 100);
+    const latestAssistantContext = [...messages]
+      .reverse()
+      .map(extractContextMetadata)
+      .find((metadata): metadata is AgentContextMetadata => metadata !== null) ?? null;
+    const lastMessage = messages[messages.length - 1] ?? null;
+
+    // A stale approval card is local UI state. The backend workflow is already
+    // somewhere else, so the safest recovery is to clear the card and repaint
+    // chat from persisted messages plus the latest task metadata.
+    setPendingApproval(null);
+    setChatMessages(toChatMessages(messages));
+    setChatContextMetadata(latestAssistantContext);
+    await refreshActiveTaskPlan(latestAssistantContext);
+    setAgentSession({
+      ...session,
+      message_count: Math.max(session.message_count, messages.length),
+      last_message_at: lastMessage?.created_at ?? session.last_message_at,
+      updated_at: lastMessage?.created_at ?? session.updated_at,
+    });
+    setAgentSessions((current) =>
+      current.map((item) =>
+        item.id === session.id
+          ? {
+              ...item,
+              message_count: Math.max(item.message_count, messages.length),
+              last_message_at: lastMessage?.created_at ?? item.last_message_at,
+              updated_at: lastMessage?.created_at ?? item.updated_at,
+            }
+          : item,
+      ),
+    );
   }, [refreshActiveTaskPlan]);
 
   const refreshSkills = useCallback(async () => {
@@ -684,7 +790,30 @@ function App() {
   }, []);
 
   const refreshApplications = useCallback(async () => {
-    setApplications(await listApplications(120));
+    const [applicationsResult, notificationsResult] = await Promise.allSettled([
+      listApplications(120),
+      listApplicationNotifications(100),
+    ]);
+
+    if (applicationsResult.status === "rejected") {
+      console.error("[applications] application list refresh failed", applicationsResult.reason);
+      throw applicationsResult.reason;
+    }
+    setApplications(applicationsResult.value);
+
+    if (notificationsResult.status === "fulfilled") {
+      setApplicationNotifications(notificationsResult.value);
+      return;
+    }
+
+    // A mail notification schema/API problem must not hide the existing
+    // application board. Keep the last known candidates and surface the
+    // degraded part explicitly for diagnosis.
+    console.warn("[applications] mail notification refresh failed", notificationsResult.reason);
+    setNotice({
+      kind: "warning",
+      message: `邮件通知暂未连接：${toDisplayError(notificationsResult.reason)}`,
+    });
   }, []);
 
   const refreshJobBoard = useCallback(async (filters: JobBoardFilterDraft = INITIAL_JOB_BOARD_FILTERS) => {
@@ -777,7 +906,7 @@ function App() {
       const message = await action();
       setNotice({ kind: "success", message });
     } catch (error: unknown) {
-      setNotice({ kind: "danger", message: toDisplayError(error) });
+      setNotice(noticeForActionError(error));
     } finally {
       setWorkingAction(null);
     }
@@ -1175,15 +1304,27 @@ function App() {
     });
   };
 
-  const handleApprovePendingApproval = () => {
+  const handleChatApprovalDecision = (decision: ApprovalDecision, reason: string) => {
     const approval = pendingApproval;
     const session = agentSession;
     if (!approval || !session) {
       return;
     }
 
-    void runAction(`agent-approval-approve-${approval.approval_request_id}`, async () => {
-      const result = await approveAgentApproval(approval.approval_request_id, { decision_reason: "approved from chat UI" });
+    void runAction(`agent-approval-chat-${decision}-${approval.approval_request_id}`, async () => {
+      let result: Awaited<ReturnType<typeof approveAgentApproval>>;
+      try {
+        result =
+          decision === "approved"
+            ? await approveAgentApproval(approval.approval_request_id, { decision_reason: reason })
+            : await rejectAgentApproval(approval.approval_request_id, { decision_reason: reason });
+      } catch (error: unknown) {
+        if (isStaleApprovalError(error)) {
+          await resyncAgentSessionAfterApprovalStateChange(session);
+          throw new Error(STALE_APPROVAL_RESYNC_MESSAGE);
+        }
+        throw error;
+      }
       const messages = await getAgentMessages(session.id, 100);
       const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
       const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
@@ -1210,35 +1351,16 @@ function App() {
             : item,
         ),
       );
-      return `已确认工具调用：${approval.tool_name}`;
+      return decision === "approved" ? `已确认工具调用：${approval.tool_name}` : `已拒绝工具调用：${approval.tool_name}`;
     });
   };
 
-  const handleRejectPendingApproval = () => {
-    const approval = pendingApproval;
-    const session = agentSession;
-    if (!approval || !session) {
-      return;
-    }
+  const handleApprovePendingApproval = () => {
+    handleChatApprovalDecision("approved", "approved from chat UI");
+  };
 
-    void runAction(`agent-approval-reject-${approval.approval_request_id}`, async () => {
-      const result = await rejectAgentApproval(approval.approval_request_id, { decision_reason: "rejected from chat UI" });
-      const messages = await getAgentMessages(session.id, 100);
-      const nextMessages = appendAgentMessageIfMissing(messages, result.assistant_message);
-      const lastMessage = result.assistant_message ?? nextMessages[nextMessages.length - 1] ?? null;
-      const nextContextMetadata = result.context_metadata ?? (lastMessage ? extractContextMetadata(lastMessage) : null);
-      setPendingApproval(null);
-      setChatContextMetadata(nextContextMetadata);
-      setChatMessages(toChatMessages(nextMessages));
-      await refreshActiveTaskPlan(nextContextMetadata);
-      setAgentSession({
-        ...session,
-        message_count: Math.max(session.message_count, nextMessages.length),
-        last_message_at: lastMessage?.created_at ?? session.last_message_at,
-        updated_at: lastMessage?.created_at ?? session.updated_at,
-      });
-      return `已拒绝工具调用：${approval.tool_name}`;
-    });
+  const handleRejectPendingApproval = () => {
+    handleChatApprovalDecision("rejected", "rejected from chat UI");
   };
 
   const handleSendChat = (event: FormEvent<HTMLFormElement>) => {
@@ -1246,6 +1368,13 @@ function App() {
     const content = chatDraft.trim();
 
     if (!content) {
+      return;
+    }
+
+    const approvalDecision = pendingApproval ? classifyApprovalDecision(content) : null;
+    if (approvalDecision && agentSession) {
+      setChatDraft("");
+      handleChatApprovalDecision(approvalDecision, `chat confirmation: ${content}`);
       return;
     }
 
@@ -1273,6 +1402,7 @@ function App() {
       ]);
 
       let finalAssistantMessage: AgentMessage | null = null;
+      let streamErrorMessage: string | null = null;
       const approvalRequiredRef: { current: AgentApprovalRequiredPayload | null } = { current: null };
       await streamAgentMessage(session.id, { content_text: content }, {
         onUserMessage: (message) => {
@@ -1289,6 +1419,16 @@ function App() {
           finalAssistantMessage = message;
           setChatContextMetadata(extractContextMetadata(message));
           setChatMessages((current) => current.map((item) => (item.id === tempAssistantId ? toChatMessage(message) : item)));
+        },
+        onError: (message) => {
+          streamErrorMessage = message;
+          setChatMessages((current) =>
+            current.map((item) =>
+              item.id === tempAssistantId
+                ? { ...item, content: `执行失败：${message}`, meta: "执行失败" }
+                : item,
+            ),
+          );
         },
         onApprovalRequired: (payload) => {
           approvalRequiredRef.current = payload;
@@ -1349,10 +1489,16 @@ function App() {
             ]
           : nextChatMessages,
       );
+      if (streamErrorMessage) {
+        throw new Error(streamErrorMessage);
+      }
       if (lastMessage?.role === "assistant") {
         const nextContextMetadata = extractContextMetadata(lastMessage);
         setChatContextMetadata(nextContextMetadata);
         await refreshActiveTaskPlan(nextContextMetadata);
+        await refreshApplications().catch((error: unknown) => {
+          console.warn("[applications] refresh after agent chat failed", error);
+        });
       } else if (approvalRequiredPayload) {
         await refreshActiveTaskPlan(approvalRequiredPayload.context_metadata);
       }
@@ -1533,7 +1679,28 @@ function App() {
                   onVisiblePageDraftChange={setVisiblePageDraft}
                 />
               ) : null}
-              {activePage === "pipeline" ? <PipelinePage applications={applications} navigate={navigate} onUpdateStatus={handleUpdateApplicationStatus} /> : null}
+              {activePage === "pipeline" ? (
+                <PipelinePage
+                  applications={applications}
+                  notifications={applicationNotifications}
+                  navigate={navigate}
+                  onUpdateStatus={handleUpdateApplicationStatus}
+                  onConfirmNotification={(notification) => {
+                    void runAction(`confirm-mail-notification-${notification.id}`, async () => {
+                      await confirmApplicationNotification(notification.id, notification.to_status ?? undefined);
+                      await refreshApplications();
+                      return `${notification.title} 已确认并写入投递进度。`;
+                    });
+                  }}
+                  onRejectNotification={(notification) => {
+                    void runAction(`reject-mail-notification-${notification.id}`, async () => {
+                      await rejectApplicationNotification(notification.id);
+                      await refreshApplications();
+                      return `${notification.title} 已忽略。`;
+                    });
+                  }}
+                />
+              ) : null}
               {activePage === "guardrails" ? <GuardrailsPage /> : null}
             </div>
           )}
@@ -1864,7 +2031,10 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
   const groupedEvents = runtimeEventGroups(visibleEvents);
   const eventOrder = new Map(visibleEvents.map((event, index) => [event.id, index]));
   const latestEvent = visibleEvents[visibleEvents.length - 1] ?? null;
-  const statusLabel = isWorking ? "运行中" : visibleEvents.length ? "已结束" : "待运行";
+  const unfinishedToolCalls = runtimeUnfinishedToolCalls(events);
+  const hasUnfinishedToolCalls = unfinishedToolCalls.length > 0;
+  const statusLabel = isWorking ? "运行中" : hasUnfinishedToolCalls ? "结果待确认" : visibleEvents.length ? "已结束" : "待运行";
+  const statusTone = isWorking ? "is-running" : hasUnfinishedToolCalls ? "is-warning" : visibleEvents.length ? "is-finished" : "is-idle";
 
   useLayoutEffect(() => {
     if (isWorking && visibleEvents.length <= 1) {
@@ -1906,11 +2076,13 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
             <Workflow size={14} aria-hidden="true" />
             {runtimeFlowExpanded ? "收起流程图" : "展开流程图"}
           </button>
-          <span className={`runtime-status-pill ${isWorking ? "is-running" : visibleEvents.length ? "is-finished" : "is-idle"}`}>{statusLabel}</span>
+          <span className={`runtime-status-pill ${statusTone}`}>{statusLabel}</span>
         </div>
       </div>
-      <RuntimeFlowMap events={visibleEvents} />
+      <RuntimeFlowMap events={events} />
+      <RuntimeSubAgentSummary events={events} isWorking={isWorking} />
       {runtimeFlowExpanded ? <RuntimeExpandedFlowBoard events={visibleEvents} isWorking={isWorking} /> : null}
+      {hasUnfinishedToolCalls ? <RuntimeUnfinishedToolCallNotice calls={unfinishedToolCalls} isWorking={isWorking} /> : null}
       {visibleEvents.length ? (
         <div className="runtime-event-groups">
           {groupedEvents.map((group) => (
@@ -1927,6 +2099,7 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
                   const actor = runtimeEventActor(event);
                   const chain = runtimeAgentChain(event, actor);
                   const payloadPreview = runtimePayloadPreview(event);
+                  const filesystemTrace = runtimeFilesystemTrace(event.resultSummary);
                   return (
                     <li
                       className={`runtime-event-item runtime-event-animated runtime-event-${event.tone}`}
@@ -1962,6 +2135,7 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
                             ))}
                           </div>
                         ) : null}
+                        {filesystemTrace ? <RuntimeFilesystemTraceCard trace={filesystemTrace} /> : null}
                         {payloadPreview ? <pre className="runtime-event-payload-preview">{payloadPreview}</pre> : null}
                         {event.candidateNames?.length ? (
                           <div className="runtime-event-candidates" aria-label="候选能力">
@@ -2002,32 +2176,68 @@ function ChatRuntimeTimeline({ events, isWorking }: { events: ChatRuntimeTimelin
   );
 }
 
+function RuntimeSubAgentSummary({ events, isWorking }: { events: ChatRuntimeTimelineEvent[]; isWorking: boolean }) {
+  const runs = runtimeSubAgentRuns(events);
+
+  return (
+    <section className="runtime-subagent-summary" aria-label="子 Agent 委派状态">
+      <div className="runtime-subagent-summary-head">
+        <span>
+          <Network size={14} aria-hidden="true" />
+          子 Agent 委派
+        </span>
+        <b>{runs.length ? `${runs.length} 次` : "未委派"}</b>
+      </div>
+      {runs.length ? (
+        <ul className="runtime-subagent-run-list">
+          {runs.map((run) => (
+            <li className={`runtime-subagent-run runtime-subagent-run-${run.status}`} key={run.id}>
+              <span className="runtime-subagent-run-icon" aria-hidden="true">
+                {run.status === "running" ? <Loader2 className="spin" size={13} /> : run.status === "succeeded" ? <CheckCircle2 size={13} /> : run.status === "failed" ? <AlertTriangle size={13} /> : run.status === "waiting_user" ? <Clock3 size={13} /> : <Network size={13} />}
+              </span>
+              <span className="runtime-subagent-run-copy">
+                <strong>{run.name}</strong>
+                <small>{formatRuntimeToolName(run.capability)} · 内部 MCP {run.mcpCallCount} 次</small>
+              </span>
+              <span className="runtime-subagent-run-status">{runtimeSubAgentRunStatusLabel(run.status)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="runtime-subagent-summary-empty">
+          {isWorking ? "主 agent 正在判断是否需要委派子 Agent。" : "本轮没有发生子 Agent 委派。"}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function RuntimeFlowMap({ events }: { events: ChatRuntimeTimelineEvent[] }) {
-  const actorCounts = runtimeActorCounts(events);
+  const flowCounts = runtimeFlowCounts(events);
   const mainVisual = runtimeActorVisual("main_model");
   const subAgentVisual = runtimeActorVisual("sub_agent");
   const toolVisual = runtimeActorVisual("local_tool");
   const returnVisual = runtimeActorVisual("observation");
   return (
     <div className="runtime-flow-map" aria-label="Agent 执行链路概览">
-      <RuntimeFlowNode visual={mainVisual} count={actorCounts.main_model + actorCounts.runtime} />
+      <RuntimeFlowNode visual={mainVisual} count={flowCounts.main} countLabel="事件" />
       <ArrowRight size={14} aria-hidden="true" />
-      <RuntimeFlowNode visual={subAgentVisual} count={actorCounts.sub_agent} />
+      <RuntimeFlowNode visual={subAgentVisual} count={flowCounts.subAgents} countLabel="委派" active={flowCounts.activeSubAgents > 0} />
       <ArrowRight size={14} aria-hidden="true" />
-      <RuntimeFlowNode visual={toolVisual} count={actorCounts.local_tool} />
+      <RuntimeFlowNode visual={toolVisual} count={flowCounts.tools} countLabel="调用" />
       <ArrowRight size={14} aria-hidden="true" />
-      <RuntimeFlowNode visual={returnVisual} count={actorCounts.observation} />
+      <RuntimeFlowNode visual={returnVisual} count={flowCounts.observations} countLabel="事件" />
     </div>
   );
 }
 
-function RuntimeFlowNode({ visual, count }: { visual: RuntimeActorVisual; count: number }) {
+function RuntimeFlowNode({ visual, count, countLabel, active = false }: { visual: RuntimeActorVisual; count: number; countLabel: string; active?: boolean }) {
   const Icon = visual.Icon;
   return (
-    <div className={`runtime-flow-node ${visual.className}`}>
+    <div className={`runtime-flow-node ${visual.className} ${active ? "is-active" : ""}`}>
       <Icon size={15} aria-hidden="true" />
       <span>{visual.label}</span>
-      <b>{count} 步</b>
+      <b>{count} {countLabel}</b>
     </div>
   );
 }
@@ -2078,6 +2288,29 @@ function RuntimeExpandedFlowBoard({ events, isWorking }: { events: ChatRuntimeTi
   );
 }
 
+function RuntimeUnfinishedToolCallNotice({ calls, isWorking }: { calls: RuntimeUnfinishedToolCall[]; isWorking: boolean }) {
+  return (
+    <section className="runtime-unfinished-tool-notice" aria-label="工具结果未返回">
+      <div className="runtime-unfinished-tool-head">
+        <span>
+          {isWorking ? <Loader2 className="spin" size={14} aria-hidden="true" /> : <AlertTriangle size={14} aria-hidden="true" />}
+          工具结果未返回
+        </span>
+        <b>{isWorking ? "等待中" : "需复核"}</b>
+      </div>
+      <p>{isWorking ? "已看到工具开始执行，正在等待完成事件或结果摘要。" : "不要把流程结束当成工具成功：下面这些工具只有开始记录，还没有完成记录或结果摘要。"}</p>
+      <div className="runtime-unfinished-tool-list">
+        {calls.slice(0, 3).map((call) => (
+          <span key={call.key}>
+            <b>{formatRuntimeToolName(call.toolName)}</b>
+            {call.summary}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function RuntimeActorBadge({ actor }: { actor: RuntimeActorInfo }) {
   const visual = runtimeActorVisual(actor.type);
   const Icon = visual.Icon;
@@ -2099,6 +2332,87 @@ function RuntimeAgentChain({ chain }: { chain: string[] }) {
         </span>
       ))}
     </div>
+  );
+}
+
+function RuntimeFilesystemTraceCard({ trace }: { trace: RuntimeFilesystemTrace }) {
+  const postcheck = trace.postcheck ?? {};
+  const completed = postcheck.completed === true;
+  const hasCompletedFlag = typeof postcheck.completed === "boolean";
+  const sourcePath = runtimeTraceText(postcheck.source_path);
+  const targetPath = runtimeTraceText(postcheck.target_path);
+  const singlePath = runtimeTraceText(postcheck.path);
+  const reason = runtimeTraceText(postcheck.reason);
+  const sourceExistsAfter = runtimeTraceBoolean(postcheck.source_exists_after);
+  const targetExistsAfter = runtimeTraceBoolean(postcheck.target_exists_after);
+  const pathExistsAfter = runtimeTraceBoolean(postcheck.path_exists_after);
+  const script = trace.script ?? {};
+  const internalScript = runtimeTraceText(script.internal_script);
+
+  return (
+    <section className={`runtime-filesystem-trace-card ${completed ? "is-ok" : hasCompletedFlag ? "is-failed" : "is-unknown"}`} aria-label="文件复核">
+      <div className="runtime-filesystem-trace-head">
+        <span>
+          {completed ? <CheckCircle2 size={13} aria-hidden="true" /> : <AlertTriangle size={13} aria-hidden="true" />}
+          文件复核
+        </span>
+        <b>{hasCompletedFlag ? (completed ? "通过" : "未通过") : "未复核"}</b>
+      </div>
+      <div className="runtime-filesystem-trace-grid">
+        <span>
+          <b>动作</b>
+          {runtimeOperationLabel(trace.operation)}
+        </span>
+        {internalScript ? (
+          <span>
+            <b>脚本</b>
+            {internalScript}
+          </span>
+        ) : null}
+        {sourcePath ? (
+          <span>
+            <b>源路径</b>
+            {sourcePath}
+          </span>
+        ) : null}
+        {targetPath ? (
+          <span>
+            <b>目标路径</b>
+            {targetPath}
+          </span>
+        ) : null}
+        {!sourcePath && singlePath ? (
+          <span>
+            <b>路径</b>
+            {singlePath}
+          </span>
+        ) : null}
+        {sourceExistsAfter ? (
+          <span>
+            <b>源文件状态</b>
+            {sourceExistsAfter}
+          </span>
+        ) : null}
+        {targetExistsAfter ? (
+          <span>
+            <b>目标文件状态</b>
+            {targetExistsAfter}
+          </span>
+        ) : null}
+        {pathExistsAfter ? (
+          <span>
+            <b>路径状态</b>
+            {pathExistsAfter}
+          </span>
+        ) : null}
+        {!completed && reason ? (
+          <span className="runtime-filesystem-trace-reason">
+            <b>原因</b>
+            {reason}
+          </span>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
@@ -2350,6 +2664,8 @@ function AgentRuntimePage({ panel, navigate }: { panel: AgentRuntimePanel | null
           <RuntimeStatusRow icon={BadgeCheck} label="结果标准化" value="观察结果回传" />
         </div>
 
+        <McpIntegrationList integrations={panel.mcp_integrations ?? []} />
+
         <button className="button button-ghost full-width" type="button" onClick={() => navigate("skills")}>
           <Layers3 size={16} />
           查看 Skill 管理
@@ -2394,6 +2710,56 @@ function RuntimeStatusRow({ icon: Icon, label, value }: { icon: LucideIcon; labe
       <Icon size={16} aria-hidden="true" />
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function McpIntegrationList({ integrations }: { integrations: AgentRuntimeMcpIntegration[] }) {
+  if (!integrations.length) {
+    return null;
+  }
+
+  return (
+    <div className="mcp-integration-list" aria-label="MCP 接入状态">
+      <div className="mcp-integration-heading">
+        <span>MCP 接入状态</span>
+        <small>子 Agent 可用性</small>
+      </div>
+      {integrations.map((integration) => (
+        <article className="mcp-integration-card" key={integration.id}>
+          {(() => {
+            const configuredTools = integration.configured_tools?.length ? integration.configured_tools : integration.registered_tools;
+            const discoveredTools = integration.discovered_tools ?? [];
+
+            return (
+              <>
+          <div className="mcp-integration-title-row">
+            <span>
+              <Link2 size={14} aria-hidden="true" />
+              {integration.name}
+            </span>
+            <strong className={`mcp-integration-status mcp-integration-status-${integration.status}`}>{mcpIntegrationStatusLabel(integration)}</strong>
+          </div>
+          <p>{integration.detail}</p>
+          <small className="mcp-integration-transport">接入方式：{mcpIntegrationTransportLabel(integration.transport)}</small>
+          <McpToolGroup label="声明工具" tools={configuredTools} emptyLabel="暂未加载声明工具" />
+          <McpToolGroup label="实际发现工具" tools={discoveredTools} emptyLabel="尚未进行实际发现；首次由 SDK 子 Agent 运行时执行" />
+              </>
+            );
+          })()}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function McpToolGroup({ label, tools, emptyLabel }: { label: string; tools: string[]; emptyLabel: string }) {
+  return (
+    <div className="mcp-integration-tool-group">
+      <span className="mcp-integration-tool-label">{label}</span>
+      <div className={`mcp-integration-tools${tools.length ? "" : " is-empty"}`}>
+        {tools.length ? tools.slice(0, 6).map((tool) => <code key={tool}>{tool}</code>) : <span>{emptyLabel}</span>}
+      </div>
     </div>
   );
 }
@@ -2453,6 +2819,12 @@ function AgentCapabilityList({ capabilities }: { capabilities: AgentRuntimeCapab
             <span><strong>来源</strong>{formatCompactList(capability.allowed_source_types, "不限")}</span>
             <span><strong>确认</strong>{capability.requires_confirmation ? "需要用户确认" : "可自动执行"}</span>
           </div>
+          {(capability.candidate_use_when.length || capability.candidate_do_not_use_when.length) ? (
+            <div className="agent-capability-boundary">
+              {capability.candidate_use_when.length ? <span><strong>适用</strong>{formatCompactList(capability.candidate_use_when, "未声明")}</span> : null}
+              {capability.candidate_do_not_use_when.length ? <span><strong>不适用</strong>{formatCompactList(capability.candidate_do_not_use_when, "未声明")}</span> : null}
+            </div>
+          ) : null}
           <div className="agent-chip-row">
             {(capability.candidate_categories.length ? capability.candidate_categories : capability.candidate_keywords).slice(0, 5).map((item) => <span key={item}>{item}</span>)}
           </div>
@@ -3508,15 +3880,67 @@ function UrlImportFlow({ steps }: { steps: UrlImportFlowStep[] }) {
 
 function PipelinePage({
   applications,
+  notifications,
   navigate,
   onUpdateStatus,
+  onConfirmNotification,
+  onRejectNotification,
 }: {
   applications: ApplicationBoardItem[];
+  notifications: ApplicationNotification[];
   navigate: (page: PageId) => void;
   onUpdateStatus: (application: ApplicationBoardItem, status: ApplicationStatus) => void;
+  onConfirmNotification: (notification: ApplicationNotification) => void;
+  onRejectNotification: (notification: ApplicationNotification) => void;
 }) {
   return (
     <section className="application-board-section">
+      {notifications.length ? (
+        <section className="mail-notification-panel glass-panel" aria-label="待确认招聘邮件通知">
+          <div className="application-board-toolbar">
+            <div>
+              <p className="eyebrow">QQ Mail Review Queue</p>
+              <h3>待确认招聘通知 {notifications.length}</h3>
+              <p>邮件只读 Agent 提取了候选事件，确认后才会改变正式投递状态。</p>
+            </div>
+            <BadgeCheck size={22} aria-hidden="true" />
+          </div>
+          <div className="mail-notification-list">
+            {notifications.map((notification) => {
+              const metadata = notification.event_metadata ?? {};
+              const evidence = Array.isArray(metadata.evidence) ? metadata.evidence.map(String) : [];
+              const companyName = String(metadata.company_name ?? notification.application.job.company.name);
+              const jobTitle = String(metadata.job_title ?? notification.application.job.title);
+              return (
+                <article className="mail-notification-card" key={notification.id}>
+                  <div className="mail-notification-heading">
+                    <div>
+                      <strong>{companyName}</strong>
+                      <span>{jobTitle}</span>
+                    </div>
+                    <span className="mail-notification-stage">{APPLICATION_STATUS_LABELS[notification.to_status ?? "applied"] ?? notification.event_type}</span>
+                  </div>
+                  <p>{notification.title}</p>
+                  <div className="tag-row">
+                    {notification.scheduled_at ? <span>开始：{formatDateTime(notification.scheduled_at)}</span> : null}
+                    {notification.deadline_at ? <span>截止：{formatDateTime(notification.deadline_at)}</span> : null}
+                    <span>置信度：{Math.round(Number(metadata.confidence ?? 0) * 100)}%</span>
+                  </div>
+                  {evidence.length ? <p className="application-note">证据：{evidence[0]}</p> : null}
+                  <div className="mail-notification-actions">
+                    <button className="button button-primary" type="button" onClick={() => onConfirmNotification(notification)}>
+                      <CheckCircle2 size={15} /> 确认写入
+                    </button>
+                    <button className="button button-ghost" type="button" onClick={() => onRejectNotification(notification)}>
+                      <X size={15} /> 忽略
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
       <div className="application-board-toolbar glass-panel">
         <div>
           <p className="eyebrow">Application Progress</p>
@@ -3558,6 +3982,19 @@ function PipelinePage({
                         <span>{application.job.city ?? "地点未披露"}</span>
                         <span>{application.channel ?? application.job.source}</span>
                       </div>
+                      {application.mail_timing ? (
+                        <div className="tag-row application-mail-timing">
+                          <span>邮件：{formatMailEventType(application.mail_timing.event_type)}</span>
+                          {application.mail_timing.scheduled_at ? (
+                            <span>
+                              {isInterviewMailEvent(application.mail_timing.event_type) ? "面试时间" : "开始"}：
+                              {formatDateTime(application.mail_timing.scheduled_at)}
+                            </span>
+                          ) : null}
+                          {application.mail_timing.deadline_at ? <span>截止：{formatDateTime(application.mail_timing.deadline_at)}</span> : null}
+                          {application.mail_timing.timing_source === "relative" ? <span>按邮件发送时间计算</span> : null}
+                        </div>
+                      ) : null}
                       <select value={application.status} onChange={(event) => onUpdateStatus(application, event.target.value as ApplicationStatus)}>
                         {APPLICATION_STAGES.map((option) => (
                           <option key={option.status} value={option.status}>
@@ -4209,7 +4646,7 @@ function buildApprovalChatMessage(approval: AgentApprovalRequiredPayload): strin
 }
 
 function appendRuntimeEvent(current: ChatRuntimeTimelineEvent[], nextEvent: ChatRuntimeTimelineEvent): ChatRuntimeTimelineEvent[] {
-  return [...current, nextEvent].slice(-24);
+  return appendRuntimeEventToTurn(current, nextEvent);
 }
 
 function runtimeEventAnimationDelay(index: number): string {
@@ -4249,6 +4686,13 @@ function toRuntimeEventFromTool(payload: AgentStreamToolEvent, ordinal: number):
     summary: runtimeEventSummary(eventType, payload, toolName),
     status,
     toolName,
+    toolCallId: stringOrNull(payload.tool_call_id),
+    workflowRunId: stringOrNull(payload.workflow_run_id),
+    delegationId: stringOrNull(payload.delegation_id),
+    capabilityKind: stringOrNull(payload.capability_kind),
+    executorId: stringOrNull(payload.executor_id),
+    parentCapability: stringOrNull(payload.parent_capability),
+    agentName: stringOrNull(payload.subagent_name) ?? stringOrNull(payload.parent_agent_name),
     stepIndex: typeof payload.step_index === "number" ? payload.step_index : null,
     inputHint,
     candidateNames,
@@ -4278,7 +4722,7 @@ function runtimeEventGroup(eventType: string): ChatRuntimeEventGroup {
   if (["reasoning_summary", "candidate_capabilities", "turn_started", "model_decision"].includes(eventType)) {
     return "reasoning";
   }
-  if (["tool_input_preview", "tool_started", "tool_finished", "textual_tool_call_recovered", "textual_tool_call_blocked"].includes(eventType)) {
+  if (["tool_input_preview", "tool_started", "tool_finished", "subagent_started", "subagent_finished", "subagent_tool_started", "subagent_tool_finished", "subagent_tool_waiting_approval", "textual_tool_call_recovered", "textual_tool_call_blocked"].includes(eventType)) {
     return "tooling";
   }
   if (["tool_result_summary", "reflection_evaluation", "tool_reflection_retry", "observation_insufficient", "turn_finished"].includes(eventType)) {
@@ -4308,19 +4752,41 @@ function runtimeEventTone(eventType: string, status?: string | null): ChatRuntim
   if (status === "failed" || status === "error" || status === "denied") {
     return "danger";
   }
+  if (eventType === "task_finished" && (status === "failed" || status === "blocked")) {
+    return "danger";
+  }
   if (eventType === "waiting_user" || eventType === "tool_reflection_retry" || eventType === "textual_tool_call_blocked" || eventType === "observation_insufficient" || status === "retry") {
     return "warning";
   }
-  if (eventType === "task_finished" || status === "succeeded" || status === "success") {
+  if (eventType === "task_finished" && status === "waiting_user") {
+    return "warning";
+  }
+  if (eventType === "task_finished" && (status === "succeeded" || status === "success")) {
     return "success";
   }
-  if (eventType === "task_started" || eventType === "turn_started" || eventType === "model_decision" || eventType === "candidate_capabilities" || eventType === "reasoning_summary" || eventType === "tool_input_preview" || eventType === "tool_started" || eventType === "textual_tool_call_recovered" || status === "running") {
+  if (status === "succeeded" || status === "success") {
+    return "success";
+  }
+  if (eventType === "subagent_tool_waiting_approval" || status === "waiting_user") {
+    return "warning";
+  }
+  if (eventType === "task_started" || eventType === "turn_started" || eventType === "model_decision" || eventType === "candidate_capabilities" || eventType === "reasoning_summary" || eventType === "tool_input_preview" || eventType === "tool_started" || eventType === "subagent_started" || eventType === "subagent_tool_started" || eventType === "textual_tool_call_recovered" || status === "running") {
     return "running";
   }
   return "muted";
 }
 
 function runtimeEventActor(event: ChatRuntimeTimelineEvent): RuntimeActorInfo {
+  if (event.eventType.startsWith("subagent_")) {
+    const agentName = event.agentName || runtimeSubAgentName(event.toolName, event.executorId);
+    return {
+      type: "sub_agent",
+      label: agentName,
+      detail: event.eventType.startsWith("subagent_tool_")
+        ? `${agentName} 正在通过 MCP Gateway 调用 ${formatRuntimeToolName(event.toolName || "MCP 工具")}。`
+        : `${agentName} 已由主 agent 委派，当前状态：${runtimeEventStateLabel(event)}。`,
+    };
+  }
   if (["candidate_capabilities", "reasoning_summary", "turn_started", "model_decision", "task_started"].includes(event.eventType)) {
     return {
       type: "main_model",
@@ -4349,11 +4815,18 @@ function runtimeEventActor(event: ChatRuntimeTimelineEvent): RuntimeActorInfo {
       detail: "子任务结果已回到主 agent，由主 agent 验收、重试或总结。",
     };
   }
-  if (runtimeToolRunsInSubAgent(event.toolName)) {
+  if (runtimeEventRunsInSkill(event)) {
+    return {
+      type: "local_tool",
+      label: "Skill 执行",
+      detail: `${runtimeSkillName(event.toolName, event.executorId)} 正在选择并执行内部文件动作。`,
+    };
+  }
+  if (runtimeExecutorRunsInSubAgent(event.executorId) || (!event.executorId && runtimeToolRunsInSubAgent(event.toolName))) {
     return {
       type: "sub_agent",
       label: "子 Agent 执行",
-      detail: `${runtimeSubAgentName(event.toolName)} 正在执行主 agent 派发的任务。`,
+      detail: `${runtimeSubAgentName(event.toolName, event.executorId)} 正在执行主 agent 派发的任务。`,
     };
   }
   if (event.kind === "tool" || event.toolName) {
@@ -4460,16 +4933,33 @@ function runtimeToolRunsInSubAgent(toolName?: string | null): boolean {
     toolName === "external.web_search" ||
     toolName === "applications.find_apply_entry" ||
     toolName.includes("openai") ||
-    toolName.includes("claude") ||
-    toolName.includes("agent")
+    toolName.includes("claude")
   );
 }
 
-function runtimeSubAgentName(toolName?: string | null): string {
-  if (toolName === "resume.tailor" || toolName?.includes("openai")) {
+function runtimeExecutorRunsInSubAgent(executorId?: string | null): boolean {
+  if (!executorId || executorId === "agent_tool_registry") {
+    return false;
+  }
+  return executorId.includes("openai") || executorId.includes("claude");
+}
+
+function runtimeEventRunsInSkill(event: ChatRuntimeTimelineEvent): boolean {
+  return event.capabilityKind === "skill" || event.toolName?.startsWith("skill.") === true || event.executorId?.startsWith("skill_executor.") === true;
+}
+
+function runtimeSkillName(toolName?: string | null, executorId?: string | null): string {
+  if (toolName === "skill.filesystem" || executorId === "skill_executor.filesystem") {
+    return "Filesystem Skill";
+  }
+  return toolName?.replace(/^skill\./, "") || executorId?.replace(/^skill_executor\./, "") || "Skill";
+}
+
+function runtimeSubAgentName(toolName?: string | null, executorId?: string | null): string {
+  if (executorId === "openai-sdk-agent" || toolName === "resume.tailor" || toolName?.includes("openai")) {
     return "OpenAI SDK Agent";
   }
-  if (toolName?.includes("claude")) {
+  if (executorId === "claude-sdk-agent" || toolName?.includes("claude")) {
     return "Claude SDK Agent";
   }
   if (toolName === "external.web_search") {
@@ -4478,7 +4968,23 @@ function runtimeSubAgentName(toolName?: string | null): string {
   if (toolName === "applications.find_apply_entry") {
     return "浏览器执行 Agent";
   }
+  if (toolName === "agent.google_chrome") {
+    return "Google Chrome Agent";
+  }
+  if (toolName === "agent.dbx_readonly") {
+    return "DBX 只读 Agent";
+  }
   return "能力子 Agent";
+}
+
+function runtimeCapabilityName(capability?: string | null): string {
+  if (capability === "agent.google_chrome") {
+    return "Google Chrome Agent";
+  }
+  if (capability === "agent.dbx_readonly") {
+    return "DBX 只读 Agent";
+  }
+  return capability || "子 Agent";
 }
 
 function runtimeActorBadgeClass(actorType: ChatRuntimeActorType): string {
@@ -4491,14 +4997,47 @@ function runtimeActorBadgeClass(actorType: ChatRuntimeActorType): string {
   }[actorType];
 }
 
-function runtimeActorCounts(events: ChatRuntimeTimelineEvent[]): Record<ChatRuntimeActorType, number> {
-  return events.reduce<Record<ChatRuntimeActorType, number>>(
-    (counts, event) => {
-      const actorType = runtimeEventActor(event).type;
-      return { ...counts, [actorType]: counts[actorType] + 1 };
-    },
-    { main_model: 0, sub_agent: 0, local_tool: 0, runtime: 0, observation: 0 },
-  );
+function runtimeSubAgentRuns(events: ChatRuntimeTimelineEvent[]): RuntimeSubAgentRun[] {
+  return summarizeRuntimeDelegations(events.map((event) => ({
+    id: event.id,
+    eventType: event.eventType,
+    toolCallId: event.toolCallId,
+    delegationId: event.delegationId,
+    toolName: event.toolName,
+    parentCapability: event.parentCapability,
+    executorId: event.executorId,
+    agentName: event.agentName,
+    status: event.status,
+  })));
+}
+
+function runtimeSubAgentRunStatusLabel(status: RuntimeSubAgentRunStatus): string {
+  return {
+    running: "执行中",
+    succeeded: "已完成",
+    failed: "失败",
+    waiting_user: "等待确认",
+    unknown: "状态未知",
+  }[status];
+}
+
+function runtimeFlowCounts(events: ChatRuntimeTimelineEvent[]): { main: number; subAgents: number; activeSubAgents: number; tools: number; observations: number } {
+  const runs = runtimeSubAgentRuns(events);
+  const toolCalls = new Set<string>();
+  events.forEach((event) => {
+    if (event.eventType !== "tool_started" && event.eventType !== "subagent_tool_started") {
+      return;
+    }
+    toolCalls.add(runtimeToolTrackingKey(event) || event.id);
+  });
+  const observationEvents = new Set(["tool_result_summary", "reflection_evaluation", "turn_finished", "evidence_selected", "observation_insufficient"]);
+  return {
+    main: events.filter((event) => runtimeEventActor(event).type === "main_model").length,
+    subAgents: runs.length,
+    activeSubAgents: runs.filter((run) => run.status === "running" || run.status === "waiting_user").length,
+    tools: toolCalls.size,
+    observations: events.filter((event) => observationEvents.has(event.eventType)).length,
+  };
 }
 
 function runtimeAgentChain(event: ChatRuntimeTimelineEvent, actor: RuntimeActorInfo): string[] {
@@ -4506,15 +5045,75 @@ function runtimeAgentChain(event: ChatRuntimeTimelineEvent, actor: RuntimeActorI
     return ["主模型", "选择下一步"];
   }
   if (actor.type === "sub_agent") {
-    return ["主 agent", runtimeSubAgentName(event.toolName), "返回主 agent"];
+    if (event.eventType.startsWith("subagent_tool_")) {
+      return ["主 agent", runtimeCapabilityName(event.parentCapability), event.agentName || "子 Agent", "MCP Gateway", formatRuntimeToolName(event.toolName || "MCP 工具")];
+    }
+    return ["主 agent", runtimeSubAgentName(event.toolName, event.executorId), event.eventType === "subagent_started" ? "执行中" : "返回主 agent"];
   }
   if (actor.type === "local_tool") {
+    if (runtimeEventRunsInSkill(event)) {
+      return ["主 agent", runtimeSkillName(event.toolName, event.executorId), "返回主 agent"];
+    }
     return ["主 agent", "本地工具注册中心", "返回主 agent"];
   }
   if (actor.type === "observation") {
     return ["工具结果", "主 agent 验收", event.eventType === "tool_reflection_retry" ? "准备重试" : "整理回答"];
   }
   return ["运行时", "更新状态"];
+}
+
+function runtimeUnfinishedToolCalls(events: ChatRuntimeTimelineEvent[]): RuntimeUnfinishedToolCall[] {
+  const openCalls = new Map<string, RuntimeUnfinishedToolCall>();
+
+  events.forEach((event) => {
+    const key = runtimeToolTrackingKey(event);
+    if (!key) {
+      return;
+    }
+
+    if (event.eventType === "tool_started" || event.eventType === "subagent_tool_started") {
+      openCalls.set(key, {
+        key,
+        toolName: event.toolName ?? "agent_tool",
+        summary: event.summary || "工具已开始执行。",
+      });
+      return;
+    }
+
+    if (runtimeToolTerminalEventTypes.has(event.eventType)) {
+      openCalls.delete(key);
+      runtimeMatchingToolKeys(openCalls, event).forEach((matchedKey) => openCalls.delete(matchedKey));
+    }
+  });
+
+  return Array.from(openCalls.values());
+}
+
+const runtimeToolTerminalEventTypes = new Set(["tool_finished", "subagent_tool_finished", "subagent_tool_waiting_approval", "tool_result_summary", "textual_tool_call_blocked"]);
+
+function runtimeToolTrackingKey(event: ChatRuntimeTimelineEvent): string | null {
+  if (!event.toolName || event.kind !== "tool") {
+    return null;
+  }
+  if (event.toolCallId) {
+    return `call:${event.toolCallId}`;
+  }
+  if (event.workflowRunId && event.stepIndex !== null && event.stepIndex !== undefined) {
+    return `workflow:${event.workflowRunId}:${event.stepIndex}:${event.toolName}`;
+  }
+  if (event.stepIndex !== null && event.stepIndex !== undefined) {
+    return `step:${event.stepIndex}:${event.toolName}`;
+  }
+  return `tool:${event.toolName}`;
+}
+
+function runtimeMatchingToolKeys(openCalls: Map<string, RuntimeUnfinishedToolCall>, event: ChatRuntimeTimelineEvent): string[] {
+  if (!event.toolName) {
+    return [];
+  }
+  return Array.from(openCalls.entries())
+    .filter(([, call]) => call.toolName === event.toolName)
+    .map(([key]) => key);
 }
 
 function runtimeEventStateLabel(event: ChatRuntimeTimelineEvent): string {
@@ -4553,6 +5152,44 @@ function runtimePayloadPreview(event: ChatRuntimeTimelineEvent): string | null {
     return runtimeCompactJson(event.reflection);
   }
   return null;
+}
+
+function runtimeFilesystemTrace(resultSummary?: Record<string, unknown> | null): RuntimeFilesystemTrace | null {
+  const trace = recordOrNull(resultSummary?.filesystem_trace);
+  if (!trace) {
+    return null;
+  }
+  // Filesystem proof stays structured so the timeline can show what changed on disk,
+  // instead of only showing a generic "tool completed" sentence.
+  return {
+    operation: stringOrNull(trace.operation),
+    precheck: recordOrNull(trace.precheck) ?? undefined,
+    script: recordOrNull(trace.script) ?? undefined,
+    postcheck: recordOrNull(trace.postcheck) ?? undefined,
+  };
+}
+
+function runtimeTraceText(value: unknown): string | null {
+  const text = stringOrNull(value);
+  return text && text.length > 220 ? `${text.slice(0, 220)}...` : text;
+}
+
+function runtimeTraceBoolean(value: unknown): string | null {
+  if (typeof value !== "boolean") {
+    return null;
+  }
+  return value ? "存在" : "不存在";
+}
+
+function runtimeOperationLabel(operation?: string | null): string {
+  return {
+    copy_file: "复制文件",
+    rename_file: "重命名文件",
+    move_file: "移动文件",
+    replace_text: "替换文本",
+    read_file: "读取文件",
+    path_exists: "检查路径",
+  }[operation ?? ""] ?? operation ?? "文件操作";
 }
 
 function runtimeCompactJson(value: Record<string, unknown>): string {
@@ -4630,13 +5267,16 @@ function runtimeEventIcon(event: ChatRuntimeTimelineEvent): LucideIcon {
   if (event.eventType === "model_decision") {
     return Sparkles;
   }
+  if (event.eventType === "subagent_started" || event.eventType === "subagent_finished" || event.eventType.startsWith("subagent_tool_")) {
+    return Network;
+  }
   if (event.eventType === "waiting_user") {
     return Clock3;
   }
   if (event.tone === "success") {
     return CheckCircle2;
   }
-  if (runtimeToolRunsInSubAgent(event.toolName)) {
+  if (runtimeExecutorRunsInSubAgent(event.executorId) || (!event.executorId && runtimeToolRunsInSubAgent(event.toolName))) {
     return Cpu;
   }
   if (event.toolName?.includes("search")) {
@@ -4669,6 +5309,12 @@ function runtimeEventSummary(eventType: string, payload: AgentStreamToolEvent, t
 }
 
 function formatRuntimeToolName(toolName: string): string {
+  if (toolName.startsWith("mcp.chrome.") || toolName.startsWith("mcp.google_chrome.") || toolName.startsWith("mcp.google-chrome.")) {
+    return `Chrome MCP · ${toolName.split(".").slice(2).join(".")}`;
+  }
+  if (toolName.startsWith("mcp.dbx.")) {
+    return `DBX MCP · ${toolName.slice("mcp.dbx.".length)}`;
+  }
   return RUNTIME_TOOL_LABELS[toolName] ?? toolName;
 }
 
@@ -5049,6 +5695,41 @@ function agentStatusLabel(status: string): string {
   return status;
 }
 
+function mcpIntegrationStatusLabel(integration: AgentRuntimeMcpIntegration): string {
+  if (integration.status === "configured") {
+    return integration.label || "已配置，待首次发现";
+  }
+  if (integration.status === "registered") {
+    return integration.label || "已注册";
+  }
+  if (integration.status === "unavailable") {
+    return integration.label || "MCP 不可用";
+  }
+  if (integration.status === "credentials_missing") {
+    return integration.label || "邮箱凭据未配置";
+  }
+  if (integration.status === "not_configured") {
+    return integration.label || "网关未配置";
+  }
+  if (integration.status === "not_registered") {
+    return integration.label || "未注册";
+  }
+  if (integration.status === "disabled") {
+    return integration.label || "未启用";
+  }
+  return integration.label || integration.status;
+}
+
+function mcpIntegrationTransportLabel(transport: string | null | undefined): string {
+  if (transport === "stdio_bridge") {
+    return "默认 stdio MCP bridge";
+  }
+  if (transport === "http_gateway") {
+    return "HTTP MCP Gateway";
+  }
+  return "未配置";
+}
+
 function agentHealthLabel(health: AgentRuntimeHealth): string {
   if (health.status === "healthy") {
     return health.label || "已连接";
@@ -5091,6 +5772,53 @@ function formatDateTime(value: string | null): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatMailEventType(value: string): string {
+  const labels: Record<string, string> = {
+    ai_interview: "AI 面试",
+    interview: "面试",
+    written_test: "笔试",
+    assessment: "测评",
+    online_assessment: "在线测评",
+  };
+  return labels[value] ?? value;
+}
+
+function isInterviewMailEvent(value: string): boolean {
+  return value.toLowerCase().includes("interview") || value.includes("面试");
+}
+
+const STALE_APPROVAL_ERROR_CODE = "STALE_APPROVAL_REQUEST";
+const STALE_APPROVAL_RESYNC_MESSAGE = "这个确认请求已经过期，已刷新当前会话状态，请重新发起操作。";
+
+function noticeForActionError(error: unknown): Notice {
+  if (isStaleApprovalError(error)) {
+    return { kind: "warning", message: STALE_APPROVAL_RESYNC_MESSAGE };
+  }
+  return { kind: "danger", message: toDisplayError(error) };
+}
+
+function isStaleApprovalError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    const detail = apiErrorDetail(error.details);
+    if (detail?.error_code === STALE_APPROVAL_ERROR_CODE) {
+      return true;
+    }
+    if (error.status === 409 && error.message.includes("确认请求已经过期")) {
+      return true;
+    }
+  }
+  const message = error instanceof Error ? error.message : "";
+  return message.includes(STALE_APPROVAL_ERROR_CODE) || message.includes("Workflow is not waiting for user confirmation") || message.includes("确认请求已经过期");
+}
+
+function apiErrorDetail(details: unknown): Record<string, unknown> | null {
+  if (!isRecord(details)) {
+    return null;
+  }
+  const detail = details.detail;
+  return isRecord(detail) ? detail : null;
 }
 
 function toDisplayError(error: unknown): string {

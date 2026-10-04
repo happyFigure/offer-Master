@@ -221,7 +221,10 @@ class AgentSkillRepositoryTest(unittest.TestCase):
             skill = repository.import_skill_from_path(source_dir, category="content_source")
             session.commit()
 
+        imported_dir = Path(skill.file_path).parent
         metadata = skill.metadata_json
+        self.assertTrue((imported_dir / "scripts" / "fetch.py").is_file())
+        self.assertTrue((imported_dir / "references" / "usage.md").is_file())
         self.assertEqual(["wechat_article", "wechat_account"], metadata["source_types"])
         self.assertEqual(["weixin-articles-mcp.read_article"], metadata["required_tools"])
         self.assertEqual(["weixin-articles-mcp.read_article", "ocr.extract_text"], metadata["allowed_tools"])
@@ -326,11 +329,12 @@ class AgentSkillRepositoryTest(unittest.TestCase):
 
         self.assertEqual(200, list_response.status_code)
         listed_names = {item["name"] for item in list_response.json()["items"]}
-        self.assertEqual(4, len(listed_names))
+        self.assertEqual(5, len(listed_names))
         self.assertIn("api-sync", listed_names)
         self.assertIn("wechat-article-content-fetch", listed_names)
         self.assertIn("xiaohongshu-content-fetch", listed_names)
         self.assertIn("database-operations", listed_names)
+        self.assertIn("qq-mail-recruitment", listed_names)
         self.assertEqual(200, get_response.status_code)
         self.assertEqual("markdown_file", get_response.json()["skill"]["storage_type"])
         self.assertTrue(get_response.json()["content"].startswith("# "))
@@ -377,11 +381,12 @@ class AgentSkillRepositoryTest(unittest.TestCase):
         self.assertEqual(["wechat_article", "wechat_account"], import_response.json()["metadata_json"]["source_types"])
         self.assertEqual(200, list_response.status_code)
         listed_names = {item["name"] for item in list_response.json()["items"]}
-        self.assertEqual(4, len(listed_names))
+        self.assertEqual(5, len(listed_names))
         self.assertIn("wechat-recruiting-articles", listed_names)
         self.assertIn("wechat-article-content-fetch", listed_names)
         self.assertIn("xiaohongshu-content-fetch", listed_names)
         self.assertIn("database-operations", listed_names)
+        self.assertIn("qq-mail-recruitment", listed_names)
 
     def test_skill_api_bootstraps_builtin_content_source_skills_on_list(self) -> None:
         app = self._app()
@@ -403,8 +408,9 @@ class AgentSkillRepositoryTest(unittest.TestCase):
         self.assertIn("wechat-article-content-fetch", first_names)
         self.assertIn("xiaohongshu-content-fetch", first_names)
         self.assertEqual(len(second_names), len(set(second_names)))
-        self.assertEqual(3, len(second_names))
+        self.assertEqual(4, len(second_names))
         self.assertIn("database-operations", second_names)
+        self.assertIn("qq-mail-recruitment", second_names)
 
     def test_skill_api_bootstraps_builtin_database_operations_skill_on_list(self) -> None:
         app = self._app()
@@ -464,7 +470,10 @@ class AgentSkillRepositoryTest(unittest.TestCase):
 
         self.assertEqual(201, import_response.status_code)
         imported_metadata = import_response.json()["metadata_json"]
-        listed_metadata = list_response.json()["items"][0]["metadata_json"]
+        listed_skill = next(
+            item for item in list_response.json()["items"] if item["name"] == "memory-recall-skill"
+        )
+        listed_metadata = listed_skill["metadata_json"]
 
         self.assertEqual("available", imported_metadata["availability_state"])
         self.assertEqual("available", imported_metadata["tool_dependency_state"])

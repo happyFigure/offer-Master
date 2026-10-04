@@ -83,7 +83,6 @@ class AgentSkillRepository:
         if blocking_errors:
             raise ValueError("; ".join(str(error) for error in blocking_errors))
 
-        skill_file = package.skill_file
         name = package.name
         if self._repository.get_skill_by_name(name) is not None:
             raise ValueError(f"Agent skill name already exists: {name}")
@@ -109,7 +108,7 @@ class AgentSkillRepository:
         skill_dir = self._skill_root / skill.id
         skill_dir.mkdir(parents=True, exist_ok=True)
         imported_file = skill_dir / "SKILL.md"
-        shutil.copyfile(skill_file, imported_file)
+        _copy_skill_package(package.package_root, skill_dir)
         skill.file_path = str(imported_file)
         self._ensure_usage(skill.id)
         self._repository.flush()
@@ -131,6 +130,7 @@ class AgentSkillRepository:
             [
                 *_builtin_content_source_skill_paths(),
                 *_builtin_database_skill_paths(),
+                *_builtin_mail_skill_paths(),
             ]
         )
 
@@ -311,6 +311,34 @@ def _builtin_content_source_skill_paths() -> list[Path]:
 
 def _builtin_database_skill_paths() -> list[Path]:
     return [_default_skill_root() / "builtin-database" / "database-operations"]
+
+
+def _builtin_mail_skill_paths() -> list[Path]:
+    return [_default_skill_root() / "builtin-mail" / "qq-mail-recruitment"]
+
+
+def _copy_skill_package(source_root: Path, destination_root: Path) -> None:
+    """Copy the executable Skill package, not only SKILL.md.
+
+    Claude Code/my-agents style progressive loading needs SKILL.md for the
+    human instructions, plus bundled scripts/references/assets/agents for lazy
+    action listing and execution. We intentionally copy only known Skill package
+    folders so importing a local directory does not sweep unrelated files or
+    secrets into OfferMaster's managed Skill store.
+    """
+    destination_root.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_root / "SKILL.md", destination_root / "SKILL.md")
+    for folder in ("scripts", "references", "assets", "agents"):
+        source = source_root / folder
+        if not source.is_dir():
+            continue
+        destination = destination_root / folder
+        shutil.copytree(
+            source,
+            destination,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"),
+        )
 
 
 def _resolve_skill_file(source_path: Path) -> Path:

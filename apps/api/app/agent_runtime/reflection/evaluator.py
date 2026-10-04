@@ -171,7 +171,12 @@ def _evaluate_public_web_search_result(
     relevant = _public_result_matches_query(query, text)
     has_source_evidence = _web_search_has_traceable_source(result_payload)
     requires_source_evidence = _contains_any(query, _TIME_SENSITIVE_PUBLIC_TERMS)
-    if relevant and not off_target and (has_source_evidence or not requires_source_evidence):
+    # Search providers may return a useful target result together with noisy
+    # same-name results. A relevant answer plus traceable evidence is enough
+    # to continue; the final synthesis prompt is responsible for filtering
+    # those noisy items. Reject only when the whole result misses the query or
+    # lacks required evidence.
+    if relevant and (not requires_source_evidence or has_source_evidence):
         return ReflectionDecision(
             quality=ReflectionQuality.GOOD,
             next_action=ReflectionNextAction.CONTINUE,
@@ -181,7 +186,7 @@ def _evaluate_public_web_search_result(
                 "mode": "public_web",
                 "checks": {
                     "relevant": True,
-                    "off_target": False,
+                    "off_target": off_target,
                     "has_source_evidence": has_source_evidence,
                     "requires_source_evidence": requires_source_evidence,
                 },
@@ -257,6 +262,15 @@ def _public_result_matches_query(query: str, text: str) -> bool:
     if not query_terms:
         return bool(text_lower.strip())
     hits = sum(1 for term in query_terms if term in text_lower)
+    # Search providers commonly normalize 校园招聘 to 校招 (and vice versa).
+    # Treat that pair as one semantic signal so a useful result is not retried
+    # just because the provider chose a shorter recruiting label.
+    recruiting_query = _contains_any(query_lower, ["校园招聘", "校招", "秋招", "campus", "graduate"])
+    recruiting_result = _contains_any(text_lower, ["校园招聘", "校招", "秋招", "campus", "graduate"])
+    if recruiting_query and recruiting_result and not any(
+        term in text_lower for term in ("校园招聘", "校招", "秋招", "campus", "graduate") if term in query_lower
+    ):
+        hits += 1
     return hits >= 1
 
 
@@ -287,6 +301,18 @@ def _public_retry_query(tool_input: dict[str, Any]) -> str:
         if asks_last_match:
             return "Lionel Messi last match result date ESPN Flashscore SofaScore Inter Miami Argentina"
         return "Lionel Messi next match fixtures ESPN Flashscore SofaScore Inter Miami Argentina"
+    # A model-selected recruiting query may be underspecified after the
+    # semantic router is removed. Keep retry quality in the evaluator: enrich
+    # only a failed public hiring search, never the capability selection.
+    if _contains_any(lowered, ["招聘", "校招", "校园", "秋招", "campus", "graduate"]):
+        company_part = re.sub(
+            r"(?:校园招聘|招聘|校招|秋招|campus|graduate|官网|official|\b20\d{2}\b)",
+            " ",
+            original,
+            flags=re.IGNORECASE,
+        )
+        company_part = re.sub(r"\s+", " ", company_part).strip()
+        return f"{company_part} 校园招聘 官网 2026".strip()
     return original or "latest public information official source"
 
 

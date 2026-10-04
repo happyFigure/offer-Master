@@ -129,11 +129,14 @@ class DurableStateService:
         step_id: str,
         *,
         approval_request_id: str | None = None,
+        tool_call_log_id: str | None = None,
         output_payload: dict[str, Any] | None = None,
     ) -> AgentStepState:
         step = self.get_step(step_id)
         step.status = AgentStepStatus.WAITING_USER
         step.approval_request_id = approval_request_id
+        if tool_call_log_id is not None:
+            step.tool_call_log_id = tool_call_log_id
         if output_payload is not None:
             step.output_payload = output_payload
         self.repository.update_step(step)

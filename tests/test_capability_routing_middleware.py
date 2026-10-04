@@ -1,5 +1,6 @@
 import sys
 import unittest
+from typing import Dict
 from pathlib import Path
 
 
@@ -8,7 +9,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "apps" / "api"))
 
 
 class CapabilityRoutingMiddlewareTest(unittest.TestCase):
-    def _context_pack(self, *, intent: str, company_names=None, risk_level: str = "low") -> dict[str, object]:
+    def _context_pack(self, *, intent: str, company_names=None, risk_level: str = "low") -> Dict[str, object]:
         from app.agent_runtime.context.capability_catalog import CapabilityCatalog
         from app.agent_runtime.context.context_pack import ContextPackBuilder
         from app.agent_runtime.tool_registry import create_default_agent_tool_registry
@@ -155,6 +156,149 @@ class CapabilityRoutingMiddlewareTest(unittest.TestCase):
         self.assertEqual({"sample_limit": 10, "include_external_job_board": True}, decision.tool_input)
         self.assertFalse(decision.requires_confirmation)
         self.assertEqual(True, decision.metadata["read_only"])
+
+    def test_routes_company_count_to_company_exhibition_provider(self) -> None:
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+        from app.agent_runtime.tool_registry import LOCAL_JOB_SOURCE_OVERVIEW_TOOL
+
+        context_pack = self._context_pack(intent="company_board_overview")
+        context_pack["sync_policy"] = {"mode": "company_board_count", "company_board": "offerio_company_openings"}
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="当前数据库中的公司数有多少个",
+            intent_frame={"intent": "company_board_overview", "confidence": 1.0, "risk_level": "low"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual(LOCAL_JOB_SOURCE_OVERVIEW_TOOL, decision.capability)
+        self.assertEqual("company_board_overview", decision.executor_name)
+        self.assertEqual({"mode": "company_board_count"}, decision.tool_input)
+
+    def test_explicit_required_dbx_capability_routes_to_child_agent(self) -> None:
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        context_pack = self._context_pack(intent="company_board_overview")
+        context_pack["required_capability"] = "agent.dbx_readonly"
+        context_pack["allowed_capabilities"] = ["agent.dbx_readonly"]
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="只通过 DBX 只读子 Agent 查询公司展览公司数",
+            intent_frame={"intent": "company_board_overview", "confidence": 1.0, "risk_level": "low"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual("local_tool", decision.route)
+        self.assertEqual("agent.dbx_readonly", decision.capability)
+        self.assertEqual("agent", decision.executor_type)
+        self.assertEqual("只通过 DBX 只读子 Agent 查询公司展览公司数", decision.tool_input["task"])
+        self.assertTrue(decision.metadata["required_capability"])
+
+    def test_explicit_required_dbx_capability_fails_closed_when_unavailable(self) -> None:
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        context_pack = self._context_pack(intent="company_board_overview")
+        context_pack["required_capability"] = "agent.dbx_readonly"
+        context_pack["missing_required_capability"] = True
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="只通过 DBX 查询公司数",
+            intent_frame={"intent": "company_board_overview", "confidence": 1.0, "risk_level": "low"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual("block", decision.route)
+        self.assertIsNone(decision.capability)
+        self.assertIn("agent.dbx_readonly", decision.reason)
+
+    def test_routes_filesystem_operation_to_filesystem_skill(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        context_pack = self._context_pack(intent="filesystem_operation")
+        context_pack["filesystem_operation"] = "path_exists"
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 你看下这个文件是否存在",
+            intent_frame={"intent": "filesystem_operation", "confidence": 1.0, "risk_level": "medium"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual("local_workflow", decision.route)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, decision.capability)
+        self.assertEqual("skill_executor", decision.executor_type)
+        self.assertEqual("filesystem_skill", decision.executor_name)
+        self.assertEqual(
+            {
+                "user_task": "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex 你看下这个文件是否存在",
+            },
+            decision.tool_input,
+        )
+        self.assertFalse(decision.requires_confirmation)
+
+    def test_routes_filesystem_capability_before_model_selects_inner_operation(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="复制这份简历，并根据内容自己起一个名字",
+            intent_frame={"intent": "filesystem_operation", "confidence": 0.95, "risk_level": "medium"},
+            context_pack=self._context_pack(intent="filesystem_operation"),
+        )
+
+        self.assertEqual("local_workflow", decision.route)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, decision.capability)
+        self.assertEqual("skill_executor", decision.executor_type)
+        self.assertEqual({"user_task": "复制这份简历，并根据内容自己起一个名字"}, decision.tool_input)
+        self.assertTrue(decision.metadata["structured_operation_required"])
+        self.assertFalse(decision.requires_confirmation)
+
+    def test_routes_filesystem_content_followup_with_resolved_operation_and_path(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        context_pack = self._context_pack(intent="filesystem_operation")
+        context_pack["filesystem_operation"] = "read_file"
+        context_pack["active_file"] = {"path": path, "last_focus": "file"}
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="文件内容",
+            intent_frame={"intent": "filesystem_operation", "confidence": 1.0, "risk_level": "low"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual("local_workflow", decision.route)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, decision.capability)
+        self.assertNotIn("operation", decision.tool_input)
+        self.assertEqual({"user_task": "文件内容"}, decision.tool_input)
+        self.assertNotIn("file_task_frame", decision.tool_input)
+
+    def test_routes_filesystem_copy_followup_with_resolved_src_and_dst(self) -> None:
+        from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
+        from app.agent_runtime.routing.capability_routing_middleware import CapabilityRoutingMiddleware
+
+        source_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume.tex"
+        target_path = "C:/Users/phoenix/Documents/Obsidian Vault/简历/resume-copy.tex"
+        context_pack = self._context_pack(intent="filesystem_operation")
+        context_pack["filesystem_operation"] = "copy_file"
+        context_pack["active_file"] = {"path": source_path, "last_focus": "file"}
+        context_pack["operation_intent"] = {
+            "destination": {"kind": "file", "path": target_path},
+            "name_policy": "copy_suffix",
+            "user_delegated_name": False,
+        }
+
+        decision = CapabilityRoutingMiddleware().decide(
+            user_message="复制一份叫 resume-copy.tex",
+            intent_frame={"intent": "filesystem_operation", "confidence": 1.0, "risk_level": "high"},
+            context_pack=context_pack,
+        )
+
+        self.assertEqual("local_workflow", decision.route)
+        self.assertEqual(FILESYSTEM_SKILL_CAPABILITY, decision.capability)
+        self.assertNotIn("operation", decision.tool_input)
+        self.assertEqual(source_path, context_pack["active_file"]["path"])
+        self.assertNotIn("operation_intent", decision.tool_input)
+        self.assertNotIn("file_task_frame", decision.tool_input)
 
 
 if __name__ == "__main__":

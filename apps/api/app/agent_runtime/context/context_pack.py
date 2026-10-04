@@ -22,6 +22,11 @@ class ContextPack:
     memory_policy: str = "default"
     notes: list[str] = field(default_factory=list)
     sync_policy: dict[str, Any] = field(default_factory=dict)
+    filesystem_operation: str | None = None
+    operation_intent: dict[str, Any] = field(default_factory=dict)
+    required_capability: str | None = None
+    missing_required_capability: bool = False
+    capability_selection_mode: str = "model_driven"
 
     def to_metadata_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +42,11 @@ class ContextPack:
             "memory_policy": self.memory_policy,
             "notes": list(self.notes),
             "sync_policy": dict(self.sync_policy),
+            "filesystem_operation": self.filesystem_operation,
+            "operation_intent": dict(self.operation_intent),
+            "required_capability": self.required_capability,
+            "missing_required_capability": self.missing_required_capability,
+            "capability_selection_mode": self.capability_selection_mode,
         }
 
 
@@ -44,9 +54,21 @@ class ContextPackBuilder:
     def __init__(self, capability_catalog: CapabilityCatalog) -> None:
         self._capability_catalog = capability_catalog
 
-    def build(self, frame: IntentFrame) -> ContextPack:
-        allowed = self._capability_catalog.allowed_for_intent(frame.intent)
-        excluded = self._capability_catalog.excluded_for_intent(frame.intent)
+    def build(self, frame: IntentFrame, *, source_type: str = "agent_chat") -> ContextPack:
+        # The main model receives the source-eligible catalog. Intent is
+        # retained as observation metadata and must not remove tools before
+        # the model has seen the conversation history.
+        source_allowed = self._capability_catalog.model_visible_for_source(source_type)
+        required_capability = str(frame.required_capability or "").strip() or None
+        if required_capability is None:
+            allowed = source_allowed
+            missing_required_capability = False
+        else:
+            allowed = [capability for capability in source_allowed if capability.name == required_capability]
+            # An explicit source is a hard user constraint. Do not replace an
+            # unavailable capability with a similar local tool.
+            missing_required_capability = not allowed
+        excluded = [capability for capability in source_allowed if capability not in allowed]
         memory_policy = _memory_policy_for_intent(frame.intent)
         sync_policy = _sync_policy_for_intent(frame.intent, [capability.name for capability in allowed])
         return ContextPack(
@@ -62,6 +84,11 @@ class ContextPackBuilder:
             memory_policy=memory_policy,
             notes=_notes_for_intent(frame.intent),
             sync_policy=sync_policy,
+            filesystem_operation=frame.filesystem_operation,
+            operation_intent=dict(frame.operation_intent),
+            required_capability=required_capability,
+            missing_required_capability=missing_required_capability,
+            capability_selection_mode="model_driven",
         )
 
 
@@ -71,8 +98,10 @@ def _memory_policy_for_intent(intent: str) -> str:
         "local_company_database_overview",
         "local_company_database_list",
         "local_job_source_overview",
+        "company_board_overview",
         "offerio_company_jobs_sync",
         "application_entry_discovery",
+        "filesystem_operation",
     }:
         return "do_not_load_resume_full_text"
     if intent in {"job_match_analysis", "resume_tailoring"}:
@@ -93,8 +122,12 @@ def _notes_for_intent(intent: str) -> list[str]:
         return ["read_only_local_company_list", "do_not_modify_database", "do_not_load_resume_full_text"]
     if intent == "local_job_source_overview":
         return ["read_only_local_job_sources", "include_offerio_job_board_totals", "do_not_modify_database"]
+    if intent == "company_board_overview":
+        return ["company_count_means_company_exhibition", "read_only_external_company_board", "do_not_fallback_to_legacy_company_tables"]
     if intent == "application_entry_discovery":
         return ["stop_before_final_submission", "do_not_upload_unselected_resume"]
+    if intent == "filesystem_operation":
+        return ["use_active_file_context", "do_not_guess_missing_paths", "confirm_high_risk_file_writes"]
     return []
 
 
@@ -107,4 +140,6 @@ def _sync_policy_for_intent(intent: str, allowed_capabilities: list[str]) -> dic
         return {"read_only": True, "default_limit": 20}
     if intent == "local_job_source_overview" and LOCAL_JOB_SOURCE_OVERVIEW_TOOL in allowed_capabilities:
         return {"read_only": True, "sample_limit": 10, "include_external_job_board": True}
+    if intent == "company_board_overview" and LOCAL_JOB_SOURCE_OVERVIEW_TOOL in allowed_capabilities:
+        return {"read_only": True, "mode": "company_board_count", "company_board": "offerio_company_openings"}
     return {}

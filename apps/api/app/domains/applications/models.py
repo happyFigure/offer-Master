@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -77,6 +77,13 @@ class ApplicationEvent(Base):
         Index("ix_application_events_application_id", "application_id"),
         Index("ix_application_events_event_type", "event_type"),
         Index("ix_application_events_created_at", "created_at"),
+        Index("ix_application_events_review_status", "review_status"),
+        UniqueConstraint(
+            "application_id",
+            "source_message_id",
+            "event_type",
+            name="uq_application_events_mail_source",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -89,6 +96,14 @@ class ApplicationEvent(Base):
     actor: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
     source: Mapped[str] = mapped_column(String(64), nullable=False, default="domain")
     event_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime)
+    timezone: Mapped[str | None] = mapped_column(String(64))
+    join_url: Mapped[str | None] = mapped_column(String(2048))
+    source_message_id: Mapped[str | None] = mapped_column(String(512))
+    source_uid: Mapped[str | None] = mapped_column(String(128))
+    review_status: Mapped[str | None] = mapped_column(String(32))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
 
     application: Mapped[Application] = relationship(back_populates="events")

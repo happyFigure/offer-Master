@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import date
-import json
+import logging
 import re
 from typing import Any, Callable
 
@@ -14,8 +14,11 @@ from app.agent_runtime.loop_agent.schemas import (
     LoopAgentObservation,
     LoopAgentRunResult,
 )
-from app.agent_runtime.tool_registry import AgentToolDefinition, AgentToolRegistry
+from app.agent_runtime.tool_registry import AgentToolDefinition
 from app.agent_runtime.web_search_query import normalize_external_web_search_query
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ class ToolChoiceLoopRunner:
     def __init__(
         self,
         *,
-        registry: AgentToolRegistry,
+        registry: Any,
         llm_client: Any,
         db_session: Any | None = None,
         execute_tool: Callable[[LoopAgentTask, LoopAgentDecision], LoopAgentObservation] | None = None,
@@ -89,32 +92,87 @@ class ToolChoiceLoopRunner:
         stage_context_history = _stage_context_history(active_stage_context)
         stage_capabilities_history: list[dict[str, Any]] = []
         messages: list[dict[str, Any]] = _initial_messages(task)
+        final_answer_guard_retries = 0
+        model_turns = 0
+        filesystem_recovery_observed = False
+        filesystem_read_observed = False
+        filesystem_mutation_completed = False
+        filesystem_guard_prompt_injected = False
 
         def decide_next_step(_trace) -> LoopAgentDecision:
+            nonlocal final_answer_guard_retries, model_turns
             current_capabilities = _stage_filtered_capabilities(active_stage_context, all_capabilities)
             _append_stage_capabilities_history(stage_capabilities_history, active_stage_context, current_capabilities)
             bundle = _build_tool_schema_bundle(self._registry, current_capabilities)
-            completion = self._llm_client.complete(
-                messages=messages,
-                tools=bundle["tools"] or None,
-                tool_choice="auto" if bundle["tools"] else None,
-            )
-            tool_calls = list(getattr(completion, "tool_calls", []) or [])
-            if not tool_calls:
-                textual_decision = _textual_tool_call_decision(
-                    str(getattr(completion, "content", "") or ""),
-                    bundle=bundle,
-                    task=task,
+            while True:
+                model_turns += 1
+                logger.info(
+                    "Tool choice model turn: turn=%s capabilities=%s message_count=%s guard_retries=%s",
+                    model_turns,
+                    current_capabilities,
+                    len(messages),
+                    final_answer_guard_retries,
                 )
-                if textual_decision is not None:
-                    return _decision_with_stage_policy_metadata(
-                        textual_decision,
-                        stage_context=active_stage_context,
-                        offered_capabilities=current_capabilities,
+                completion = self._llm_client.complete(
+                    messages=messages,
+                    tools=bundle["tools"] or None,
+                    tool_choice="auto" if bundle["tools"] else None,
+                )
+                tool_calls = list(getattr(completion, "tool_calls", []) or [])
+                if tool_calls:
+                    break
+
+                final_message = str(getattr(completion, "content", "") or "").strip()
+                guard_reason = _filesystem_final_answer_guard_reason(task, _trace)
+                if (
+                    guard_reason is None
+                    and filesystem_recovery_observed
+                    and filesystem_read_observed
+                    and not filesystem_mutation_completed
+                ):
+                    guard_reason = (
+                        "当前文件任务的 runtime 恢复信号要求读取后继续完成写操作，"
+                        "不能把 read_file 当成最终结果。"
+                    )
+                if guard_reason and final_answer_guard_retries < 2:
+                    final_answer_guard_retries += 1
+                    # This is a runtime-owned continuation signal. It does not
+                    # manufacture an operation or filename; it only prevents a
+                    # prose answer from terminating an unfinished write flow.
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "RUNTIME_COMPLETION_GUARD: "
+                                "运行时阻止了本轮提前结束。"
+                                f"{guard_reason}"
+                                "请不要返回普通文本，也不要等待用户确认；请根据已经读取到的真实内容，"
+                                "提交 skill.filesystem 的结构化写操作调用。"
+                                "由模型自己选择 copy_file 或 rename_file、目标路径和文件名意图；"
+                                "runtime 只会校验、审批和执行你提交的结构化参数。"
+                            ),
+                            "metadata": {"source": "runtime_completion_guard", "retry": final_answer_guard_retries},
+                        }
+                    )
+                    logger.info(
+                        "Filesystem completion guard prompt appended: retry=%s message_count=%s",
+                        final_answer_guard_retries,
+                        len(messages),
+                    )
+                    continue
+                if guard_reason:
+                    return LoopAgentDecision(
+                        action=LoopAgentAction.WAIT_USER,
+                        message="文件任务尚未完成：模型还没有提交真实的文件写操作，runtime 已阻止提前结束。",
+                        reason=guard_reason,
+                        metadata={
+                            "source": "runtime_completion_guard",
+                            "guard_retries": final_answer_guard_retries,
+                        },
                     )
                 return LoopAgentDecision(
                     action=LoopAgentAction.FINAL_ANSWER,
-                    message=str(getattr(completion, "content", "") or "").strip(),
+                    message=final_message,
                     reason="模型认为当前信息已经足够，可以直接回答。",
                 )
 
@@ -146,6 +204,7 @@ class ToolChoiceLoopRunner:
 
         def execute_step(decision: LoopAgentDecision) -> LoopAgentObservation:
             nonlocal active_stage_context, stage_context_history
+            nonlocal filesystem_recovery_observed, filesystem_read_observed, filesystem_mutation_completed, filesystem_guard_prompt_injected
             current_capabilities = _stage_filtered_capabilities(active_stage_context, all_capabilities)
             blocked_observation = _blocked_tool_decision_observation(task, decision, current_capabilities)
             if blocked_observation is not None:
@@ -160,6 +219,61 @@ class ToolChoiceLoopRunner:
                     "content": _observation_message(decision, observation),
                 }
             )
+            if str(decision.capability or "").strip() == "skill.filesystem":
+                operation = str((decision.tool_input or {}).get("operation") or "").strip()
+                observation_metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+                next_action = str(observation_metadata.get("next_action") or "").strip()
+                error_code = str(observation_metadata.get("error_code") or "").strip()
+                recovery_outcome = observation_metadata.get("recovery_outcome")
+                recovery_next_action = (
+                    str(recovery_outcome.get("next_action") or "").strip()
+                    if isinstance(recovery_outcome, dict)
+                    else ""
+                )
+                if next_action in {"continue_model_loop", "read_before_write"} or recovery_next_action in {"continue_model_loop", "read_before_write"} or error_code in {
+                    "STRUCTURED_OPERATION_REQUIRED",
+                    "CONTENT_BASED_NAME_REQUIRED",
+                    "CONTENT_BASED_NAME_REQUIRES_READ",
+                    "MISSING_REQUIRED_ARGUMENT",
+                }:
+                    filesystem_recovery_observed = True
+                if operation == "read_file" and str(observation.status or "").strip().lower() in {"succeeded", "partial", "completed", "success", "ok"}:
+                    filesystem_read_observed = True
+                if operation in {"copy_file", "rename_file"} and str(observation.status or "").strip().lower() in {"succeeded", "completed", "success", "ok"}:
+                    filesystem_mutation_completed = True
+                logger.info(
+                    "Filesystem loop evidence updated: operation=%s status=%s recovery=%s read=%s mutation=%s",
+                    operation,
+                    observation.status,
+                    filesystem_recovery_observed,
+                    filesystem_read_observed,
+                    filesystem_mutation_completed,
+                )
+                if (
+                    operation == "read_file"
+                    and filesystem_recovery_observed
+                    and filesystem_read_observed
+                    and not filesystem_mutation_completed
+                    and not filesystem_guard_prompt_injected
+                ):
+                    logger.info("Injecting filesystem completion guard after verified coarse read")
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "RUNTIME_COMPLETION_GUARD: 运行时阻止了本轮提前结束。"
+                                "当前文件任务已经读取了源文件，下一步必须继续提交 skill.filesystem 的结构化写操作调用；"
+                                "请由模型根据真实文件内容自行选择 copy_file 或 rename_file、目标路径和文件名意图，"
+                                "不要返回普通文本，也不要等待用户确认。runtime 只负责校验、审批和执行。"
+                            ),
+                            "metadata": {"source": "runtime_completion_guard", "phase": "after_verified_read"},
+                        }
+                    )
+                    logger.info(
+                        "Filesystem completion guard prompt appended after read: message_count=%s",
+                        len(messages),
+                    )
+                    filesystem_guard_prompt_injected = True
             transition_history = _stage_context_history_after_observation(active_stage_context, observation, decision)
             for stage_identifier in transition_history:
                 stage_context_history = _append_unique_strings(stage_context_history, stage_identifier)
@@ -219,6 +333,19 @@ class ToolChoiceLoopRunner:
 
         missing_required = _missing_required_tool_input_names(definition, decision.tool_input)
         if missing_required:
+            if _is_model_recoverable_input_error(definition):
+                return LoopAgentObservation(
+                    status="failed",
+                    summary=f"工具参数还不完整：缺少 {', '.join(missing_required)}。请根据这个结构化错误继续补全工具参数。",
+                    tool_call_id=_decision_tool_call_id(decision),
+                    metadata={
+                        "error_code": "TOOL_INPUT_INVALID",
+                        "tool_input": dict(decision.tool_input),
+                        "missing_required_fields": missing_required,
+                        "recoverable": True,
+                        "next_action": "continue_model_loop",
+                    },
+                )
             return LoopAgentObservation(
                 status="waiting_user",
                 summary=f"工具参数还不完整：缺少 {', '.join(missing_required)}。请补充后我再继续。",
@@ -276,6 +403,117 @@ def _initial_messages(task: LoopAgentTask) -> list[dict[str, Any]]:
         messages.append({"role": "system", "content": f"本轮上下文：{task.context}"})
     messages.append({"role": "user", "content": task.user_message})
     return messages
+
+
+def _filesystem_final_answer_guard_reason(
+    task: LoopAgentTask,
+    trace: list[Any],
+) -> str | None:
+    """Return a structured reason when a filesystem write is still pending."""
+
+    contract = task.context.get("filesystem_completion_contract") if isinstance(task.context, dict) else None
+    contract_active = isinstance(contract, dict) and bool(
+        contract.get("awaiting_write") or contract.get("requires_follow_up_after_read")
+    )
+    recovery_observed = False
+    read_observed = False
+
+    logger.warning(
+        "Filesystem completion guard inspect: contract=%s trace=%s",
+        contract,
+        [
+            {
+                "operation": getattr(entry, "metadata", {}).get("observation", {}).get("metadata", {}).get("tool_input", {}).get("operation")
+                if isinstance(getattr(entry, "metadata", {}).get("observation", {}), dict)
+                else None,
+                "status": getattr(entry, "observation_status", None),
+                "metadata": getattr(entry, "metadata", {}).get("observation", {}).get("metadata", {})
+                if isinstance(getattr(entry, "metadata", {}).get("observation", {}), dict)
+                else {},
+            }
+            for entry in trace
+            if str(getattr(entry, "capability", "") or "").strip() == "skill.filesystem"
+        ],
+    )
+
+    for entry in trace:
+        capability = str(getattr(entry, "capability", "") or "").strip()
+        if capability != "skill.filesystem":
+            continue
+        observation = getattr(entry, "metadata", {}).get("observation", {})
+        observation_metadata = observation.get("metadata") if isinstance(observation, dict) else {}
+        observation_metadata = observation_metadata if isinstance(observation_metadata, dict) else {}
+        tool_input = observation_metadata.get("tool_input") if isinstance(observation_metadata.get("tool_input"), dict) else {}
+        operation = str(tool_input.get("operation") or "").strip()
+        observation_status = str(getattr(entry, "observation_status", "") or "").strip().lower()
+        if operation == "read_file" and observation_status in {"succeeded", "partial", "completed", "success", "ok"}:
+            read_observed = True
+        if operation in {"copy_file", "rename_file"} and observation_status in {"succeeded", "completed", "success", "ok"}:
+            return None
+        if str(observation_metadata.get("next_action") or "").strip() in {"continue_model_loop", "read_before_write"}:
+            recovery_observed = True
+        recovery_outcome = observation_metadata.get("recovery_outcome")
+        if isinstance(recovery_outcome, dict) and str(recovery_outcome.get("next_action") or "").strip() in {"continue_model_loop", "read_before_write"}:
+            recovery_observed = True
+        if observation_metadata.get("error_code") in {
+            "STRUCTURED_OPERATION_REQUIRED",
+            "CONTENT_BASED_NAME_REQUIRED",
+            "CONTENT_BASED_NAME_REQUIRES_READ",
+            "MISSING_REQUIRED_ARGUMENT",
+        }:
+            recovery_observed = True
+        # A missing structured operation is itself a runtime-owned recovery
+        # signal. Do not parse the user's prose here; only use the native
+        # tool input and the structured observation emitted by the executor.
+        if not operation and observation_status in {"failed", "partial", "completed"}:
+            if observation_metadata.get("recoverable") is True or observation_metadata.get("error_code"):
+                recovery_observed = True
+
+    if (
+        contract_active
+        and (bool(contract.get("awaiting_write")) or read_observed)
+        and not _trace_contains_completed_filesystem_write(trace)
+    ):
+        return "当前文件任务已经读取了源文件，但还没有完成模型选择的 copy_file 或 rename_file 写操作。"
+    if recovery_observed and read_observed and not _trace_contains_completed_filesystem_write(trace):
+        return "当前文件任务的 runtime 恢复信号要求读取后继续完成写操作，不能把 read_file 当成最终结果。"
+    return None
+
+
+def _trace_contains_completed_filesystem_write(trace: list[Any]) -> bool:
+    for entry in trace:
+        if str(getattr(entry, "capability", "") or "").strip() != "skill.filesystem":
+            continue
+        observation = getattr(entry, "metadata", {}).get("observation", {})
+        observation_metadata = observation.get("metadata") if isinstance(observation, dict) else {}
+        observation_metadata = observation_metadata if isinstance(observation_metadata, dict) else {}
+        tool_input = observation_metadata.get("tool_input") if isinstance(observation_metadata.get("tool_input"), dict) else {}
+        operation = str(tool_input.get("operation") or "").strip()
+        observation_status = str(getattr(entry, "observation_status", "") or "").strip().lower()
+        if operation in {"copy_file", "rename_file"} and observation_status in {"succeeded", "completed", "success", "ok"}:
+            return True
+    return False
+
+
+def _first_nested_runtime_field(payload: dict[str, Any] | None, key: str) -> Any | None:
+    """Find one runtime-owned field without interpreting user prose."""
+
+    if not isinstance(payload, dict):
+        return None
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if not isinstance(current, dict) or id(current) in visited:
+            continue
+        visited.add(id(current))
+        if key in current and current[key] is not None:
+            return current[key]
+        for child_key in ("result", "raw_result", "result_envelope", "error_details", "output_payload"):
+            child = current.get(child_key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return None
 
 
 def _task_stage_context(task: LoopAgentTask) -> LoopAgentStageContext | dict[str, Any] | None:
@@ -405,6 +643,17 @@ def _next_stage_index_after_observation(
     if not current_stage_context:
         return None
     if observation.status != "succeeded" or observation.requires_user_action or observation.suggested_next_decision is not None:
+        return None
+    # Filesystem operations form one model-directed transaction: read_file is
+    # commonly followed by copy_file or rename_file after the model inspects
+    # the returned content.  Do not advance an unrelated business stage here,
+    # otherwise its allow-list can hide skill.filesystem before the write step.
+    if str(decision.capability or "").strip() in {"skill.filesystem", "skill_filesystem"}:
+        logger.info(
+            "Keeping stage context after filesystem observation: capability=%s stage=%s",
+            decision.capability,
+            _stage_context_identifier(current_stage_context),
+        )
         return None
     plan = _stage_context_plan(current_stage_context)
     if not plan:
@@ -556,7 +805,7 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _build_tool_schema_bundle(registry: AgentToolRegistry, capabilities: tuple[str, ...]) -> dict[str, Any]:
+def _build_tool_schema_bundle(registry: Any, capabilities: tuple[str, ...]) -> dict[str, Any]:
     tools: list[dict[str, Any]] = []
     alias_to_tool_name: dict[str, str] = {}
     used_aliases: set[str] = set()
@@ -615,68 +864,13 @@ def _missing_required_tool_input_names(definition: AgentToolDefinition, tool_inp
     return [str(name) for name in required if str(name) not in tool_input]
 
 
-_TEXTUAL_TOOL_CALL_RE = re.compile(
-    r"^\s*(?:(?:\*\*)?OfferMaster\s+AI(?:\*\*)?\s*)?"
-    r"(?:Tool\s*call|工具调用)\s*[:：]\s*"
-    r"(?P<tool>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*"
-    r"(?P<arguments>\{.*\})\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
+def _is_model_recoverable_input_error(definition: AgentToolDefinition) -> bool:
+    """Let the model repair filesystem arguments before asking the user."""
 
-_MULTILINE_TEXTUAL_TOOL_CALL_RE = re.compile(
-    r"^\s*(?:(?:\*\*)?OfferMaster\s+AI(?:\*\*)?\s*)?"
-    r"(?:Tool\s*call|工具调用)\s*[:：]\s*"
-    r"(?P<tool>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\n+"
-    r"(?:Arguments|参数)\s*[:：]\s*"
-    r"(?P<arguments>\{.*\})\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _textual_tool_call_decision(content: str, *, bundle: dict[str, Any], task: LoopAgentTask) -> LoopAgentDecision | None:
-    normalized = str(content or "").replace("\\_", "_").strip()
-    if not normalized:
-        return None
-    for candidate in _textual_tool_call_candidates(normalized):
-        match = _TEXTUAL_TOOL_CALL_RE.match(candidate) or _MULTILINE_TEXTUAL_TOOL_CALL_RE.match(candidate)
-        if match is None:
-            continue
-        raw_tool_name = match.group("tool")
-        arguments = _parse_tool_call_arguments(match.group("arguments"))
-        if arguments is None:
-            continue
-        requested_tool_name = bundle["alias_to_tool_name"].get(raw_tool_name, raw_tool_name)
-        arguments = _repair_relative_time_tool_input(task, requested_tool_name, arguments)
-        return LoopAgentDecision(
-            action=LoopAgentAction.CALL_TOOL,
-            capability=requested_tool_name,
-            tool_input=arguments,
-            reason="模型把工具调用写成了普通文本，运行时将其转换为真实工具调用。",
-            metadata={"tool_call_id": "textual-tool-call", "tool_alias": raw_tool_name, "textual_tool_call": True},
-        )
-    return None
-
-
-def _textual_tool_call_candidates(content: str) -> list[str]:
-    candidates = [content]
-    lines = [line.strip() for line in content.split("\n") if line.strip()]
-    for index, line in enumerate(lines):
-        if "tool call" not in line.lower() and "工具调用" not in line:
-            continue
-        if index > 0 and "OfferMaster" in lines[index - 1]:
-            candidates.append(f"{lines[index - 1]}\n{line}")
-        if index + 1 < len(lines) and ("arguments" in lines[index + 1].lower() or "参数" in lines[index + 1]):
-            candidates.append(f"{line}\n{lines[index + 1]}")
-        candidates.append(line)
-    return candidates
-
-
-def _parse_tool_call_arguments(raw_arguments: str) -> dict[str, Any] | None:
-    try:
-        parsed = json.loads(raw_arguments)
-    except Exception:
-        return None
-    return dict(parsed) if isinstance(parsed, dict) else None
+    if definition.name.startswith("filesystem."):
+        return True
+    profile = definition.candidate_profile
+    return bool(profile and "filesystem_operation" in profile.categories)
 
 
 _YEAR_RE = re.compile(r"20\d{2}")
@@ -875,11 +1069,43 @@ def _summarize_tool_payload(payload: Any) -> str:
 
 
 def _observation_message(decision: LoopAgentDecision, observation: LoopAgentObservation) -> str:
-    return (
+    message = (
         f"工具 {decision.capability} 执行状态：{observation.status}\n"
         f"观察结果：{observation.summary}\n"
-        f"结构化结果：{observation.result_payload}"
+        f"结构化结果：{observation.result_payload}\n"
+        f"运行元数据：{observation.metadata}"
     )
+    if str(decision.capability or "").strip() == "skill.filesystem" and str(
+        (decision.tool_input or {}).get("operation") or ""
+    ).strip() == "read_file":
+        content = _filesystem_read_content_from_observation(observation.result_payload)
+        if content:
+            # Keep the model-facing evidence explicit. The raw nested payload is
+            # retained for auditability, but a prose-only dict dump is not a
+            # reliable interface for content-based follow-up decisions.
+            logger.info("Filesystem read content promoted to model evidence: chars=%s", len(content))
+            message += f"\n文件真实内容（可用于后续判断）：\n{content}"
+    return message
+
+
+def _filesystem_read_content_from_observation(payload: Any) -> str:
+    """Extract read_file content from the runtime result without semantic parsing."""
+
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if not isinstance(current, dict) or id(current) in visited:
+            continue
+        visited.add(id(current))
+        content = current.get("content")
+        if isinstance(content, str) and content.strip():
+            return content[:12000]
+        for child_key in ("result", "raw_result", "output_payload", "result_envelope"):
+            child = current.get(child_key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return ""
 
 
 __all__ = ["LoopAgentStageContext", "LoopAgentTask", "ToolChoiceLoopRunner"]

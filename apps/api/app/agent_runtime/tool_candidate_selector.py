@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.agent_runtime.agent_as_tool import FILESYSTEM_SKILL_CAPABILITY
 from app.agent_runtime.tool_registry import (
     DATABASE_COMPANY_LIST_TOOL,
     EXTERNAL_WEB_SEARCH_TOOL,
@@ -39,14 +40,19 @@ class ToolCandidateSelector:
         auto_executable_only: bool = True,
     ) -> ToolCandidateSelection:
         signals = _detect_task_signals(user_message)
-        if not signals:
-            return ToolCandidateSelection()
-
         capabilities: list[str] = []
         reasons: dict[str, str] = {}
         signal_set = set(signals)
+        skill_first = _high_level_filesystem_skill_selection(self._registry, signals)
+        if skill_first is not None:
+            return skill_first
         for definition in self._registry.list_definitions():
             if not _tool_is_candidate_eligible(definition, source_type=source_type, auto_executable_only=auto_executable_only):
+                continue
+            capability_id = _definition_id(definition)
+            if _is_always_available_agent(definition):
+                capabilities.append(capability_id)
+                reasons[capability_id] = "always-available high-level Agent capability; model decides whether to delegate"
                 continue
             categories = _candidate_categories(definition)
             if not categories:
@@ -54,11 +60,24 @@ class ToolCandidateSelector:
             matched = sorted(signal_set.intersection(categories))
             if not matched:
                 continue
-            capability_id = _definition_id(definition)
             capabilities.append(capability_id)
             reasons[capability_id] = f"matched task signals: {', '.join(matched)}"
 
         return ToolCandidateSelection(capabilities=tuple(capabilities), signals=signals, reasons=reasons)
+
+
+def _high_level_filesystem_skill_selection(registry: Any, signals: tuple[str, ...]) -> ToolCandidateSelection | None:
+    if not any(signal.startswith("filesystem_") or signal == "filesystem_operation" for signal in signals):
+        return None
+
+    # Filesystem routing is deliberately coarse-grained. The main agent must
+    # never fall back to internal scripts just because a caller passed a legacy
+    # tool registry instead of the runtime capability registry.
+    return ToolCandidateSelection(
+        capabilities=(FILESYSTEM_SKILL_CAPABILITY,),
+        signals=("skill_filesystem", *signals),
+        reasons={FILESYSTEM_SKILL_CAPABILITY: "matched filesystem task; internal scripts are handled by the Skill executor"},
+    )
 
 
 def _tool_is_candidate_eligible(
@@ -76,6 +95,10 @@ def _tool_is_candidate_eligible(
         return True
     risk_level = str(getattr(definition.risk_level, "value", definition.risk_level))
     return risk_level == "low" and not definition.requires_confirmation
+
+
+def _is_always_available_agent(definition: Any) -> bool:
+    return bool(getattr(definition, "always_available", False)) and str(getattr(definition, "kind", "")) == "agent"
 
 
 def _candidate_categories(definition: Any) -> frozenset[str]:
@@ -195,6 +218,11 @@ def _looks_like_filesystem_request(text: str) -> bool:
         ".csv",
         "本地文件",
         "文件路径",
+        "文件名",
+        "文件名称",
+        "文件的名字",
+        "文件的名称",
+        "这个文件",
         "目录",
         "文件夹",
     )
@@ -206,6 +234,12 @@ def _looks_like_filesystem_request(text: str) -> bool:
         "能读",
         "打开",
         "查看",
+        "看下",
+        "看一下",
+        "是否存在",
+        "存不存在",
+        "有没有这个文件",
+        "文件是否存在",
         "列出",
         "修改",
         "替换",
@@ -229,6 +263,8 @@ def _looks_like_filesystem_request(text: str) -> bool:
         "delete",
         "rename",
         "mkdir",
+        "exists",
+        "stat",
     )
     return any(marker in lowered for marker in path_markers) and any(marker in lowered for marker in action_markers)
 

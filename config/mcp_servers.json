@@ -1,0 +1,70 @@
+{
+  "servers": [
+    {
+      "id": "chrome",
+      "tool_prefix": "chrome",
+      "transport": "stdio",
+      "command": "${JOBPILOT_CHROME_MCP_NODE:-node}",
+      "args": [
+        "${JOBPILOT_CHROME_MCP_SCRIPT:-node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js}",
+        "--headless",
+        "--userDataDir",
+        "${JOBPILOT_CHROME_MCP_USER_DATA_DIR:-.runtime/chrome/profile}",
+        "--no-usage-statistics",
+        "--no-performance-crux"
+      ],
+      "env": {},
+      "enabled_env": "JOBPILOT_SDK_AGENT_ENABLE_CHROME_MCP",
+      "allow_tools": [
+        "list_pages",
+        "select_page",
+        "navigate_page",
+        "get_page_content",
+        "take_screenshot",
+        "wait_for",
+        "click",
+        "fill",
+        "type_text",
+        "press_key"
+      ],
+      "deny_tools": ["close_page", "upload_file"],
+      "policy": "browser_runtime"
+    },
+    {
+      "id": "dbx",
+      "tool_prefix": "dbx",
+      "transport": "stdio",
+      "command": "${JOBPILOT_DBX_MCP_COMMAND:-dbx-mcp}",
+      "args": [],
+      "env": {
+        "DBX_DATA_DIR": "${JOBPILOT_DBX_DATA_DIR:-.runtime/dbx/data}"
+      },
+      "enabled_env": "JOBPILOT_SDK_AGENT_ENABLE_DBX_MCP",
+      "allow_tools": [
+        "dbx_list_connections",
+        "dbx_list_databases",
+        "dbx_list_tables",
+        "dbx_get_schema_context",
+        "dbx_describe_table",
+        "dbx_execute_query"
+      ],
+      "policy": "dbx_read_only"
+    },
+    {
+      "id": "qq_mail",
+      "tool_prefix": "qq_mail",
+      "transport": "stdio",
+      "command": "${JOBPILOT_QQ_MAIL_PYTHON:-python}",
+      "args": ["-m", "app.mcp_gateway.qq_mail_server"],
+      "cwd": "${JOBPILOT_QQ_MAIL_API_ROOT:-apps/api}",
+      "env": {
+        "JOBPILOT_QQ_MAIL_USERNAME": "${JOBPILOT_QQ_MAIL_USERNAME:-}",
+        "JOBPILOT_QQ_MAIL_AUTH_CODE": "${JOBPILOT_QQ_MAIL_AUTH_CODE:-}",
+        "PYTHONPATH": "${JOBPILOT_QQ_MAIL_API_ROOT:-apps/api}"
+      },
+      "enabled_env": "JOBPILOT_SDK_AGENT_ENABLE_QQ_MAIL_MCP",
+      "allow_tools": ["list_messages", "get_message"],
+      "policy": "qq_mail_read_only"
+    }
+  ]
+}

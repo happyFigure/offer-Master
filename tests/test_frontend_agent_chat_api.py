@@ -3,6 +3,17 @@ from unittest import TestCase
 
 
 class FrontendAgentChatApiTest(TestCase):
+    def test_chat_confirmation_uses_existing_approval_continuation(self) -> None:
+        app_source = Path("apps/web/src/app/App.tsx").read_text(encoding="utf-8")
+        api_source = Path("apps/web/src/api/agent.ts").read_text(encoding="utf-8")
+
+        self.assertIn("classifyApprovalDecision", app_source)
+        self.assertIn("handleChatApprovalDecision", app_source)
+        self.assertIn("approveAgentApproval", app_source)
+        self.assertIn("rejectAgentApproval", app_source)
+        self.assertIn("getPendingAgentApproval", api_source)
+        self.assertIn("/approvals/pending", api_source)
+
     def test_agent_api_client_uses_session_message_and_stream_endpoints(self) -> None:
         api_source = Path("apps/web/src/api/agent.ts").read_text(encoding="utf-8")
 
@@ -190,7 +201,14 @@ class FrontendAgentChatApiTest(TestCase):
     def test_runtime_timeline_distinguishes_main_model_sub_agents_and_tool_returns(self) -> None:
         app_source = Path("apps/web/src/app/App.tsx").read_text(encoding="utf-8")
         style_source = Path("apps/web/src/styles/global.css").read_text(encoding="utf-8")
+        types_source = Path("apps/web/src/types/agent.ts").read_text(encoding="utf-8")
 
+        self.assertIn("executor_id?: string | null", types_source)
+        self.assertIn("executorId?: string | null", app_source)
+        self.assertIn("executorId: stringOrNull(payload.executor_id)", app_source)
+        self.assertIn("runtimeExecutorRunsInSubAgent(event.executorId)", app_source)
+        self.assertIn('executorId === "agent_tool_registry"', app_source)
+        self.assertNotIn("if (runtimeToolRunsInSubAgent(event.toolName))", app_source)
         self.assertIn("RuntimeActorBadge", app_source)
         self.assertIn("runtimeEventActor", app_source)
         self.assertIn("主模型", app_source)

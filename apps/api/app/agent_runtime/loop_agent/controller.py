@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from app.agent_runtime.loop_agent.dead_loop_detector import DeadLoopDetector
 from app.agent_runtime.loop_agent.events import LoopAgentEvent, LoopAgentEventType
 from app.agent_runtime.loop_agent.schemas import (
     LoopAgentAction,
@@ -16,8 +17,9 @@ from app.agent_runtime.loop_agent.schemas import (
 class LoopAgentController:
     """Runtime-owned control loop for auditable multi-step agent execution."""
 
-    def __init__(self, *, max_steps: int = 1) -> None:
+    def __init__(self, *, max_steps: int = 1, dead_loop_detector: DeadLoopDetector | None = None) -> None:
         self.max_steps = max(0, max_steps)
+        self._dead_loop_detector = dead_loop_detector or DeadLoopDetector()
 
     def run(
         self,
@@ -32,6 +34,7 @@ class LoopAgentController:
         trace: list[LoopAgentTraceEntry] = []
         events: list[LoopAgentEvent] = []
         next_decision: LoopAgentDecision | None = None
+        executed_action_keys: list[str] = []
 
         def emit(event: LoopAgentEvent) -> None:
             events.append(event)
@@ -143,6 +146,23 @@ class LoopAgentController:
                     summary=decision.message or decision.reason,
                 )
 
+            intervention = self._dead_loop_detector.intervention_for(decision, executed_action_keys)
+            if intervention is not None:
+                metadata = {"loop_intervention": intervention.to_metadata_dict()}
+                return finish(
+                    LoopAgentRunResult(
+                        stop_reason=LoopAgentStopReason.REPLAN_REQUIRED,
+                        trace=trace,
+                        pending_decision=decision,
+                        metadata=metadata,
+                    ),
+                    status="replan_required",
+                    summary=intervention.reason,
+                )
+            # Record before execution so failures and partial results still count
+            # toward loop detection on the next attempted identical call.
+            executed_action_keys.append(self._dead_loop_detector.action_key(decision))
+
             emit(
                 make_event(
                     LoopAgentEventType.TOOL_STARTED,
@@ -215,6 +235,9 @@ class LoopAgentController:
                     summary=observation.summary,
                 )
             if observation.status == "failed":
+                if bool(observation.metadata.get("recoverable")):
+                    next_decision = observation.suggested_next_decision
+                    continue
                 return finish(
                     LoopAgentRunResult(
                         stop_reason=LoopAgentStopReason.STEP_FAILED,

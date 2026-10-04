@@ -64,6 +64,10 @@ export async function getAgentMessages(sessionId: string, limit = 100): Promise<
   return response.items;
 }
 
+export async function getPendingAgentApproval(sessionId: string): Promise<AgentApprovalRequiredPayload | null> {
+  return apiRequest<AgentApprovalRequiredPayload | null>(`/api/v1/agent/sessions/${sessionId}/approvals/pending`);
+}
+
 export async function sendAgentMessage(sessionId: string, input: AgentUserMessageInput): Promise<AgentChatTurnResponse> {
   return apiRequest<AgentChatTurnResponse>(`/api/v1/agent/sessions/${sessionId}/messages`, {
     method: "POST",
@@ -105,6 +109,7 @@ export async function streamAgentMessage(sessionId: string, input: AgentUserMess
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const terminalState = { seen: false };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -114,16 +119,25 @@ export async function streamAgentMessage(sessionId: string, input: AgentUserMess
     buffer += decoder.decode(value, { stream: true });
     const parts = buffer.split("\n\n");
     buffer = parts.pop() ?? "";
-    parts.forEach((part) => dispatchAgentStreamEvent(part, handlers));
+    parts.forEach((part) => dispatchAgentStreamEvent(part, handlers, terminalState));
   }
 
   buffer += decoder.decode();
   if (buffer.trim()) {
-    dispatchAgentStreamEvent(buffer, handlers);
+    dispatchAgentStreamEvent(buffer, handlers, terminalState);
+  }
+  if (!terminalState.seen) {
+    const message = "Agent 流式连接提前结束，未收到完成状态。";
+    handlers.onError?.(message);
+    throw new ApiError(message, 502, { terminal: false });
   }
 }
 
-function dispatchAgentStreamEvent(rawEvent: string, handlers: AgentStreamHandlers): void {
+function dispatchAgentStreamEvent(
+  rawEvent: string,
+  handlers: AgentStreamHandlers,
+  terminalState: { seen: boolean },
+): void {
   const lines = rawEvent.split("\n");
   const eventName = lines
     .find((line) => line.startsWith("event:"))
@@ -142,6 +156,7 @@ function dispatchAgentStreamEvent(rawEvent: string, handlers: AgentStreamHandler
     handlers.onToken?.(data.content);
   }
   if (eventName === "approval_required" && isAgentApprovalRequiredPayload(data)) {
+    terminalState.seen = true;
     handlers.onApprovalRequired?.(data);
   }
   if (eventName === "outer_session_event" && isAgentStreamOuterSessionEvent(data)) {
@@ -151,12 +166,13 @@ function dispatchAgentStreamEvent(rawEvent: string, handlers: AgentStreamHandler
     handlers.onToolEvent?.(data);
   }
   if (eventName === "done" && isAgentMessage(data.assistant_message)) {
+    terminalState.seen = true;
     handlers.onDone?.(data.assistant_message);
   }
   if (eventName === "error") {
+    terminalState.seen = true;
     const message = typeof data.message === "string" ? data.message : "Agent stream failed";
     handlers.onError?.(message);
-    throw new ApiError(message, 500, data);
   }
 }
 

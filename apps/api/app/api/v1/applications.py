@@ -10,6 +10,12 @@ from app.domains.applications.schemas import (
     ApplicationCreate,
     ApplicationFromJobCreate,
     ApplicationListResponse,
+    ApplicationMailNotificationConfirm,
+    ApplicationMailNotificationCreate,
+    ApplicationMailNotificationUpdate,
+    ApplicationMailTimingRead,
+    ApplicationNotificationListResponse,
+    ApplicationNotificationRead,
     ApplicationRead,
     ApplicationUpdate,
 )
@@ -98,6 +104,80 @@ def update_application(
     return _application_board_item(application)
 
 
+@router.get("/notification-candidates", response_model=ApplicationNotificationListResponse)
+def list_notification_candidates(
+    limit: int = Query(default=100, ge=1, le=200),
+    session: Session = Depends(get_db_session),
+) -> ApplicationNotificationListResponse:
+    service = _application_service(session)
+    items = service.list_pending_mail_notifications(limit=limit)
+    return ApplicationNotificationListResponse(items=[_notification_read(item) for item in items])
+
+
+@router.post("/{application_id}/notification-candidates", response_model=ApplicationNotificationRead)
+def create_notification_candidate(
+    application_id: str,
+    request: ApplicationMailNotificationCreate,
+    session: Session = Depends(get_db_session),
+) -> ApplicationNotificationRead:
+    if request.application_id != application_id:
+        raise HTTPException(status_code=400, detail="application_id in path and body must match")
+    service = _application_service(session)
+    try:
+        event = service.create_mail_notification_candidate(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return _notification_read(event)
+
+
+@router.patch("/notification-candidates/{event_id}", response_model=ApplicationNotificationRead)
+def update_notification_candidate(
+    event_id: str,
+    request: ApplicationMailNotificationUpdate,
+    session: Session = Depends(get_db_session),
+) -> ApplicationNotificationRead:
+    service = _application_service(session)
+    try:
+        event = service.update_mail_notification_candidate(event_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return _notification_read(event)
+
+
+@router.post("/notification-candidates/{event_id}/confirm", response_model=ApplicationNotificationRead)
+def confirm_notification_candidate(
+    event_id: str,
+    request: ApplicationMailNotificationConfirm | None = None,
+    session: Session = Depends(get_db_session),
+) -> ApplicationNotificationRead:
+    service = _application_service(session)
+    try:
+        service.confirm_mail_notification_candidate(event_id, (request or ApplicationMailNotificationConfirm()).to_status)
+        event = service.get_mail_notification_candidate(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Mail notification candidate not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return _notification_read(event)
+
+
+@router.post("/notification-candidates/{event_id}/reject", response_model=ApplicationNotificationRead)
+def reject_notification_candidate(
+    event_id: str,
+    session: Session = Depends(get_db_session),
+) -> ApplicationNotificationRead:
+    service = _application_service(session)
+    try:
+        event = service.reject_mail_notification_candidate(event_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return _notification_read(event)
+
+
 def _application_service(session: Session) -> ApplicationService:
     return ApplicationService(
         applications=ApplicationRepository(session),
@@ -106,6 +186,7 @@ def _application_service(session: Session) -> ApplicationService:
 
 
 def _application_board_item(application) -> ApplicationBoardItem:
+    latest_mail_event = _latest_mail_event(application)
     return ApplicationBoardItem(
         id=application.id,
         job_id=application.job_id,
@@ -118,6 +199,31 @@ def _application_board_item(application) -> ApplicationBoardItem:
         created_at=application.created_at,
         updated_at=application.updated_at,
         job=_job_summary(application.job),
+        mail_timing=_mail_timing(latest_mail_event) if latest_mail_event is not None else None,
+    )
+
+
+def _latest_mail_event(application):
+    events = [
+        event
+        for event in getattr(application, "events", [])
+        if event.source == "qq_mail" and event.review_status in {"pending", "confirmed", "synced"}
+    ]
+    return max(events, key=lambda event: event.created_at) if events else None
+
+
+def _mail_timing(event) -> ApplicationMailTimingRead:
+    metadata = event.event_metadata or {}
+    return ApplicationMailTimingRead(
+        event_type=event.event_type,
+        title=event.title,
+        source_sent_at=metadata.get("source_sent_at"),
+        scheduled_at=event.scheduled_at,
+        deadline_at=event.deadline_at,
+        deadline_offset_hours=metadata.get("deadline_offset_hours"),
+        timezone=event.timezone,
+        timing_source=str(metadata.get("timing_source") or "none"),
+        timing_note=metadata.get("timing_note"),
     )
 
 
@@ -133,4 +239,29 @@ def _job_summary(job) -> JobSummaryRead:
         job_type=job.job_type,
         skills=job.skills,
         status=job.status,
+    )
+
+
+def _notification_read(event) -> ApplicationNotificationRead:
+    return ApplicationNotificationRead(
+        id=event.id,
+        application_id=event.application_id,
+        event_type=event.event_type,
+        from_status=event.from_status,
+        to_status=event.to_status,
+        title=event.title,
+        body=event.body,
+        actor=event.actor,
+        source=event.source,
+        event_metadata=event.event_metadata,
+        scheduled_at=event.scheduled_at,
+        deadline_at=event.deadline_at,
+        timezone=event.timezone,
+        join_url=event.join_url,
+        source_message_id=event.source_message_id,
+        source_uid=event.source_uid,
+        review_status=event.review_status,
+        reviewed_at=event.reviewed_at,
+        created_at=event.created_at,
+        application=_application_board_item(event.application),
     )
